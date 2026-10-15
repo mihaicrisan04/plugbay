@@ -1,0 +1,146 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  check-version:
+    name: check tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: compare versions
+        run: |
+          crate_version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "plugbay") | .version')
+          if [ "v$crate_version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $crate_version"
+            exit 1
+          fi
+
+  build:
+    name: build / ${{ matrix.target }}
+    needs: check-version
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+          # Oldest supported Ubuntu runners, so the binaries need the oldest glibc.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+    env:
+      ARCHIVE: plugbay-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: build
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: package
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/plugbay README.md LICENSE dist/
+          tar -czf "$ARCHIVE" -C dist .
+          shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
+          cat "$ARCHIVE.sha256"
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugbay-${{ matrix.target }}
+          path: |
+            ${{ env.ARCHIVE }}
+            ${{ env.ARCHIVE }}.sha256
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: combine checksums
+        run: |
+          cat artifacts/*.tar.gz.sha256 > artifacts/SHA256SUMS
+          cat artifacts/SHA256SUMS
+
+      - name: create github release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.sha256
+            artifacts/SHA256SUMS
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+
+      - name: keep checksums for the tap
+        uses: actions/upload-artifact@v4
+        with:
+          name: sha256sums
+          path: artifacts/SHA256SUMS
+
+  homebrew-tap:
+    name: update homebrew tap
+    needs: release
+    # Prereleases (v1.2.0-rc.1) stay off the tap.
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: sha256sums
+
+      - name: check the tap token
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
+            echo "::error::HOMEBREW_TAP_TOKEN is not set; see docs/releasing.md"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          repository: mihaicrisan04/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: render formula
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          bash packaging/homebrew/render.sh "$version" SHA256SUMS > homebrew-tap/Formula/plugbay.rb
+          cat homebrew-tap/Formula/plugbay.rb
+
+      - name: commit and push
+        working-directory: homebrew-tap
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/plugbay.rb
+          if git diff --cached --quiet; then
+            echo "formula already up to date"
+            exit 0
+          fi
+          git commit -m "plugbay: update to ${GITHUB_REF_NAME}"
+          git push

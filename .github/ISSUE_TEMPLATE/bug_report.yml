@@ -1,0 +1,37 @@
+name: Bug report
+description: Something in plugbay does not work as expected
+labels: [bug]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Include the relevant plugbay.toml files, with any secrets removed.
+      render: toml
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Output of `plugbay doctor` and relevant lines from `~/.local/state/plugbay/daemon.log` (or `plugbay daemon --log-level debug`). Remove tokens and keys before pasting.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: plugbay version
+      description: Output of `plugbay --version`
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS and version, agent (Claude Code, Codex, other) and its version
+    validations:
+      required: true
