@@ -1,0 +1,11 @@
+---
+source: src/commands/inspect.rs
+expression: "format_ls(&config, &[], Path::new(HOME))"
+---
+Project      none (only the global config applies)
+
+Config files (merge order)
+  none found
+
+Servers
+  none

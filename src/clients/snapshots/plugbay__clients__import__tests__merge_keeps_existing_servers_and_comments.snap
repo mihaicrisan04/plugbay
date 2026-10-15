@@ -1,0 +1,11 @@
+---
+source: src/clients/import.rs
+expression: "merge_into(existing, &plan.servers).unwrap()"
+---
+account = "initech" # tree default
+
+[servers]
+sentry = true
+
+# from Claude Code (user scope) `linear-server`
+linear = "default"

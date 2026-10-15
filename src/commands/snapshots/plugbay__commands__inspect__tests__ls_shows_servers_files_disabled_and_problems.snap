@@ -1,0 +1,25 @@
+---
+source: src/commands/inspect.rs
+expression: output
+---
+Project      ~/work/client-a/app
+Working dir  ~/.t3/worktrees/app/feature
+
+Config files (merge order)
+  global   ~/.config/plugbay/config.toml
+  project  ~/work/plugbay.toml
+  project  ~/work/client-a/plugbay.toml
+  project  ~/work/client-a/app/plugbay.toml
+  local    ~/work/client-a/app/plugbay.local.toml
+
+Servers
+  SERVER            TRANSPORT  TARGET                                   TOOLS                  STATUS
+  linear:default    http       https://mcp.linear.app/mcp               linear__*              needs login: run `plugbay login linear:default` (add `--token` for an API token)
+  posthog:client-a  http       https://mcp-eu.posthog.com/mcp           posthog__* (filtered)  ready · Client A EU
+  tool:default      stdio      /home/me/bin/tool serve --name "my app"  tool__*                needs trust: run `plugbay trust`
+
+Disabled
+  notion  by ~/work/client-a/plugbay.toml
+
+Problems
+  - unknown server `mystery`: it is not in the bundled registry, so set `url` or `command`

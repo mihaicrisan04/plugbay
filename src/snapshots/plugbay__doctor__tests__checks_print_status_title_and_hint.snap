@@ -1,0 +1,6 @@
+---
+source: src/doctor.rs
+expression: check.to_string()
+---
+warn  linear:default: no stored login
+      → plugbay login linear:default

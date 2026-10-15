@@ -1,0 +1,42 @@
+[package]
+name = "plugbay"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.89"
+description = "mise for MCP servers: one entry in every agent, the right servers and accounts per directory"
+license = "Apache-2.0"
+repository = "https://github.com/mihaicrisan04/plugbay"
+homepage = "https://github.com/mihaicrisan04/plugbay"
+readme = "README.md"
+keywords = ["mcp", "ai", "agents", "claude", "codex"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+anyhow = "1.0.104"
+async-trait = "0.1.92"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+clap_complete = "4"
+futures = "0.3.34"
+globset = "0.4.20"
+hex = "0.4.3"
+keyring = "4.2.0"
+open = "5.4.4"
+parking_lot = "0.12.5"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+rmcp = { version = "3.5", features = ["client", "server", "transport-io", "transport-child-process", "transport-streamable-http-client-reqwest", "auth", "elicitation", "reqwest"] }
+rpassword = "7.5.4"
+rustix = { version = "1.1.5", features = ["fs", "process"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+thiserror = "2.0.21"
+tokio = { version = "1.53.2", features = ["full"] }
+toml = "1.1.8"
+toml_edit = "0.25.17"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+url = "2.5.8"
+
+[dev-dependencies]
+insta = "1.49.0"
+tempfile = "3.27.0"

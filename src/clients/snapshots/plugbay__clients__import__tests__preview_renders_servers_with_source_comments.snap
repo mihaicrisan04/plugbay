@@ -1,0 +1,14 @@
+---
+source: src/clients/import.rs
+expression: "merge_into(\"\", &servers).unwrap()"
+---
+[servers]
+# from Claude Code (user scope) `linear-server`
+linear = "default"
+
+# from Claude Code (user scope) `Posthog`
+posthog = { url = "https://mcp.posthog.com/mcp", headers = { X-Api-Key = "${keychain:plugbay/posthog-x-api-key-278d3d46}" } }
+
+# from Codex `tool`
+# note: Codex forwarded env vars HOME
+tool = { command = "npx", args = ["-y", "some-server"], env = { DEBUG = "1" } }

@@ -1,0 +1,18 @@
+---
+source: src/commands/inspect.rs
+expression: output
+---
+tool:default
+  identity  stdio:abc123
+  tools     tool__*
+
+  FIELD     VALUE                               SET BY
+  enabled   true                                ~/work/client-a/app/plugbay.local.toml
+  account   default                             built-in default
+  command   /home/me/bin/tool                   ~/work/client-a/app/plugbay.local.toml
+  args      ["serve", "--name", "my app"]       ~/work/client-a/app/plugbay.local.toml
+  env.MODE  dev                                 ~/work/client-a/app/plugbay.local.toml
+  cwd       /home/me/work/client-a/app/scripts  ~/work/client-a/app/plugbay.local.toml
+
+  needs trust from
+    ~/work/client-a/app/plugbay.local.toml

@@ -1,0 +1,11 @@
+---
+source: src/clients/codex.rs
+expression: updated
+---
+
+model = "gpt-5"   # keep me
+
+[mcp_servers.linear]
+url = "https://mcp.linear.app/mcp"
+bearer_token_env_var = "LINEAR_TOKEN"
+env_http_headers = { "X-Team" = "LINEAR_TEAM" }

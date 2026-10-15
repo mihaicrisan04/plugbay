@@ -1,0 +1,24 @@
+---
+source: src/clients/codex.rs
+expression: updated
+---
+
+model = "gpt-5"   # keep me
+
+[mcp_servers.slack]
+command = "npx"
+args = ["-y", "slack-mcp-server"]
+env = { SLACK_MCP_ADD_MESSAGE_TOOL = "true" }
+
+[mcp_servers.linear]
+url = "https://mcp.linear.app/mcp"
+bearer_token_env_var = "LINEAR_TOKEN"
+env_http_headers = { "X-Team" = "LINEAR_TEAM" }
+
+[mcp_servers.off]
+command = "off"
+enabled = false
+
+[mcp_servers.plugbay]
+command = "/opt/plugbay"
+args = ["connect"]

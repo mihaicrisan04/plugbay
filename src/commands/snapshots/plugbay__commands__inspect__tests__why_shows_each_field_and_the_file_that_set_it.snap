@@ -1,0 +1,19 @@
+---
+source: src/commands/inspect.rs
+expression: output
+---
+posthog:client-a
+  identity  https://mcp-eu.posthog.com/mcp
+  tools     posthog__*
+
+  FIELD                  VALUE                           SET BY
+  enabled                true                            ~/work/client-a/plugbay.toml
+  account                client-a                        ~/work/client-a/plugbay.toml
+  url                    https://mcp-eu.posthog.com/mcp  ~/work/client-a/plugbay.toml
+  headers.authorization  Bearer ${op://c/posthog/key}    ~/work/client-a/plugbay.toml
+  headers.x-api-key      [redacted]                      ~/work/client-a/plugbay.toml
+  exclude_tools          ["delete_*"]                    ~/work/client-a/app/plugbay.toml
+  metadata.region        eu                              ~/work/client-a/plugbay.toml
+
+  needs trust from
+    ~/work/client-a/plugbay.toml
