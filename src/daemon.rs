@@ -2,6 +2,7 @@
 
 use std::fs::File;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -14,6 +15,7 @@ use tokio::io::{
 use tokio::net::unix::OwnedReadHalf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Notify;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::config::ServerIdentity;
 use crate::paths::Paths;
@@ -29,6 +31,9 @@ const UPSTREAM_GRACE: Duration = Duration::from_secs(60);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 /// Client bytes in flight between the hangup watch and rmcp.
 const RELAY_BUFFER_BYTES: usize = 64 * 1024;
+/// Client bytes rmcp hasn't read yet; a client further ahead than one maximum-size message (as for
+/// stdio upstreams) is flooding the session.
+const MAX_UNREAD_CLIENT_BYTES: usize = 16 * 1024 * 1024;
 
 pub async fn run(paths: &Paths, idle_timeout: Duration) -> anyhow::Result<()> {
     paths.ensure_state_dir()?;
@@ -157,17 +162,58 @@ where
 
 /// rmcp reads nothing while our `initialize` handler waits for upstreams, so a client leaving
 /// then would go unnoticed and its pending connections would still start. Relaying its bytes
-/// ourselves sees the hangup at once and ends the session; rmcp then reads EOF too.
+/// ourselves sees the hangup at once and ends the session; rmcp then reads EOF too. Reading
+/// never waits for rmcp: what it hasn't taken yet queues here, up to one message's worth.
 async fn relay_until_hangup<R: AsyncRead + Unpin>(
-    mut from_client: R,
-    mut to_rmcp: WriteHalf<SimplexStream>,
+    from_client: R,
+    to_rmcp: WriteHalf<SimplexStream>,
     session: Arc<Session>,
 ) {
-    if let Err(error) = tokio::io::copy(&mut from_client, &mut to_rmcp).await {
-        tracing::debug!(%error, "client connection failed");
+    let (chunks, queued) = tokio::sync::mpsc::unbounded_channel();
+    let unread_bytes = AtomicUsize::new(0);
+    tokio::join!(
+        async {
+            read_client(from_client, chunks, &unread_bytes).await;
+            session.end();
+        },
+        forward_to_rmcp(queued, to_rmcp, &unread_bytes),
+    );
+}
+
+async fn read_client<R: AsyncRead + Unpin>(
+    mut from_client: R,
+    chunks: UnboundedSender<Vec<u8>>,
+    unread_bytes: &AtomicUsize,
+) {
+    let mut buffer = vec![0; RELAY_BUFFER_BYTES];
+    loop {
+        let read = match from_client.read(&mut buffer).await {
+            Ok(0) => break tracing::info!("client hung up"),
+            Ok(read) => read,
+            Err(error) => break tracing::debug!(%error, "client connection failed"),
+        };
+        let unread = unread_bytes.fetch_add(read, Ordering::Relaxed) + read;
+        if unread > MAX_UNREAD_CLIENT_BYTES {
+            break tracing::warn!("client sent more than the session could take; ending it");
+        }
+        if chunks.send(buffer[..read].to_vec()).is_err() {
+            break;
+        }
     }
-    tracing::info!("client hung up");
-    session.end();
+}
+
+async fn forward_to_rmcp(
+    mut queued: UnboundedReceiver<Vec<u8>>,
+    mut to_rmcp: WriteHalf<SimplexStream>,
+    unread_bytes: &AtomicUsize,
+) {
+    while let Some(chunk) = queued.recv().await {
+        if let Err(error) = to_rmcp.write_all(&chunk).await {
+            tracing::debug!(%error, "rmcp stopped reading the client");
+            return;
+        }
+        unread_bytes.fetch_sub(chunk.len(), Ordering::Relaxed);
+    }
     if let Err(error) = to_rmcp.shutdown().await {
         tracing::debug!(%error, "could not pass the hangup on");
     }

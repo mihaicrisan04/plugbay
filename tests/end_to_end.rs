@@ -1332,6 +1332,18 @@ async fn initialize_and_the_first_listing_share_one_startup_budget() {
 
 #[tokio::test]
 async fn a_client_that_leaves_during_initialize_starts_nothing() {
+    leave_during_initialize(0).await;
+}
+
+#[tokio::test]
+async fn a_client_that_leaves_during_initialize_after_a_large_message_starts_nothing() {
+    leave_during_initialize(256 * 1024).await;
+}
+
+/// Sends `initialize`, waits until the server's secret is being resolved, sends a notification
+/// padded to `padding` bytes (more than the relay buffer holds while rmcp isn't reading), then
+/// closes the client's input.
+async fn leave_during_initialize(padding: usize) {
     let sandbox = Sandbox::new();
     let marker = sandbox.plugbay_home.join("local-started");
     sandbox.append_to_global_config(&format!(
@@ -1362,6 +1374,17 @@ async fn a_client_that_leaves_during_initialize_starts_nothing() {
         .await
         .unwrap();
     wait_for_file(&sandbox, &sandbox.plugbay_home.join("bin/slow-token-asked")).await;
+    if padding > 0 {
+        let notification = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/padding",
+            "params": { "padding": "x".repeat(padding) }
+        });
+        stdin
+            .write_all(format!("{notification}\n").as_bytes())
+            .await
+            .unwrap();
+    }
 
     drop(stdin);
     shim.wait().await.unwrap();
