@@ -55,6 +55,10 @@ fn ready_deadline() -> Duration {
     })
 }
 
+fn fresh_deadline() -> Instant {
+    Instant::now() + ready_deadline()
+}
+
 /// State every session in one daemon shares.
 pub struct Shared {
     pub paths: Paths,
@@ -121,7 +125,8 @@ pub struct Session {
     /// Signalled whenever a connection attempt finishes.
     connections_settled: tokio::sync::watch::Sender<()>,
     next_attempt: AtomicU64,
-    /// `initialize` and the first tool listing share this one budget, counted from the connection.
+    /// `initialize` and the first tool listing share this one budget, counted from the connection,
+    /// so together they stay inside Codex's startup timeout.
     startup_deadline: Instant,
     /// Set when the client disconnects; pending connection attempts stop for good.
     ended: AtomicBool,
@@ -225,7 +230,7 @@ impl Session {
     /// The first refresh runs once, however many requests arrive while it is in flight.
     async fn ensure_ready(&self) {
         self.first_refresh
-            .get_or_init(|| self.refresh_and_notify())
+            .get_or_init(|| self.refresh_and_notify_by(self.startup_deadline))
             .await;
     }
 
@@ -239,33 +244,25 @@ impl Session {
         self.connections_settled.send_replace(());
     }
 
-    /// When the current wait for upstreams gives up: the startup budget while it lasts, so
-    /// `initialize` and the first listing don't each get a full one; afterwards a fresh one.
-    fn wait_deadline(&self) -> Instant {
-        let now = Instant::now();
-        if now < self.startup_deadline {
-            self.startup_deadline
-        } else {
-            now + ready_deadline()
-        }
+    pub async fn refresh_and_notify(&self) {
+        self.refresh_and_notify_by(fresh_deadline()).await;
     }
 
-    pub async fn refresh_and_notify(&self) {
-        let changed = self.refresh().await;
+    async fn refresh_and_notify_by(&self, deadline: Instant) {
+        let changed = self.refresh(deadline).await;
         if changed {
             self.notify_tools_changed().await;
         }
         self.offer_trust_prompt();
     }
 
-    /// Re-resolves config and reconnects whatever changed, waiting until [`Self::wait_deadline`]
-    /// for new connections. Returns true when the exposed tools may differ.
-    async fn refresh(&self) -> bool {
+    /// Re-resolves config and reconnects whatever changed, waiting until `deadline` for new
+    /// connections. Returns true when the exposed tools may differ.
+    async fn refresh(&self, deadline: Instant) -> bool {
         let _refreshing = self.refreshing.lock().await;
         if self.ended.load(Ordering::SeqCst) {
             return false;
         }
-        let deadline = self.wait_deadline();
         let resolved = self.resolve_config();
         if let Ok(config) = &resolved.outcome {
             index::record(&self.shared.paths, config).await;
@@ -470,7 +467,9 @@ impl Session {
         }
     }
 
-    async fn list_all_tools(&self) -> Vec<Tool> {
+    /// The first listing shares the startup budget with `initialize`, even once it is spent:
+    /// then it answers at once with what is ready. Later listings get a fresh budget.
+    async fn list_all_tools(&self, first_listing: bool) -> Vec<Tool> {
         self.ensure_ready().await;
         let mut tools = vec![status_tool(), disable_tool()];
         let mut connected = Vec::new();
@@ -493,7 +492,11 @@ impl Session {
             }
         }
 
-        let deadline = self.wait_deadline();
+        let deadline = if first_listing {
+            self.startup_deadline
+        } else {
+            fresh_deadline()
+        };
         let listed = futures::future::join_all(
             connected
                 .into_iter()
@@ -504,23 +507,18 @@ impl Session {
         tools
     }
 
-    /// One server's tools, or none when it doesn't answer by `deadline`: the listing carries on
-    /// and the client is told when it lands.
+    /// One server's tools, or none when it doesn't answer by `deadline`: the client is told when
+    /// they land. Tools cached while connecting come back even when `deadline` has passed.
     async fn tools_of(
         &self,
         server: ResolvedServer,
         upstream: Arc<Upstream>,
         deadline: Instant,
     ) -> Vec<Tool> {
-        let mut listing = tokio::spawn(async move { upstream.tools().await });
-        let Ok(joined) = tokio::time::timeout_at(deadline, &mut listing).await else {
+        let Ok(listed) = tokio::time::timeout_at(deadline, upstream.tools()).await else {
             tracing::info!(server = %server.display_name(), "listing tools is slow; the client hears when they arrive");
-            self.notify_when_listed(listing);
+            self.notify_when_listed(upstream);
             return Vec::new();
-        };
-        let listed = match joined {
-            Ok(listed) => listed,
-            Err(error) => Err(error.into()),
         };
         match listed {
             Ok(upstream_tools) => exposed_tools(&server, upstream_tools),
@@ -531,10 +529,10 @@ impl Session {
         }
     }
 
-    fn notify_when_listed(&self, listing: tokio::task::JoinHandle<anyhow::Result<Vec<Tool>>>) {
+    fn notify_when_listed(&self, upstream: Arc<Upstream>) {
         let session = self.this.clone();
         tokio::spawn(async move {
-            let listed = matches!(listing.await, Ok(Ok(_)));
+            let listed = upstream.tools().await.is_ok();
             if let Some(session) = session.upgrade().filter(|_| listed) {
                 session.notify_tools_changed().await;
             }
@@ -792,8 +790,8 @@ impl ServerHandler for Session {
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
         // Set first, so a server that lands while this listing runs still triggers a change.
-        self.tools_listed.store(true, Ordering::SeqCst);
-        let tools = self.list_all_tools().await;
+        let first_listing = !self.tools_listed.swap(true, Ordering::SeqCst);
+        let tools = self.list_all_tools(first_listing).await;
         Ok(ListToolsResult::with_all_items(tools))
     }
 
@@ -829,7 +827,14 @@ async fn connect(
     may_connect: MayConnect<'_>,
 ) -> ServerStatus {
     match pool.acquire(server, working_dir, may_connect).await {
-        Ok(lease) => ServerStatus::Connected(lease),
+        Ok(lease) => {
+            // Listed while connecting, so the first `tools/list` is answered from the cache even
+            // when the startup budget is already spent.
+            if let Err(error) = lease.upstream.tools().await {
+                tracing::warn!(server = %server.display_name(), error = format!("{error:#}"), "listing tools failed");
+            }
+            ServerStatus::Connected(lease)
+        }
         Err(ConnectError::NeedsLogin { challenge }) => ServerStatus::NeedsLogin { challenge },
         Err(ConnectError::Withdrawn) => {
             tracing::info!(server = %server.display_name(), "trust was withdrawn before connecting");

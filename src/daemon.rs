@@ -7,7 +7,10 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use parking_lot::Mutex;
 use rmcp::ServiceExt;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::{
+    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, SimplexStream,
+    WriteHalf,
+};
 use tokio::net::unix::OwnedReadHalf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Notify;
@@ -24,6 +27,8 @@ const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 /// How long an upstream stays connected after its last session leaves, so a quick restart reuses it.
 const UPSTREAM_GRACE: Duration = Duration::from_secs(60);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Client bytes in flight between the hangup watch and rmcp.
+const RELAY_BUFFER_BYTES: usize = 64 * 1024;
 
 pub async fn run(paths: &Paths, idle_timeout: Duration) -> anyhow::Result<()> {
     paths.ensure_state_dir()?;
@@ -88,7 +93,7 @@ pub async fn run(paths: &Paths, idle_timeout: Duration) -> anyhow::Result<()> {
 pub async fn serve_in_process(paths: &Paths, hints: ProjectHints) -> anyhow::Result<()> {
     let shared = Shared::new(paths.clone());
     spawn_upstream_reaper(&shared);
-    serve_session(shared, hints, rmcp::transport::stdio()).await
+    serve_session(shared, hints, tokio::io::stdin(), tokio::io::stdout()).await
 }
 
 async fn handle_connection(
@@ -115,7 +120,7 @@ async fn handle_connection(
         Hello::Session { version, hints } => {
             warn_on_version_mismatch(&version);
             activity.session_started();
-            if let Err(error) = serve_session(shared, hints, (reader, write_half)).await {
+            if let Err(error) = serve_session(shared, hints, reader, write_half).await {
                 tracing::warn!(error = format!("{error:#}"), "session ended with an error");
             }
             activity.session_ended();
@@ -130,20 +135,42 @@ async fn handle_connection(
     }
 }
 
-async fn serve_session<T, E, A>(
+async fn serve_session<R, W>(
     shared: Arc<Shared>,
     hints: ProjectHints,
-    transport: T,
+    from_client: R,
+    to_client: W,
 ) -> anyhow::Result<()>
 where
-    T: rmcp::transport::IntoTransport<rmcp::RoleServer, E, A>,
-    E: std::error::Error + Send + Sync + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
 {
     tracing::info!(?hints, "session connected");
     let session = Session::new(shared, hints);
-    let served = serve_until_closed(session.clone(), transport).await;
+    let (to_rmcp, relay) = tokio::io::simplex(RELAY_BUFFER_BYTES);
+    let hangup_watch = tokio::spawn(relay_until_hangup(from_client, relay, session.clone()));
+    let served = serve_until_closed(session.clone(), (to_rmcp, to_client)).await;
     session.end();
+    hangup_watch.abort();
     served
+}
+
+/// rmcp reads nothing while our `initialize` handler waits for upstreams, so a client leaving
+/// then would go unnoticed and its pending connections would still start. Relaying its bytes
+/// ourselves sees the hangup at once and ends the session; rmcp then reads EOF too.
+async fn relay_until_hangup<R: AsyncRead + Unpin>(
+    mut from_client: R,
+    mut to_rmcp: WriteHalf<SimplexStream>,
+    session: Arc<Session>,
+) {
+    if let Err(error) = tokio::io::copy(&mut from_client, &mut to_rmcp).await {
+        tracing::debug!(%error, "client connection failed");
+    }
+    tracing::info!("client hung up");
+    session.end();
+    if let Err(error) = to_rmcp.shutdown().await {
+        tracing::debug!(%error, "could not pass the hangup on");
+    }
 }
 
 async fn serve_until_closed<T, E, A>(session: Arc<Session>, transport: T) -> anyhow::Result<()>

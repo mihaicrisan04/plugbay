@@ -15,6 +15,7 @@ use rmcp::service::{NotificationContext, RequestContext};
 use rmcp::transport::TokioChildProcess;
 use rmcp::{ClientHandler, RoleClient, ServiceExt};
 use tempfile::TempDir;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
 
 /// A client whose human answers every plugbay prompt with the same choice, e.g. `allow_once`.
@@ -99,7 +100,7 @@ struct Sandbox {
 /// Stands in for `fnox get <NAME>`: `SLOW_TOKEN` answers after 3 s, `FAILS_SLOWLY` fails after 2 s.
 const FAKE_FNOX: &str = r#"#!/bin/sh
 case "$2" in
-  SLOW_TOKEN) sleep 3; echo test-token ;;
+  SLOW_TOKEN) touch "$(dirname "$0")/slow-token-asked"; sleep 3; echo test-token ;;
   FAILS_SLOWLY) sleep 2; echo "no such secret" >&2; exit 1 ;;
   *) echo test-token ;;
 esac
@@ -178,6 +179,11 @@ env = {{ ECHO_ACCOUNT = "client-b" }}
     }
 
     fn transport(&self, project: &str) -> TokioChildProcess {
+        TokioChildProcess::new(self.shim_command(project)).unwrap()
+    }
+
+    /// `plugbay connect` for `project`, the way an agent launches it.
+    fn shim_command(&self, project: &str) -> tokio::process::Command {
         let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_plugbay"));
         command
             .arg("connect")
@@ -197,7 +203,7 @@ env = {{ ECHO_ACCOUNT = "client-b" }}
                 deadline.as_millis().to_string(),
             );
         }
-        TokioChildProcess::new(command).unwrap()
+        command
     }
 
     fn path_with_fake_tools(&self) -> String {
@@ -1295,30 +1301,90 @@ async fn a_slow_upstream_does_not_hold_up_the_others() {
 #[tokio::test]
 async fn initialize_and_the_first_listing_share_one_startup_budget() {
     let sandbox = Sandbox::with_ready_deadline(Duration::from_secs(3));
+    let echo = echo_server_binary();
     sandbox.append_to_global_config(&format!(
-        "\n[servers.sluggish]\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"sleep 2; exec {}\"]\nenv = {{ ECHO_LIST_DELAY_MS = \"30000\" }}\nenabled = false\n",
-        echo_server_binary().display()
+        "\n[servers.hangs]\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30; exec {echo}\"]\nenabled = false\n\
+         \n[servers.sluggish]\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"sleep 1; exec {echo}\"]\nenv = {{ ECHO_LIST_DELAY_MS = \"30000\" }}\nenabled = false\n",
+        echo = echo.display()
     ));
     write_project(
-        &sandbox.projects.join("sluggish"),
-        "[servers]\necho = \"client-b\"\nsluggish = true\n",
+        &sandbox.projects.join("slow-start"),
+        "[servers]\necho = \"client-b\"\nhangs = true\nsluggish = true\n",
     );
     let warm_up = sandbox.connect("quiet").await;
     warm_up.cancel().await.unwrap();
 
     let started = tokio::time::Instant::now();
-    let client = sandbox.connect("sluggish").await;
+    let client = sandbox.connect("slow-start").await;
     let tools = tool_names(&client).await;
     let elapsed = started.elapsed();
 
     assert!(tools.contains(&"echo__whoami".to_string()), "{tools:?}");
+    assert!(!tools.contains(&"hangs__whoami".to_string()), "{tools:?}");
     assert!(
         !tools.contains(&"sluggish__whoami".to_string()),
         "{tools:?}"
     );
-    // One 3 s budget covers both; separate ones would take 2 s to initialize plus 3 s to list.
-    assert!(elapsed < Duration::from_millis(4300), "took {elapsed:?}");
+    // `hangs` spends the whole 3 s budget in initialize; the first listing must not start another.
+    assert!(elapsed < Duration::from_millis(4200), "took {elapsed:?}");
     client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_client_that_leaves_during_initialize_starts_nothing() {
+    let sandbox = Sandbox::new();
+    let marker = sandbox.plugbay_home.join("local-started");
+    sandbox.append_to_global_config(&format!(
+        "\n[servers.local]\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"touch {marker}; exec {echo}\"]\nenv = {{ TOKEN = \"${{fnox:SLOW_TOKEN}}\" }}\n",
+        marker = marker.display(),
+        echo = echo_server_binary().display()
+    ));
+    let mut shim = sandbox
+        .shim_command("quiet")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = shim.stdin.take().unwrap();
+    let initialize = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": { "name": "leaves-early", "version": "0" }
+        }
+    });
+    stdin
+        .write_all(format!("{initialize}\n").as_bytes())
+        .await
+        .unwrap();
+    wait_for_file(&sandbox, &sandbox.plugbay_home.join("bin/slow-token-asked")).await;
+
+    drop(stdin);
+    shim.wait().await.unwrap();
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    assert!(
+        !marker.exists(),
+        "the command ran after its client left during initialize; daemon log:\n{}",
+        sandbox.daemon_log()
+    );
+}
+
+async fn wait_for_file(sandbox: &Sandbox, path: &Path) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !path.exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{} never appeared; daemon log:\n{}",
+            path.display(),
+            sandbox.daemon_log()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// A project server whose env waits on the fake `fnox` (3 s) and that creates `marker` if it
