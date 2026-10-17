@@ -40,11 +40,11 @@ Values are polymorphic, like mise tool entries:
 
 | value | meaning |
 |---|---|
-| `"acct"` | enable with this account |
+| `"acct"` | enable with this account (what `plugbay use name:acct` writes) |
 | `true` | enable with the tree's default account (`account = ...`), else `default` |
 | `false` | disable (an inherited server) |
-| `["a", "b"]` | explicit multi-account opt-in: both exposed, tools prefixed `name-a__`, `name-b__` |
-| `{ ... }` | inline table, fields below; enables the server unless `enabled = false` |
+| `["a", "b"]` | explicit multi-account opt-in: both exposed, tools prefixed `name-a__`, `name-b__` (`plugbay use name:a name:b`) |
+| `{ ... }` | inline table, fields below; enables the server unless `enabled = false` (`plugbay unuse` sets that rather than dropping the table's settings) |
 
 Table fields:
 
@@ -64,18 +64,18 @@ A server needs either `url` or `command`, unless its name is in the registry (`s
 Definitions you want everywhere but pinned only in some trees live in the global config, switched off:
 
 ```toml
-# ~/.config/plugbay/config.toml   (plugbay add wa --url http://127.0.0.1:7373/mcp)
-[servers.wa]
-url = "http://127.0.0.1:7373/mcp"
+# ~/.config/plugbay/config.toml   (plugbay add huggingface --url https://huggingface.co/mcp)
+[servers.huggingface]
+url = "https://huggingface.co/mcp"
 enabled = false
 
-[servers.teams]                   # plugbay add teams -- npx -y msteams-mcp@0.28.0
+[servers.playwright]              # plugbay add playwright -- npx -y @playwright/mcp@latest
 command = "npx"
-args = ["-y", "msteams-mcp@0.28.0"]
+args = ["-y", "@playwright/mcp@latest"]
 enabled = false
 ```
 
-A tree then pins it like a registry server (`wa = true`, `teams = "work"`; `plugbay use wa` writes that). The global config is always trusted, so catalog stdio servers never prompt for trust, and project files stay pure pins. `ls` lists catalog entries as available, not as disabled; agents can switch one on for their session with `plugbay__enable`.
+A tree then pins it like a registry server (`huggingface = true`, `playwright = "work"`; `plugbay use huggingface` writes that). `plugbay ls --available` lists the registry and the catalog. `plugbay add` refuses plain `http://` except to localhost, a name the registry already has (it would redirect every existing pin; `--force` to mean it), and `--env` values under secret-looking names that aren't `${...}` refs. The global config is always trusted, so catalog stdio servers never prompt for trust, and project files stay pure pins. `ls` lists catalog entries as available, not as disabled; agents can switch one on for their session with `plugbay__enable`.
 
 ### Merge rules
 

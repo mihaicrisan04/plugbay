@@ -36,12 +36,10 @@ Works with Claude Code and Codex, and with T3 Code through them.
 [servers]
 linear = "agency"
 
-# ~/work/acme/plugbay.toml: every Acme repo
-account = "acme"
-
+# ~/work/acme/plugbay.toml: every Acme repo (`plugbay use sentry:acme posthog:acme`)
 [servers]
-sentry = true      # sentry:acme
-posthog = true     # posthog:acme
+sentry = "acme"
+posthog = "acme"
 ```
 
 ## How it works
@@ -111,6 +109,7 @@ Starting fresh:
 
 ```sh
 plugbay setup                                  # register plugbay in Claude Code and Codex
+plugbay ls --available                         # the built-in servers and your catalog
 cd ~/work/acme && plugbay use sentry:acme posthog:acme
 plugbay login                                  # log in to every account that still needs it
 ```
@@ -128,10 +127,9 @@ linear = "agency"          # registry server, account "agency"
 sentry = "agency"
 
 # ~/work/acme/plugbay.toml: every repo for this client
-account = "acme"           # default account for servers in this tree
 [servers]
-sentry = true              # sentry:acme
-posthog = true             # posthog:acme
+sentry = "acme"            # sentry:acme
+posthog = "acme"           # posthog:acme
 linear = false             # not for this client
 
 # ~/work/acme/app/plugbay.toml
@@ -139,10 +137,12 @@ linear = false             # not for this client
 posthog = { exclude_tools = ["delete_*"] }
 ```
 
+`plugbay use sentry:acme` writes `sentry = "acme"`. A tree where most servers share one account can say it once instead: `account = "acme"` at the top, then `sentry = true`.
+
 | value | meaning |
 | --- | --- |
 | `"acme"` | on, with this account |
-| `true` | on, with the tree's `account` (else `default`) |
+| `true` | on, with the tree's `account = "..."` (else `default`) |
 | `false` | off, even if a parent turned it on |
 | `["a", "b"]` | both accounts on purpose; tools become `name-a__*`, `name-b__*` |
 | `{ ... }` | `account`, `url`, `headers`, `command`/`args`/`env`/`cwd`, `tools`/`exclude_tools`, `enabled` |
@@ -153,8 +153,10 @@ posthog = { exclude_tools = ["delete_*"] }
 
 ```sh
 plugbay add wiki --url https://mcp.wiki.example.com/mcp
-plugbay add teams -- npx -y msteams-mcp
+plugbay add playwright -- npx -y @playwright/mcp
 ```
+
+`add` refuses plain `http://` to anything but localhost, a name that would silently replace a built-in server (unless `--force`), and `--env` values that look like secrets: pass a reference such as `--env 'API_KEY=${keychain:playwright/API_KEY}'` instead.
 
 ```toml
 # ~/.config/plugbay/config.toml (written by `plugbay add`)
@@ -186,22 +188,23 @@ The full reference is [docs/config-schema.md](docs/config-schema.md).
 
 | `plugbay <command>` | what it does |
 | --- | --- |
-| `use <server[:account]>...` | Pin servers for this directory (`--local` for `plugbay.local.toml`, `-g` for global) |
-| `unuse <server>...` | Remove a pin, or switch off a server this directory inherits |
-| `ls` | The servers resolved here, and why any are missing (`--all`: every directory plugbay has seen) |
+| `use <server[:account]>...` | Pin servers for this directory (`--local` for `plugbay.local.toml`, `-g` for global). Two accounts of one server write `["a", "b"]` |
+| `unuse <server>...` | Remove a pin (a pin with settings is kept as `enabled = false`), or switch off a server this directory inherits |
+| `ls` | The servers resolved here, and why any are missing (`--all`: every directory plugbay has seen; `--available`: every server you can pin) |
 | `why <server>` | Which file set each field of a server |
 | `accounts` | Every account in use: logged in or not, verified as whom, used where |
 | `login [server[:account]]` | OAuth login, or `--token` / `--from-env VAR` for an API token. No argument: every missing login |
 | `logout <server[:account]>` | Forget a stored login or token |
 | `add <name> --url <url>` | Add a remote server to the catalog (`-- <command...>` for a stdio server) |
-| `remove <name>` | Remove a server from the catalog |
+| `remove <name>` | Remove a server from the catalog (`unuse` stops using one here) |
 | `trust` | Trust the executable parts of this directory's config (`--revoke` to undo) |
 | `migrate` | Move servers out of Claude Code and Codex (`--apply`, `--undo`) |
 | `setup` | Register plugbay in Claude Code and Codex (`--client`, `--dry-run`) |
 | `doctor` | Check the installation, daemon, config and client setup |
+| `stop` | Stop the daemon; agents start a fresh one on their next connection |
 | `completion <shell>` | Shell completions for bash, zsh, fish, elvish, powershell |
 
-Every command takes `-C <dir>` to act as if started in another directory. Agents get three tools of their own: `plugbay__status` (what resolved and why), `plugbay__enable` and `plugbay__disable` (switch a known server on or off for this session only).
+`connect` (what agents run) and `daemon` (started by `connect`; run it by hand with `--log-level debug` to debug) are internal. Every command takes `-C <dir>` to act as if started in another directory. Agents get three tools of their own: `plugbay__status` (what resolved and why), `plugbay__enable` and `plugbay__disable` (switch a known server on or off for this session only).
 
 ## Security model
 
