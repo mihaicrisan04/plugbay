@@ -119,8 +119,8 @@ Roadmap, in order:
 3. **Done:** `migrate` replacing `import` (kept, hidden): native configs plus Claude Code's per-directory disable lists → catalog definitions + inferred pin tree; bearer tokens → bound credentials, other secrets → keychain refs; `setup`; native entries removed; one journal; `--undo`
 4. **Done:** verified accounts: who a login really is (a registry-defined whoami tool, run by the daemon once per new connection, cached a day in `state/accounts.toml`) shown next to the label in `ls`, `accounts`, `doctor` and the agent's instructions; two labels on the same account flagged; `[accounts.<server>.<label>] expect = "..."` turns a mismatched server off with a message saying how to fix it
 5. **Done (v0.2.1):** hardening after an audit, a sandboxed first-run test and three review rounds (decisions in the next section); `ls --available`, did-you-mean, `add` guards, `completion`
-6. Next, the launch headline: tools on demand. A meta-tool mode (`search_tools` / `call_tool`) so agents load tools when needed instead of every server's tools up front; measurable token savings, and it sidesteps Codex never re-listing tools
-7. Then: `search` / `add` from the official MCP Registry (`registry.modelcontextprotocol.io/v0.1/servers`, prefer vendor namespaces), curated stdio entries (convex, xcodebuild), `export` to `.mcp.json` / `.vscode/mcp.json` / Agent Plugins `mcp.json`, `tools`, `call`, `logs`, `restart`, `prune`, `self-update`
+6. ~~Tools on demand (a `search_tools` / `call_tool` meta-tool mode)~~ Dropped on 2026-10-17 (Mihai): Claude Code already defers MCP tool definitions behind its own tool search, so a second layer would only duplicate it and hide tools from the client's search. plugbay's lever on context is the same as its purpose: only the servers a project needs, with the right accounts
+7. Next: `search` / `add` from the official MCP Registry (`registry.modelcontextprotocol.io/v0.1/servers`, prefer vendor namespaces), curated stdio entries (convex, xcodebuild), `export` to `.mcp.json` / `.vscode/mcp.json` / Agent Plugins `mcp.json`, `tools`, `call`, `logs`, `restart`, `prune`, `self-update`
 
 Decisions made for step 1 (Mihai said go ahead on the proposal; both defaults are revisitable):
 
@@ -140,7 +140,7 @@ Decisions made for steps 2 and 3 (Mihai approved the session-enable idea; the re
 - **migrate:** definitions all go to the global catalog (trusted, so no trust prompts ever). A user-wide server switched off in some directories becomes either "on everywhere + `false` at the topmost uniformly-off directories" or "catalog + `true` at the topmost uniformly-on directories", whichever needs fewer pins (ties keep it on everywhere); pins never climb to `$HOME`. Local-scope servers are pinned in their directory. Pins inside a git checkout go to `plugbay.local.toml`. `.mcp.json` entries are pinned but never removed (team file). Accounts are `default`; rename with `use`
 - **migrate --undo** restores every plugbay file and the Codex config from the journal, deletes keychain entries and tokens the run created (pre-existing ones are never recorded), removes the `plugbay` entry from Claude Code if the run added it, and re-adds removed Claude Code entries from the saved copy of `~/.claude.json` unless they hold a literal secret (never put on a command line; the user copies those back). `~/.claude.json` itself is never restored wholesale: Claude Code rewrites it constantly
 - Verified accounts (step 4): only registry entries carry a whoami (`tool`, `arguments`, JSON pointers to show), matched by server identity, so committed config can never choose which tool plugbay calls; a whoami tool annotated as not read-only is refused. Answers are hostile input: over 64 KiB refused, control/bidi characters stripped, 80 chars max. Not in the keychain (not secret, and reads would prompt). Configured for linear, github, sentry, atlassian, vercel, stripe, supabase; posthog and notion wait for a confirmed tool. Servers whose whoami lists every org a user can see (sentry, atlassian, vercel) describe the user's reach rather than one workspace, so the "same account" check is worded as "fine if intended"
-- **One keychain item (`plugbay-vault`)** holds every secret plugbay stores itself (OAuth logins, tokens, `${keychain:plugbay/...}` refs) as a JSON map. Dogfooding showed why: macOS asks before an unrecognised app reads each item, an unsigned binary is unrecognised after every rebuild/upgrade, and status commands read every login, so N logins meant N+ prompts per upgrade. Now it is one. Reads are cached per process (the daemon drops its cache on `reload` / `credentials_changed`); writes re-read the item under `state/vault.lock`. Old per-login items are copied in on first read and left in place (deleting them could prompt again). User-owned `${keychain:<other service>/...}` refs are untouched. Tests use `PLUGBAY_INSECURE_TEST_VAULT=<file>` so they never touch the keychain. Developer ID signing (zero prompts) is a launch item in docs/releasing.md
+- **One keychain item (`plugbay-vault`)** holds every secret plugbay stores itself (OAuth logins, tokens, `${keychain:plugbay/...}` refs) as a JSON map. Dogfooding showed why: macOS asks before an unrecognised app reads each item, an unsigned binary is unrecognised after every rebuild/upgrade, and status commands read every login, so N logins meant N+ prompts per upgrade. Now it is one. Reads are cached per process (the daemon drops its cache on `reload` / `credentials_changed`); writes re-read the item under `state/vault.lock`. Old per-login items are copied in on first read and left in place (deleting them could prompt again). User-owned `${keychain:<other service>/...}` refs are untouched. Tests use `PLUGBAY_INSECURE_TEST_VAULT=<file>` so they never touch the keychain. Developer ID signing (zero prompts after the first signed version) is set up in docs/releasing.md
 - `setup` writes the `PATH` link to the binary (`/opt/homebrew/bin/plugbay`), not the versioned file behind it, so `brew upgrade` doesn't break agents. With no keychain at all (Linux without a Secret Service), reads find nothing and writes explain what to start
 
 ## Hardening decisions (2026-10-17)
@@ -173,11 +173,23 @@ From an audit of the session runtime; Mihai approved each.
 
 ## Next steps
 
-1. Release v0.2.1: `HOMEBREW_TAP_TOKEN` secret, tag, brew formula; Developer ID signing so upgrades don't re-prompt for the keychain
+1. Release v0.2.1: `HOMEBREW_TAP_TOKEN` secret, tag, brew formula. Developer ID signing is wired into the release workflow (`packaging/macos/sign.sh`); it needs the certificate and notarization key as secrets (docs/releasing.md), then the README's keychain note changes
 2. Launch: awesome-mcp-servers (Aggregators), Show HN led by the wrong-account story, r/ClaudeAI and r/codex, a note on anthropics/claude-code#27302 (multi-account connectors, 400+ 👍)
-3. Tools on demand (roadmap 6), then registry search/export (roadmap 7)
+3. Registry search/add and exports (roadmap 7)
 4. Real-service checks from the gaps list; one shared "what resolved here" report model; Linux Secret Service edge cases
 5. Side quest: PR to T3 Code wiring `onElicitation` into its Claude adapter so trust prompts work there
+
+## Backlog: waiting on Mihai
+
+The release and launch are parked until these are done (added 2026-10-17). Agents: remind Mihai when release or launch work comes up.
+
+- [ ] Developer ID Application certificate for team `QJLTVSB2G4` (only an Apple Development one exists on the Mac), exported as `.p12`
+- [ ] App Store Connect API key (Team Keys, Developer role) for notarization: `.p8`, Key ID, Issuer ID
+- [ ] Actions secrets `MACOS_CERTIFICATE_P12`, `MACOS_CERTIFICATE_PASSWORD`, `APPLE_API_KEY_P8`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER_ID` (commands in docs/releasing.md)
+- [ ] `HOMEBREW_TAP_TOKEN`: fine-grained token, Contents read/write on `mihaicrisan04/homebrew-tap`
+- [ ] Logo SVG edits (`docs/assets/logo-{light,dark}.svg`): commit or discard
+
+Then, on Mihai's go-ahead: tag `v0.2.1`, check `codesign -dv` shows `TeamIdentifier=QJLTVSB2G4` on the brew-installed binary, update the README's keychain note, test `brew install` on a clean machine, re-record `demo.gif` if output changed, and review the launch drafts (`~/dev/personal/plugbay-launch/drafts.md`; replace the invented "One morning Claude…" story) before anything is posted.
 
 ## Naming
 
