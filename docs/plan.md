@@ -118,8 +118,9 @@ Roadmap, in order:
 2. **Done:** location-independent CLI: an index of every config directory plugbay has seen; `login` from anywhere and `login` with no args (every missing credential in one go); global `-C <dir>`; `ls --all`; `accounts`; `use` / `unuse` (`-g`, `--local`); `add` / `remove` for the catalog; `plugbay__enable` / `plugbay__disable` for one agent session
 3. **Done:** `migrate` replacing `import` (kept, hidden): native configs plus Claude Code's per-directory disable lists → catalog definitions + inferred pin tree; bearer tokens → bound credentials, other secrets → keychain refs; `setup`; native entries removed; one journal; `--undo`
 4. **Done:** verified accounts: who a login really is (a registry-defined whoami tool, run by the daemon once per new connection, cached a day in `state/accounts.toml`) shown next to the label in `ls`, `accounts`, `doctor` and the agent's instructions; two labels on the same account flagged; `[accounts.<server>.<label>] expect = "..."` turns a mismatched server off with a message saying how to fix it
-5. Then: `search` (registry), curated stdio entries in the registry (convex, xcodebuild), `tools`, `call`, `logs`, `restart`, `status`, `export` (plain `.mcp.json` for teammates/CI), `prune`, `completion`, `self-update`
-6. Spike, later: meta-tool search mode so agents load tools on demand
+5. **Done (v0.2.1):** hardening after an audit, a sandboxed first-run test and three review rounds (decisions in the next section); `ls --available`, did-you-mean, `add` guards, `completion`
+6. Next, the launch headline: tools on demand. A meta-tool mode (`search_tools` / `call_tool`) so agents load tools when needed instead of every server's tools up front; measurable token savings, and it sidesteps Codex never re-listing tools
+7. Then: `search` / `add` from the official MCP Registry (`registry.modelcontextprotocol.io/v0.1/servers`, prefer vendor namespaces), curated stdio entries (convex, xcodebuild), `export` to `.mcp.json` / `.vscode/mcp.json` / Agent Plugins `mcp.json`, `tools`, `call`, `logs`, `restart`, `prune`, `self-update`
 
 Decisions made for step 1 (Mihai said go ahead on the proposal; both defaults are revisitable):
 
@@ -172,10 +173,10 @@ From an audit of the session runtime; Mihai approved each.
 
 ## Next steps
 
-1. Sign off (or change) the provisional config schema ([config-schema.md](config-schema.md))
-2. v0.1 is built here in Rust (`feat/v0.1`); compare with the TS spike in `../plugbay-ts` if still useful
-3. Real-service checks from the gaps list above
-4. Dogfood → colleagues → launch
+1. Release v0.2.1: `HOMEBREW_TAP_TOKEN` secret, tag, brew formula; Developer ID signing so upgrades don't re-prompt for the keychain
+2. Launch: awesome-mcp-servers (Aggregators), Show HN led by the wrong-account story, r/ClaudeAI and r/codex, a note on anthropics/claude-code#27302 (multi-account connectors, 400+ 👍)
+3. Tools on demand (roadmap 6), then registry search/export (roadmap 7)
+4. Real-service checks from the gaps list; one shared "what resolved here" report model; Linux Secret Service edge cases
 5. Side quest: PR to T3 Code wiring `onElicitation` into its Claude adapter so trust prompts work there
 
 ## Naming
