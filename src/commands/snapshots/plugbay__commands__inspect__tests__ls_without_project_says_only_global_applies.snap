@@ -8,4 +8,4 @@ Config files (merge order)
   none found
 
 Servers
-  none
+  none yet: `plugbay ls --available` lists the servers you can pin with `plugbay use`

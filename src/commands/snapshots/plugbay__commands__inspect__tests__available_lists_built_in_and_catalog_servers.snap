@@ -1,0 +1,21 @@
+---
+source: src/commands/inspect.rs
+expression: "format_available(&config, &catalog, Path::new(HOME))"
+---
+Built in
+  atlassian  Atlassian  https://mcp.atlassian.com/v1/mcp
+  context7   Context7   https://mcp.context7.com/mcp
+  github     GitHub     https://api.githubcopilot.com/mcp/
+  linear     Linear     https://mcp.linear.app/mcp          replaced by your catalog
+  notion     Notion     https://mcp.notion.com/mcp
+  posthog    PostHog    https://mcp.posthog.com/mcp         in use here
+  sentry     Sentry     https://mcp.sentry.dev/mcp
+  stripe     Stripe     https://mcp.stripe.com
+  supabase   Supabase   https://mcp.supabase.com/mcp
+  vercel     Vercel     https://mcp.vercel.com
+
+Your catalog (~/.config/plugbay/config.toml)
+  playwright  npx -y @playwright/mcp
+  linear      https://linear.example.test/mcp  in use here
+
+Pin one here with `plugbay use <name>` or `plugbay use <name>:<account>`.

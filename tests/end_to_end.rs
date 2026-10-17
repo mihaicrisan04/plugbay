@@ -771,3 +771,293 @@ async fn use_and_unuse_write_pins_that_ls_and_accounts_see() {
     sandbox.plugbay(&["use", "nope"], "fresh");
     assert_eq!(std::fs::read_to_string(&pins_file).unwrap(), "[servers]\n");
 }
+
+/// Runs the binary like `Sandbox::plugbay`, keeping stderr and the exit status too.
+fn plugbay_output(sandbox: &Sandbox, args: &[&str], project: &str) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_plugbay"))
+        .args(args)
+        .current_dir(sandbox.projects.join(project))
+        .env("PLUGBAY_HOME", &sandbox.plugbay_home)
+        .env(
+            "PLUGBAY_INSECURE_TEST_VAULT",
+            sandbox.plugbay_home.join("vault.json"),
+        )
+        .env_remove("PLUGBAY_LOG")
+        .output()
+        .unwrap()
+}
+
+fn text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+#[tokio::test]
+async fn use_with_two_accounts_writes_the_list_form_and_says_what_it_replaced() {
+    let sandbox = Sandbox::new();
+    write_project(&sandbox.projects.join("fresh"), "");
+    let pins_file = sandbox.projects.join("fresh/plugbay.toml");
+
+    let both = sandbox.plugbay(&["use", "echo:client-a", "echo:client-b"], "fresh");
+    assert_eq!(
+        std::fs::read_to_string(&pins_file).unwrap(),
+        "[servers]\necho = [\"client-a\", \"client-b\"]\n"
+    );
+    assert_eq!(both.matches("Using echo:client-a in").count(), 1, "{both}");
+    assert_eq!(both.matches("Using echo:client-b in").count(), 1, "{both}");
+
+    let one = sandbox.plugbay(&["use", "echo:client-b"], "fresh");
+    assert!(one.contains("(was client-a, client-b)"), "{one}");
+}
+
+#[tokio::test]
+async fn unuse_keeps_a_pins_settings_and_knows_when_there_is_nothing_to_do() {
+    let sandbox = Sandbox::new();
+    let pins_file = sandbox.projects.join("client-a/plugbay.toml");
+
+    sandbox.plugbay(&["unuse", "echo"], "client-a");
+    let switched_off = std::fs::read_to_string(&pins_file).unwrap();
+    assert_eq!(
+        switched_off,
+        "[servers]\necho = { account = \"client-a\", exclude_tools = [\"delete_*\"], enabled = false }\n"
+    );
+
+    let again = sandbox.plugbay(&["unuse", "echo"], "client-a");
+    assert!(again.contains("echo is already off here"), "{again}");
+    assert_eq!(std::fs::read_to_string(&pins_file).unwrap(), switched_off);
+
+    sandbox.plugbay(&["use", "echo"], "client-a");
+    assert_eq!(
+        std::fs::read_to_string(&pins_file).unwrap(),
+        "[servers]\necho = { account = \"client-a\", exclude_tools = [\"delete_*\"] }\n"
+    );
+
+    let unknown = plugbay_output(&sandbox, &["unuse", "notthere"], "client-a");
+    assert!(!unknown.status.success());
+    assert!(
+        text(&unknown.stderr).contains("doesn't know how to reach notthere"),
+        "{}",
+        text(&unknown.stderr)
+    );
+}
+
+#[tokio::test]
+async fn typos_and_unknown_servers_point_at_what_exists() {
+    let sandbox = Sandbox::new();
+    write_project(&sandbox.projects.join("fresh"), "");
+
+    let typo = plugbay_output(&sandbox, &["use", "sentri"], "fresh");
+    assert!(!typo.status.success());
+    assert!(
+        text(&typo.stderr).contains("did you mean `sentry`?"),
+        "{}",
+        text(&typo.stderr)
+    );
+
+    let available = sandbox.plugbay(&["ls", "--available"], "fresh");
+    assert!(
+        available.contains("https://mcp.linear.app/mcp"),
+        "{available}"
+    );
+    assert!(available.contains("echo"), "{available}");
+
+    let empty = sandbox.plugbay(&["ls"], "fresh");
+    assert!(empty.contains("plugbay ls --available"), "{empty}");
+}
+
+#[tokio::test]
+async fn add_refuses_shadowing_plain_http_and_plaintext_secrets() {
+    let sandbox = Sandbox::new();
+    let global_config = sandbox.plugbay_home.join("config/config.toml");
+    let before = std::fs::read_to_string(&global_config).unwrap();
+
+    let refused = [
+        &["add", "linear", "--url", "https://evil.example.com/mcp"][..],
+        &[
+            "add",
+            "intranet",
+            "--url",
+            "http://intranet.example.com/mcp",
+        ][..],
+        &[
+            "add",
+            "tool",
+            "--env",
+            "API_KEY=test-token",
+            "--",
+            "npx",
+            "tool",
+        ][..],
+    ];
+    for args in refused {
+        let output = plugbay_output(&sandbox, args, "client-a");
+        assert!(!output.status.success(), "{args:?} was accepted");
+        assert!(
+            !text(&output.stderr).contains("test-token"),
+            "{}",
+            text(&output.stderr)
+        );
+    }
+    assert_eq!(std::fs::read_to_string(&global_config).unwrap(), before);
+
+    let local = plugbay_output(
+        &sandbox,
+        &["add", "local", "--url", "http://127.0.0.1:7373/mcp"],
+        "client-a",
+    );
+    assert!(local.status.success(), "{}", text(&local.stderr));
+}
+
+#[tokio::test]
+async fn piped_cli_output_has_no_colour_codes_or_info_lines() {
+    let sandbox = Sandbox::new();
+    let plain = plugbay_output(&sandbox, &["ls"], "client-a");
+    let debug = plugbay_output(&sandbox, &["--log-level", "debug", "ls"], "client-a");
+
+    for output in [&plain, &debug] {
+        let stdout = text(&output.stdout);
+        let stderr = text(&output.stderr);
+        assert!(!stdout.contains('\u{1b}'), "{stdout}");
+        assert!(!stderr.contains('\u{1b}'), "{stderr}");
+    }
+    let plain_stderr = text(&plain.stderr);
+    assert!(!plain_stderr.contains("INFO"), "{plain_stderr}");
+}
+
+/// A machine with Claude Code config but no real `claude`: a fake CLI on `PATH` records calls.
+struct MigrateSandbox {
+    _temp: TempDir,
+    root: PathBuf,
+    home: PathBuf,
+}
+
+impl MigrateSandbox {
+    fn new() -> Self {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let home = root.join("home");
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        let claude = bin.join("claude");
+        std::fs::write(&claude, "#!/bin/sh\necho \"$*\" >> \"$FAKE_CLAUDE_LOG\"\n").unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Self {
+            _temp: temp,
+            root,
+            home,
+        }
+    }
+
+    fn plugbay(&self, args: &[&str]) -> std::process::Output {
+        let search_path = format!("{}:/usr/bin:/bin", self.root.join("bin").display());
+        std::process::Command::new(env!("CARGO_BIN_EXE_plugbay"))
+            .args(args)
+            .current_dir(&self.home)
+            .env_clear()
+            .env("HOME", &self.home)
+            .env("PATH", search_path)
+            .env("PLUGBAY_HOME", self.root.join("plugbay-home"))
+            .env(
+                "PLUGBAY_INSECURE_TEST_VAULT",
+                self.root.join("plugbay-home/vault.json"),
+            )
+            .env("FAKE_CLAUDE_LOG", self.claude_log_path())
+            .output()
+            .unwrap()
+    }
+
+    fn claude_log_path(&self) -> PathBuf {
+        self.root.join("claude.log")
+    }
+
+    fn claude_calls(&self) -> String {
+        std::fs::read_to_string(self.claude_log_path()).unwrap_or_default()
+    }
+}
+
+#[tokio::test]
+async fn migrate_merges_into_existing_pins_keeps_checkouts_clean_and_undoes_once() {
+    let sandbox = MigrateSandbox::new();
+    let repo = sandbox.root.join("elsewhere/repo");
+    let committed = "[servers]\nposthog = { exclude_tools = [\"delete_*\"] }\n";
+    write_cloned_project(&repo, committed);
+    let plain = sandbox.home.join("work/plain");
+    let plain_pins = "[servers]\nposthog = { exclude_tools = [\"delete_*\"] } # careful\n";
+    write_project(&plain, plain_pins);
+    let other = sandbox.home.join("work/other");
+    std::fs::create_dir_all(&other).unwrap();
+
+    let claude_config = serde_json::json!({
+        "mcpServers": {
+            "github": { "type": "http", "url": "https://api.githubcopilot.com/mcp/" },
+            "posthog": { "type": "http", "url": "https://mcp.posthog.com/mcp" },
+        },
+        "projects": {
+            repo.display().to_string(): { "disabledMcpServers": ["github"] },
+            plain.display().to_string(): { "disabledMcpServers": ["posthog"] },
+            other.display().to_string(): {},
+        },
+    });
+    std::fs::write(sandbox.home.join(".claude.json"), claude_config.to_string()).unwrap();
+
+    let plan = text(&sandbox.plugbay(&["migrate"]).stdout);
+    assert!(
+        plan.contains("posthog: keeps exclude_tools, sets enabled = false"),
+        "{plan}"
+    );
+
+    let applied = sandbox.plugbay(&["migrate", "--apply"]);
+    assert!(applied.status.success(), "{}", text(&applied.stderr));
+    assert_eq!(
+        std::fs::read_to_string(plain.join("plugbay.toml")).unwrap(),
+        "[servers]\nposthog = { exclude_tools = [\"delete_*\"], enabled = false } # careful\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("plugbay.toml")).unwrap(),
+        committed
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("plugbay.local.toml")).unwrap(),
+        "[servers]\ngithub = false\n"
+    );
+    let repo_status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["status", "--porcelain"])
+        .output()
+        .unwrap();
+    assert_eq!(text(&repo_status.stdout), "?? plugbay.local.toml\n");
+
+    let undone = sandbox.plugbay(&["migrate", "--undo"]);
+    assert!(undone.status.success(), "{}", text(&undone.stderr));
+    assert_eq!(
+        std::fs::read_to_string(plain.join("plugbay.toml")).unwrap(),
+        plain_pins
+    );
+    assert!(!repo.join("plugbay.local.toml").exists());
+
+    let calls_after_undo = sandbox.claude_calls();
+    assert_eq!(
+        calls_after_undo
+            .matches("add-json --scope user github")
+            .count(),
+        1,
+        "{calls_after_undo}"
+    );
+    std::fs::write(plain.join("plugbay.toml"), "[servers]\nlinear = true\n").unwrap();
+
+    let second = sandbox.plugbay(&["migrate", "--undo"]);
+    assert!(!second.status.success());
+    assert!(
+        text(&second.stderr).contains("already undone"),
+        "{}",
+        text(&second.stderr)
+    );
+    assert_eq!(sandbox.claude_calls(), calls_after_undo);
+    assert_eq!(
+        std::fs::read_to_string(plain.join("plugbay.toml")).unwrap(),
+        "[servers]\nlinear = true\n"
+    );
+}
