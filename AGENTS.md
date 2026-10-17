@@ -18,7 +18,7 @@ Status: v0.1 in progress on `feat/v0.1`. This repo is the Rust implementation; `
 - **Project detection:** `CLAUDE_PROJECT_DIR` / explicit flag > MCP roots (hint only) > shim cwd (ignore `/`, `$HOME`) > global
 - **Config never holds secrets.** OAuth logins and static tokens (`plugbay login <server> --token`) live in the OS keychain; stdio env secrets are refs (`op://`, `keychain:`, `env:`, `fnox:`)
 - **Credentials bind to server identity** (URL / OAuth issuer / stdio command hash) plus account, so a repo can't redirect a token by redefining a server name
-- **Trust only for executable config** (stdio commands, secret refs) **that arrived from elsewhere**: files written on this machine (outside git, untracked or locally edited) are trusted on sight; a committed file as cloned/pulled gets one in-agent prompt, `plugbay trust` as fallback, hashing only the executable parts
+- **Trust only for executable config** (stdio commands, secret refs) in project files: one in-agent prompt, `plugbay trust` as fallback, hashing only the executable parts so an edit to them asks again. Never trusted on sight: an agent can write files too. The global config is always trusted
 
 ## Stack
 
@@ -38,9 +38,9 @@ Status: v0.1 in progress on `feat/v0.1`. This repo is the Rust implementation; `
 
 ## Code map
 
-- `src/main.rs` CLI · `shim.rs` (`connect`) → `daemon.rs` (socket, control, idle exit) → `session.rs` (one agent: tools, login stubs, trust prompt, `plugbay__enable`/`__disable` session pins, config watch) → `upstream.rs` (shared upstream pool) + `upstream/stdio.rs` (process groups, message cap)
+- `src/main.rs` CLI · `shim.rs` (`connect`) → `daemon.rs` (socket, control, idle exit) → `session.rs` (one agent: refresh, upstream connects, routing, config watch) + `session/{enable,login,prompt,render,tools}.rs` (session pins, login stubs, trust/account prompts, instructions and status, built-in tools) → `upstream.rs` (shared upstream pool) + `upstream/stdio.rs` (process groups, message cap)
 - `config.rs` + `config/{file,merge,build}.rs` + `registry.rs` + `project.rs`: resolution (catalog = global entries with `enabled = false`) · `index.rs`: every config directory seen, for commands that work from anywhere
-- `secrets.rs`, `credentials.rs`, `oauth.rs`, `trust.rs` + `trust/origin.rs`, `identity.rs`: security and verified accounts
+- `secrets.rs`, `credentials.rs`, `oauth.rs`, `trust.rs`, `identity.rs`: security and verified accounts
 - `commands/`: `access.rs` (login/logout/trust), `inspect.rs` (ls/accounts/why), `pins.rs` (use/unuse/add/remove) · `clients.rs` + `clients/{claude,codex,import,migrate}.rs`: native client configs, `setup`, `migrate` · `doctor.rs`
 
 ## Skills

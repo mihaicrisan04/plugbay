@@ -1,9 +1,8 @@
 //! Trust for config that executes code or resolves secrets, pinned to a fingerprint of those parts.
-//! Files written on this machine are trusted on sight; only config delivered from elsewhere asks.
+//! Only the human grants it (`plugbay trust`, the in-agent prompt, `trusted_paths`): an agent can
+//! write files too, so where a file came from proves nothing.
 
-mod origin;
-
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -28,9 +27,6 @@ pub struct Trust {
 struct TrustFile {
     #[serde(default)]
     files: BTreeMap<String, String>,
-    /// Files revoked with `plugbay trust --revoke`: never trusted on sight again, only by `plugbay trust`.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    revoked: BTreeSet<String>,
 }
 
 impl Trust {
@@ -70,39 +66,6 @@ impl Trust {
             .collect()
     }
 
-    /// Grants lasting trust to each untrusted file that was written on this machine rather than
-    /// delivered by git or a download. Runs git, so call it off the async runtime.
-    pub fn grant_files_written_here(&mut self, config: &ResolvedConfig) -> Vec<PathBuf> {
-        let revoked = match self.load() {
-            Ok(trust_file) => trust_file.revoked,
-            Err(error) => {
-                tracing::warn!(error = format!("{error:#}"), "not trusting files on sight");
-                return Vec::new();
-            }
-        };
-        let written_here: Vec<ConfigFile> = self
-            .untrusted_files(config)
-            .into_iter()
-            .filter(|file| !revoked.contains(&path_key(&file.path)))
-            .filter(|file| origin::was_written_here(&file.path))
-            .cloned()
-            .collect();
-
-        let mut granted = Vec::new();
-        for file in written_here {
-            match self.grant_always(&file) {
-                Ok(()) => {
-                    tracing::info!(path = %file.path.display(), "trusted a config file written on this machine");
-                    granted.push(file.path);
-                }
-                Err(error) => {
-                    tracing::warn!(path = %file.path.display(), error = format!("{error:#}"), "could not save trust")
-                }
-            }
-        }
-        granted
-    }
-
     pub fn grant_for_session(&mut self, file: &ConfigFile) {
         let Some(fingerprint) = &file.executable_fingerprint else {
             tracing::warn!(path = %file.path.display(), "config file has no fingerprint to trust");
@@ -120,7 +83,6 @@ impl Trust {
         trust_file
             .files
             .insert(path_key(&file.path), fingerprint.clone());
-        trust_file.revoked.remove(&path_key(&file.path));
         self.save(&trust_file)
     }
 
@@ -133,8 +95,9 @@ impl Trust {
 
         let mut trust_file = self.load()?;
         let revoked_persistent_grant = trust_file.files.remove(&path_key(file)).is_some();
-        trust_file.revoked.insert(path_key(file));
-        self.save(&trust_file)?;
+        if revoked_persistent_grant {
+            self.save(&trust_file)?;
+        }
         Ok(revoked_session_grant || revoked_persistent_grant)
     }
 
@@ -205,18 +168,9 @@ impl Trust {
     }
 }
 
-/// [`Trust::grant_files_written_here`] off the async runtime. Failures are logged, not returned:
-/// a file that was not granted simply keeps asking.
-pub async fn grant_files_written_here(paths: &Paths, config: &ResolvedConfig) {
-    let paths = paths.clone();
-    let config = config.clone();
-    let granting = tokio::task::spawn_blocking(move || {
-        Trust::new(&paths).grant_files_written_here(&config);
-    });
-    if let Err(error) = granting.await {
-        tracing::warn!(%error, "trusting config files written here failed");
-    }
-}
+/// Files are no longer trusted on sight, so this does nothing; it stays until `doctor` and
+/// `ls` stop calling it.
+pub async fn grant_files_written_here(_paths: &Paths, _config: &ResolvedConfig) {}
 
 /// A snapshot of every grant, so one check reads `trust.toml` and builds the globs once.
 struct TrustCheck<'trust> {
@@ -491,40 +445,29 @@ mod tests {
         );
     }
 
-    fn config_needing_trust_from(file: &ConfigFile) -> ResolvedConfig {
+    #[test]
+    fn a_new_file_with_executable_parts_is_not_trusted_however_it_got_here() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("plugbay.local.toml");
+        std::fs::write(&path, "").unwrap();
+        let file = project_file(path.to_str().unwrap(), Some("abc"));
         let mut config = config_with(vec![file.clone()], Vec::new());
         config.servers.push(stdio_server(vec![file.path.clone()]));
-        config
-    }
 
-    #[test]
-    fn file_written_here_is_trusted_on_sight() {
-        let directory = TempDir::new().unwrap();
-        let path = directory.path().join("plugbay.toml");
-        std::fs::write(&path, "").unwrap();
-        let file = project_file(path.to_str().unwrap(), Some("abc"));
-        let config = config_needing_trust_from(&file);
-
-        let mut trust = trust_in(&directory);
-        assert_eq!(trust.grant_files_written_here(&config), vec![path]);
-        assert!(trust_in(&directory).is_file_trusted(&file, &[]));
-    }
-
-    #[test]
-    fn revoked_file_is_not_trusted_on_sight_until_trusted_by_hand() {
-        let directory = TempDir::new().unwrap();
-        let path = directory.path().join("plugbay.toml");
-        std::fs::write(&path, "").unwrap();
-        let file = project_file(path.to_str().unwrap(), Some("abc"));
-        let config = config_needing_trust_from(&file);
-        let mut trust = trust_in(&directory);
-
-        trust.revoke(&file.path).unwrap();
-        assert!(trust.grant_files_written_here(&config).is_empty());
+        let trust = trust_in(&directory);
         assert!(!trust.is_file_trusted(&file, &[]));
+        assert_eq!(trust.untrusted_files(&config), vec![&file]);
+    }
 
+    #[test]
+    fn trusting_again_after_a_revoke_works() {
+        let directory = TempDir::new().unwrap();
+        let file = project_file("/work/app/plugbay.toml", Some("abc"));
+        let mut trust = trust_in(&directory);
         trust.grant_always(&file).unwrap();
         trust.revoke(&file.path).unwrap();
+        assert!(!trust.is_file_trusted(&file, &[]));
+
         trust.grant_always(&file).unwrap();
         assert!(trust.is_file_trusted(&file, &[]));
     }

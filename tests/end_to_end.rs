@@ -17,16 +17,33 @@ use rmcp::{ClientHandler, RoleClient, ServiceExt};
 use tempfile::TempDir;
 use tokio::sync::Notify;
 
-/// A client whose human answers plugbay's trust prompt with `allow_once`.
-struct TrustingClient {
+/// A client whose human answers every plugbay prompt with the same choice, e.g. `allow_once`.
+#[derive(Clone)]
+struct AnsweringClient {
+    answer: &'static str,
     prompts: Arc<std::sync::Mutex<Vec<String>>>,
+    changed: Arc<Notify>,
 }
 
-impl ClientHandler for TrustingClient {
+impl AnsweringClient {
+    fn new(answer: &'static str) -> Self {
+        Self {
+            answer,
+            prompts: Arc::default(),
+            changed: Arc::default(),
+        }
+    }
+
+    fn prompts(&self) -> Vec<String> {
+        self.prompts.lock().unwrap().clone()
+    }
+}
+
+impl ClientHandler for AnsweringClient {
     fn get_info(&self) -> ClientConfig {
         ClientConfig::new(
             ClientCapabilities::builder().enable_elicitation().build(),
-            Implementation::new("trusting-test-client", "0.0.0"),
+            Implementation::new("answering-test-client", "0.0.0"),
         )
     }
 
@@ -37,7 +54,11 @@ impl ClientHandler for TrustingClient {
     ) -> Result<ElicitResult, rmcp::ErrorData> {
         self.prompts.lock().unwrap().push(format!("{request:?}"));
         Ok(ElicitResult::new(ElicitationAction::Accept)
-            .with_content(serde_json::json!({ "decision": "allow_once" })))
+            .with_content(serde_json::json!({ "decision": self.answer })))
+    }
+
+    async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
+        self.changed.notify_one();
     }
 }
 
@@ -185,23 +206,28 @@ fn write_project(dir: &Path, contents: &str) {
     }
 }
 
-/// Writes `plugbay.toml` as a git clone would deliver it: committed and unchanged, so plugbay
-/// can't tell it was written on this machine and asks for trust.
-fn write_cloned_project(dir: &Path, contents: &str) {
-    write_project(dir, contents);
-    for args in [
-        &["init", "--quiet"][..],
-        &["add", "plugbay.toml"][..],
-        &["commit", "--quiet", "-m", "add plugbay config"][..],
-    ] {
-        let status = std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(["-c", "user.name=test", "-c", "user.email=test@example.test"])
-            .args(args)
-            .status()
-            .unwrap();
-        assert!(status.success(), "git {args:?} failed");
+/// A project server that runs a local command, which needs the human's trust.
+fn local_echo_config(extra_args: &str) -> String {
+    format!(
+        "[servers]\nlocal = {{ command = \"{}\", args = [{extra_args}] }}\n",
+        echo_server_binary().display()
+    )
+}
+
+/// Polls the tool list until `tool` shows up, failing with the daemon log after 10 s.
+async fn wait_for_tool<H: ClientHandler>(
+    sandbox: &Sandbox,
+    client: &RunningService<RoleClient, H>,
+    tool: &str,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !tool_names(client).await.contains(&tool.to_string()) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{tool} never appeared; daemon log:\n{}",
+            sandbox.daemon_log()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -368,11 +394,8 @@ async fn editing_config_updates_tools_live() {
 #[tokio::test]
 async fn stdio_servers_from_untrusted_project_config_stay_off() {
     let sandbox = Sandbox::new();
-    let project_config = format!(
-        "[servers]\nlocal = {{ command = \"{}\" }}\n",
-        echo_server_binary().display()
-    );
-    write_cloned_project(&sandbox.projects.join("untrusted"), &project_config);
+    let project_config = local_echo_config("");
+    write_project(&sandbox.projects.join("untrusted"), &project_config);
 
     let client = sandbox.connect("untrusted").await;
     assert_eq!(tool_names(&client).await, ["plugbay__status"]);
@@ -394,22 +417,25 @@ async fn stdio_servers_from_untrusted_project_config_stay_off() {
 }
 
 #[tokio::test]
-async fn stdio_config_written_on_this_machine_needs_no_trust_prompt() {
+async fn stdio_config_written_on_this_machine_still_needs_trust() {
     let sandbox = Sandbox::new();
-    let project_config = format!(
-        "[servers]\nlocal = {{ command = \"{}\" }}\n",
-        echo_server_binary().display()
-    );
-    write_project(&sandbox.projects.join("mine"), &project_config);
+    write_project(&sandbox.projects.join("mine"), "");
+    std::fs::write(
+        sandbox.projects.join("mine/plugbay.local.toml"),
+        local_echo_config(""),
+    )
+    .unwrap();
 
     let client = sandbox.connect("mine").await;
-    assert!(
-        tool_names(&client)
-            .await
-            .contains(&"local__whoami".to_string()),
-        "daemon log:\n{}",
-        sandbox.daemon_log()
-    );
+    assert_eq!(tool_names(&client).await, ["plugbay__status"]);
+    let status = call_text(&client, "plugbay__status").await;
+    assert!(status.contains("not trusted"), "{status}");
+    let instructions = client
+        .peer_info()
+        .and_then(|info| info.instructions.clone())
+        .unwrap_or_default();
+    assert!(instructions.contains("plugbay trust"), "{instructions}");
+    assert!(!instructions.contains("in use"), "{instructions}");
     client.cancel().await.unwrap();
 }
 
@@ -458,38 +484,57 @@ async fn spawn_unauthorized_http_server() -> String {
 #[tokio::test]
 async fn trust_prompt_in_the_agent_unlocks_stdio_servers() {
     let sandbox = Sandbox::new();
-    let project_config = format!(
-        "[servers]\nlocal = {{ command = \"{}\" }}\n",
-        echo_server_binary().display()
-    );
-    write_cloned_project(&sandbox.projects.join("prompted"), &project_config);
+    write_project(&sandbox.projects.join("prompted"), &local_echo_config(""));
 
-    let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let client = TrustingClient {
-        prompts: prompts.clone(),
-    }
-    .serve(sandbox.transport("prompted"))
-    .await
-    .unwrap();
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while !tool_names(&client)
+    let human = AnsweringClient::new("allow_once");
+    let client = human
+        .clone()
+        .serve(sandbox.transport("prompted"))
         .await
-        .contains(&"local__whoami".to_string())
-    {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "trusted server never appeared; daemon log:\n{}",
-            sandbox.daemon_log()
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let prompts = prompts.lock().unwrap().clone();
+        .unwrap();
+
+    wait_for_tool(&sandbox, &client, "local__whoami").await;
+    let prompts = human.prompts();
     assert_eq!(prompts.len(), 1, "{prompts:?}");
     assert!(
         prompts[0].contains("echo_server"),
         "the prompt names the command: {prompts:?}"
     );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn editing_a_trusted_command_mid_session_asks_again() {
+    let sandbox = Sandbox::new();
+    write_project(&sandbox.projects.join("edited"), &local_echo_config(""));
+    let human = AnsweringClient::new("allow_once");
+    let client = human
+        .clone()
+        .serve(sandbox.transport("edited"))
+        .await
+        .unwrap();
+    wait_for_tool(&sandbox, &client, "local__whoami").await;
+
+    write_project(
+        &sandbox.projects.join("edited"),
+        &local_echo_config("\"--changed\""),
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while human.prompts().len() < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the edited command was never put to the human; daemon log:\n{}",
+            sandbox.daemon_log()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        human.prompts()[1].contains("--changed"),
+        "{:?}",
+        human.prompts()
+    );
+    wait_for_tool(&sandbox, &client, "local__whoami").await;
 
     client.cancel().await.unwrap();
 }
@@ -570,11 +615,8 @@ async fn editing_a_tool_filter_notifies_the_client() {
 #[tokio::test]
 async fn losing_trust_turns_off_a_connected_stdio_server() {
     let sandbox = Sandbox::new();
-    let project_config = format!(
-        "[servers]\nlocal = {{ command = \"{}\" }}\n",
-        echo_server_binary().display()
-    );
-    write_cloned_project(&sandbox.projects.join("revoked"), &project_config);
+    let project_config = local_echo_config("");
+    write_project(&sandbox.projects.join("revoked"), &project_config);
     let global_without_trust =
         std::fs::read_to_string(sandbox.plugbay_home.join("config/config.toml")).unwrap();
     sandbox.prepend_to_global_config(&format!(
@@ -770,4 +812,87 @@ async fn use_and_unuse_write_pins_that_ls_and_accounts_see() {
 
     sandbox.plugbay(&["use", "nope"], "fresh");
     assert_eq!(std::fs::read_to_string(&pins_file).unwrap(), "[servers]\n");
+}
+
+#[tokio::test]
+async fn enabling_another_account_than_the_project_sets_needs_the_human() {
+    let sandbox = Sandbox::new();
+    let client = sandbox.connect("client-a").await;
+
+    let same_account = call_with(
+        &client,
+        "plugbay__enable",
+        serde_json::json!({ "server": "echo", "account": "client-a" }),
+    )
+    .await;
+    assert!(
+        same_account.contains("echo:client-a is on"),
+        "{same_account}"
+    );
+
+    let refused = call_with(
+        &client,
+        "plugbay__enable",
+        serde_json::json!({ "server": "echo", "account": "client-b" }),
+    )
+    .await;
+    assert!(refused.contains("plugbay use echo:client-b"), "{refused}");
+    let whoami = call_text(&client, "echo__whoami").await;
+    assert!(whoami.starts_with("account=client-a "), "{whoami}");
+    client.cancel().await.unwrap();
+
+    let human = AnsweringClient::new("switch");
+    let approving = human
+        .clone()
+        .serve(sandbox.transport("client-a"))
+        .await
+        .unwrap();
+    let switched = call_with(
+        &approving,
+        "plugbay__enable",
+        serde_json::json!({ "server": "echo", "account": "client-b" }),
+    )
+    .await;
+    assert!(switched.contains("echo:client-b is on"), "{switched}");
+    let prompts = human.prompts();
+    assert!(
+        prompts
+            .iter()
+            .any(|prompt| prompt.contains("switch echo from client-a to client-b")),
+        "{prompts:?}"
+    );
+    let whoami = call_text(&approving, "echo__whoami").await;
+    assert!(whoami.starts_with("account=client-b "), "{whoami}");
+    approving.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_slow_upstream_does_not_hold_up_the_others() {
+    let sandbox = Sandbox::new();
+    sandbox.append_to_global_config(&format!(
+        "\n[servers.slow]\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"sleep 12; exec {}\"]\n",
+        echo_server_binary().display()
+    ));
+    let (client, changed) = sandbox.connect_watching("client-b").await;
+
+    let tools = tool_names(&client).await;
+    assert!(tools.contains(&"echo__whoami".to_string()), "{tools:?}");
+    assert!(!tools.contains(&"slow__whoami".to_string()), "{tools:?}");
+
+    let started = tokio::time::Instant::now();
+    let status = call_text(&client, "plugbay__status").await;
+    assert!(status.contains("slow:default"), "{status}");
+    assert!(status.contains("connecting"), "{status}");
+    let whoami = call_text(&client, "echo__whoami").await;
+    assert!(whoami.starts_with("account=client-b "), "{whoami}");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "status and calls to connected servers must not wait for the slow one"
+    );
+
+    tokio::time::timeout(Duration::from_secs(20), changed.notified())
+        .await
+        .expect("the slow server's arrival should send tools/list_changed");
+    wait_for_tool(&sandbox, &client, "slow__whoami").await;
+    client.cancel().await.unwrap();
 }
