@@ -127,10 +127,10 @@ fn check_state_dir(state_dir: &Path) -> Check {
     let metadata = match std::fs::metadata(state_dir) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Check::warn(
-                format!("state dir {} does not exist yet", state_dir.display()),
-                "it is created when the daemon first starts; start an agent or run `plugbay daemon`",
-            );
+            return Check::ok(format!(
+                "state dir {} not created yet (the daemon creates it on first start)",
+                state_dir.display()
+            ));
         }
         Err(error) => {
             return Check::error(
@@ -491,6 +491,13 @@ mod tests {
             );
         }
         assert!(uses_op_refs(&server));
+    }
+
+    #[test]
+    fn a_fresh_install_without_a_state_dir_is_fine() {
+        let root = tempfile::TempDir::new().unwrap();
+        let missing = root.path().join("state");
+        assert_eq!(check_state_dir(&missing).status, Status::Ok);
     }
 
     #[test]
