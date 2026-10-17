@@ -2,7 +2,7 @@
 
 mise for MCP servers. Small committable `plugbay.toml` files declare which MCP servers, and which account for each, a directory tree needs. Every AI agent started there (Claude Code, Codex, T3 Code) gets exactly those servers through one global entry, with credentials resolved securely on the machine.
 
-Status: v0.1 in progress on `feat/v0.1`. This repo is the Rust implementation; `../plugbay-ts` is a TypeScript + Effect v4 spike of the same slice for comparison.
+Status: v0.2.1, public at github.com/mihaicrisan04/plugbay, work on `main`. Roadmap and next steps in `docs/plan.md`.
 
 ## Read first
 
