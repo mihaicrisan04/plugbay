@@ -8,7 +8,7 @@ use std::process::Stdio;
 use std::task::{Context as TaskContext, Poll};
 
 use anyhow::Context;
-use tokio::io::{AsyncBufReadExt, AsyncRead, ReadBuf};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, ReadBuf};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 
 use crate::secrets;
@@ -16,6 +16,8 @@ use crate::secrets;
 /// Upper bound for one JSON-RPC line from a stdio server. Large enough for base64 screenshots,
 /// small enough that one misbehaving server can't exhaust the shared daemon's memory.
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+/// Longer stderr lines are cut in the log, so a server dumping a blob can't flood memory or the log.
+const MAX_STDERR_LINE_BYTES: usize = 4 * 1024;
 
 /// A running stdio server. Dropping it stops the whole process group, so launchers like
 /// `npx` don't leave their `node` child behind.
@@ -153,13 +155,19 @@ fn forward_stderr(
     stderr: tokio::process::ChildStderr,
     secret_values: Vec<String>,
 ) {
+    // Keep enough past the cap to redact a secret that straddles it before cutting.
+    let longest_secret = secret_values.iter().map(String::len).max().unwrap_or(0);
+    let kept_bytes = MAX_STDERR_LINE_BYTES + longest_secret;
     tokio::spawn(async move {
-        let mut lines = tokio::io::BufReader::new(stderr).lines();
+        let mut reader = tokio::io::BufReader::new(stderr);
+        let mut line = Vec::new();
         loop {
-            match lines.next_line().await {
-                Ok(Some(line)) => {
-                    let line = redact_known_secrets(&line, &secret_values);
-                    tracing::debug!(server = %server_name, "stderr: {line}");
+            match read_capped_line(&mut reader, &mut line, kept_bytes).await {
+                Ok(Some(cut_short)) => {
+                    let text = String::from_utf8_lossy(&line);
+                    let redacted = redact_known_secrets(&text, &secret_values);
+                    let shown = truncate_line(&redacted, MAX_STDERR_LINE_BYTES, cut_short);
+                    tracing::debug!(server = %server_name, "stderr: {shown}");
                 }
                 Ok(None) => break,
                 Err(error) => {
@@ -169,6 +177,49 @@ fn forward_stderr(
             }
         }
     });
+}
+
+/// Reads one line into `line` (without the newline), keeping at most `kept_bytes` and skipping
+/// the rest. Returns whether bytes were skipped, or `None` at the end of the stream.
+async fn read_capped_line(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    line: &mut Vec<u8>,
+    kept_bytes: usize,
+) -> io::Result<Option<bool>> {
+    line.clear();
+    let mut read_anything = false;
+    let mut skipped = false;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(read_anything.then_some(skipped));
+        }
+        read_anything = true;
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let content = &available[..newline.unwrap_or(available.len())];
+        let room = kept_bytes.saturating_sub(line.len());
+        if content.len() > room {
+            skipped = true;
+        }
+        line.extend_from_slice(&content[..content.len().min(room)]);
+        let consumed = content.len() + usize::from(newline.is_some());
+        reader.consume(consumed);
+        if newline.is_some() {
+            return Ok(Some(skipped));
+        }
+    }
+}
+
+/// Cuts `text` to at most `max_bytes` on a character boundary and marks lines that were cut.
+fn truncate_line(text: &str, max_bytes: usize, cut_short: bool) -> String {
+    if text.len() <= max_bytes && !cut_short {
+        return text.to_string();
+    }
+    let mut end = max_bytes.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{} [line truncated]", &text[..end])
 }
 
 fn redact_known_secrets(line: &str, secret_values: &[String]) -> String {
@@ -218,6 +269,33 @@ mod tests {
         let mut output = Vec::new();
         let error = limited.read_to_end(&mut output).await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn stderr_lines_are_capped_and_the_rest_skipped() {
+        let input = format!("short\n{}\nnext\nlast", "x".repeat(100));
+        let mut reader = input.as_bytes();
+        let mut line = Vec::new();
+        let mut lines = Vec::new();
+        while let Some(cut_short) = read_capped_line(&mut reader, &mut line, 10).await.unwrap() {
+            lines.push((String::from_utf8(line.clone()).unwrap(), cut_short));
+        }
+        assert_eq!(
+            lines,
+            [
+                ("short".to_string(), false),
+                ("x".repeat(10), true),
+                ("next".to_string(), false),
+                ("last".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn truncated_lines_are_marked_and_cut_on_a_character_boundary() {
+        assert_eq!(truncate_line("short", 10, false), "short");
+        assert_eq!(truncate_line("ab€cd", 3, false), "ab [line truncated]");
+        assert_eq!(truncate_line("abc", 10, true), "abc [line truncated]");
     }
 
     #[test]

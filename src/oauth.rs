@@ -105,8 +105,11 @@ impl LoginFlow {
 ///
 /// Pass it to `StreamableHttpClientTransport::with_client`. A server that rejects the
 /// token surfaces as `StreamableHttpError::AuthRequired` once a silent refresh failed.
+/// `http_client` carries the MCP requests; rmcp's own client (no cross-origin redirects, 30s
+/// timeout) handles discovery and token requests.
 pub async fn authorized_client(
     server: &ResolvedServer,
+    http_client: reqwest::Client,
 ) -> anyhow::Result<Option<AuthClient<reqwest::Client>>> {
     oauth_url(server)?;
     if !credentials::has_stored_credentials(&server.identity, &server.account).await? {
@@ -129,7 +132,7 @@ pub async fn authorized_client(
         );
         return Ok(None);
     }
-    Ok(Some(AuthClient::new(reqwest::Client::new(), manager)))
+    Ok(Some(AuthClient::new(http_client, manager)))
 }
 
 fn oauth_url(server: &ResolvedServer) -> anyhow::Result<&Url> {

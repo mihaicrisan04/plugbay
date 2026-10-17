@@ -23,10 +23,11 @@ const MAX_HELLO_BYTES: u64 = 64 * 1024;
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 /// How long an upstream stays connected after its last session leaves, so a quick restart reuses it.
 const UPSTREAM_GRACE: Duration = Duration::from_secs(60);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub async fn run(paths: &Paths, idle_timeout: Duration) -> anyhow::Result<()> {
     paths.ensure_state_dir()?;
-    let Some(_lock) = acquire_daemon_lock(paths)? else {
+    let Some(lock) = acquire_daemon_lock(paths)? else {
         tracing::info!("another daemon is already running");
         return Ok(());
     };
@@ -64,10 +65,22 @@ pub async fn run(paths: &Paths, idle_timeout: Duration) -> anyhow::Result<()> {
         }
     }
 
+    // The socket goes while we still hold the lock, so it can never be a successor's socket.
+    // Releasing the lock before closing upstreams lets the next shim start a fresh daemon now.
+    drop(listener);
     if let Err(error) = std::fs::remove_file(paths.socket()) {
         tracing::debug!(%error, "could not remove the socket");
     }
-    shared.pool.shutdown().await;
+    drop(lock);
+    if tokio::time::timeout(SHUTDOWN_TIMEOUT, shared.pool.shutdown())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            "upstreams did not close within {}s, exiting anyway",
+            SHUTDOWN_TIMEOUT.as_secs()
+        );
+    }
     Ok(())
 }
 

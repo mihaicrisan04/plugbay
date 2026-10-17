@@ -5,9 +5,10 @@
 
 mod answer;
 
+pub use self::answer::one_safe_line;
+
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -16,7 +17,7 @@ use rmcp::model::{CallToolRequestParams, CallToolResult, JsonObject, Tool};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{ResolvedServer, ServerIdentity};
-use crate::paths::Paths;
+use crate::paths::{Paths, state_file};
 use crate::registry::{self, Whoami};
 use crate::upstream::Upstream;
 
@@ -24,9 +25,6 @@ const RECHECK_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 const WHOAMI_TIMEOUT: Duration = Duration::from_secs(10);
 /// Account metadata key holding text the verified login must contain. A rule, not shown as metadata.
 pub const EXPECT_KEY: &str = "expect";
-
-/// Daemon tasks for different upstreams finish at the same time; each must see the others' writes.
-static WRITE_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifiedAccount {
@@ -42,35 +40,37 @@ impl VerifiedAccount {
     }
 }
 
+type Records = BTreeMap<String, VerifiedAccount>;
+
 /// Every recorded login, keyed `<identity>#<account>` like the keychain entries.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-#[serde(transparent)]
+#[derive(Debug, Default, Clone)]
 pub struct VerifiedAccounts {
-    records: BTreeMap<String, VerifiedAccount>,
+    records: Records,
+    /// The file exists but couldn't be read, so `expect` can't be checked and must not pass.
+    unreadable: bool,
 }
 
 impl VerifiedAccounts {
     /// Blocking read; a missing file means nothing is recorded yet.
     pub fn read(paths: &Paths) -> anyhow::Result<Self> {
-        let path = paths.accounts_file();
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::default());
-            }
-            Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
-        };
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+        let records = state_file::read_toml(&paths.accounts_file())?;
+        Ok(Self {
+            records,
+            unreadable: false,
+        })
     }
 
-    /// For display only: an unreadable file is logged and treated as nothing recorded.
+    /// An unreadable file is logged and shows nothing, but keeps servers with `expect` off.
     pub fn read_or_empty(paths: &Paths) -> Self {
         Self::read(paths).unwrap_or_else(|error| {
             tracing::warn!(
                 error = format!("{error:#}"),
-                "ignoring the verified accounts file"
+                "the verified accounts file is unreadable; servers with `expect` stay off until it is rewritten"
             );
-            Self::default()
+            Self {
+                records: Records::new(),
+                unreadable: true,
+            }
         })
     }
 
@@ -126,7 +126,10 @@ impl VerifiedAccounts {
                 (format!("{identity}#{account}"), record)
             })
             .collect();
-        Self { records }
+        Self {
+            records,
+            unreadable: false,
+        }
     }
 }
 
@@ -144,15 +147,23 @@ pub fn expected_account(server: &ResolvedServer) -> Option<&str> {
         .filter(|expected| !expected.is_empty())
 }
 
-/// Why `server` must stay off: its verified login doesn't contain what the project expects.
-/// A login nobody verified yet passes, since there is nothing to compare.
+/// Why `server` must stay off: its verified login doesn't contain what the project expects, or
+/// the record of who it is can't be read. A login nobody verified yet passes, since there is
+/// nothing to compare.
 pub fn expectation_failure(server: &ResolvedServer, verified: &VerifiedAccounts) -> Option<String> {
     let expected = expected_account(server)?;
+    let name = server.display_name();
+    if verified.unreadable {
+        return Some(format!(
+            "plugbay can't read its record of who {name} is logged in as, so it can't check for \
+             {expected}; ask the human to delete `accounts.toml` in plugbay's state directory, \
+             it is rebuilt on the next connection"
+        ));
+    }
     let shown = verified.shown(&server.identity, &server.account)?;
     if shown.to_lowercase().contains(&expected.to_lowercase()) {
         return None;
     }
-    let name = server.display_name();
     Some(format!(
         "{name} is logged in as {shown}, but this project expects {expected}; \
          ask the human to run `plugbay logout {name} && plugbay login {name}`"
@@ -186,15 +197,29 @@ pub fn spawn_check(
             let shown = match checked.await {
                 Ok(Ok(shown)) => shown,
                 Ok(Err(error)) => {
-                    tracing::info!(identity = %key.identity, account = key.account, error = format!("{error:#}"), "could not verify the account");
+                    tracing::info!(
+                        identity = key.identity.masked(),
+                        account = key.account,
+                        error = format!("{error:#}"),
+                        "could not verify the account"
+                    );
                     return;
                 }
                 Err(_) => {
-                    tracing::info!(identity = %key.identity, account = key.account, "verifying the account timed out");
+                    tracing::info!(
+                        identity = key.identity.masked(),
+                        account = key.account,
+                        "verifying the account timed out"
+                    );
                     return;
                 }
             };
-            tracing::info!(identity = %key.identity, account = key.account, shown, "verified the account");
+            tracing::info!(
+                identity = key.identity.masked(),
+                account = key.account,
+                shown,
+                "verified the account"
+            );
 
             let changed = previous.is_none_or(|record| record.shown != shown);
             if let Err(error) = record(&paths, &key.identity, &key.account, shown).await {
@@ -283,34 +308,12 @@ pub async fn forget(
 /// Read, change, and write back if `change` says something changed.
 async fn update(
     paths: &Paths,
-    change: impl FnOnce(&mut BTreeMap<String, VerifiedAccount>) -> bool + Send + 'static,
+    change: impl FnOnce(&mut Records) -> bool + Send + 'static,
 ) -> anyhow::Result<bool> {
-    let paths = paths.clone();
-    tokio::task::spawn_blocking(move || {
-        let _guard = WRITE_LOCK.lock();
-        let mut accounts = VerifiedAccounts::read(&paths)?;
-        let changed = change(&mut accounts.records);
-        if changed {
-            write(&paths, &accounts)?;
-        }
-        Ok(changed)
-    })
-    .await
-    .context("updating the verified accounts file")?
-}
-
-/// Written to a temporary file and renamed, so a concurrent reader never sees half a file.
-fn write(paths: &Paths, accounts: &VerifiedAccounts) -> anyhow::Result<()> {
-    paths.ensure_state_dir()?;
     let path = paths.accounts_file();
-    let text = toml::to_string(accounts).context("serialising the verified accounts")?;
-    let temporary = temporary_path(&path);
-    std::fs::write(&temporary, text).with_context(|| format!("writing {}", temporary.display()))?;
-    std::fs::rename(&temporary, &path).with_context(|| format!("replacing {}", path.display()))
-}
-
-fn temporary_path(path: &Path) -> std::path::PathBuf {
-    path.with_extension(format!("toml.{}", std::process::id()))
+    tokio::task::spawn_blocking(move || state_file::update_toml(&path, change))
+        .await
+        .context("updating the verified accounts file")?
 }
 
 fn unix_now() -> u64 {
@@ -386,6 +389,32 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let accounts = VerifiedAccounts::read(&Paths::for_test(temp.path())).unwrap();
         assert!(accounts.records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_file_fails_expect_closed_until_a_check_rewrites_it() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::for_test(temp.path());
+        paths.ensure_state_dir().unwrap();
+        std::fs::write(paths.accounts_file(), "[\"torn").unwrap();
+
+        let accounts = VerifiedAccounts::load(&paths).await;
+        let expecting = linear_server("personal", Some("mihai"));
+        assert!(
+            expectation_failure(&expecting, &accounts)
+                .unwrap()
+                .contains("can't check for mihai")
+        );
+        assert_eq!(
+            expectation_failure(&linear_server("personal", None), &accounts),
+            None
+        );
+
+        record(&paths, &linear(), "personal", "Mihai".to_string())
+            .await
+            .unwrap();
+        let accounts = VerifiedAccounts::load(&paths).await;
+        assert_eq!(expectation_failure(&expecting, &accounts), None);
     }
 
     #[test]

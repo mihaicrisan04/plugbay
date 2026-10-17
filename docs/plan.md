@@ -145,7 +145,10 @@ Decisions made for steps 2 and 3 (Mihai approved the session-enable idea; the re
 ## Known gaps after v0.1 (follow-ups)
 
 - No byte cap on remote (HTTP) upstream responses: rmcp's HTTP adapter buffers whole JSON bodies. Stdio messages are capped at 16 MiB
-- Upstream stderr is logged with resolved secret env values redacted; other secrets a server prints itself are not caught
+- Upstream stderr is logged with resolved secret env values redacted (lines capped at 4 KiB); other secrets a server prints itself are not caught
+- Server urls are masked for display (userinfo, query values, fragment, token-looking path segments), but the masking of path tokens is a heuristic, and `ServerIdentity` itself (the credential key) still holds the full path and userinfo; only logs use `ServerIdentity::masked()`
+- Version skew: after an upgrade the running daemon keeps the old version until `plugbay stop` (doctor warns). Retiring it when a newer shim connects was rejected for now: a retired daemon still serving old sessions would no longer receive `logout` / `trust --revoke` control messages
+- Remote MCP requests don't follow redirects and have a 10s connect timeout; a read only times out after 10 minutes of silence (the longest tool call), so idle event streams reconnect at most that often
 - OAuth registration is DCR-only until we host a CIMD document; no manual `client_id` flow yet
 - Untested against live services: a real OAuth login (Linear), `setup`/`import --apply` against real Claude Code and Codex configs, keychain prompts on macOS
 - The status tool, `ls` and `doctor` each render "what resolved here" separately; worth one shared report model

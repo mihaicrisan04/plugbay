@@ -1,3 +1,5 @@
+pub mod state_file;
+
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -68,6 +70,11 @@ impl Paths {
     /// Who each login really is, as its server's whoami tool answered (see `identity.rs`).
     pub fn accounts_file(&self) -> PathBuf {
         self.state_dir.join("accounts.toml")
+    }
+
+    /// Serialises read-modify-writes of the keychain vault (see `vault.rs`).
+    pub fn vault_lock(&self) -> PathBuf {
+        self.state_dir.join("vault.lock")
     }
 
     pub fn backups_dir(&self) -> PathBuf {

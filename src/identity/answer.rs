@@ -20,7 +20,7 @@ pub fn shown_from(result: &CallToolResult, show: &[&str]) -> anyhow::Result<Stri
         _ => describe_with_pointers(&answer, show).or_else(|| summarize(&answer)),
     };
     let shown = described
-        .map(|text| sanitize(&text))
+        .map(|text| one_safe_line(&text, MAX_SHOWN_CHARS))
         .filter(|text| !text.is_empty());
     shown.context("the answer names no account")
 }
@@ -120,9 +120,9 @@ fn non_empty(text: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-/// Upstream text ends up in terminals and agent instructions: no control or direction-changing
-/// characters, one line, bounded length.
-fn sanitize(text: &str) -> String {
+/// Upstream or project-file text that ends up in terminals and agent instructions: no control or
+/// direction-changing characters, one line, at most `max_chars`.
+pub fn one_safe_line(text: &str, max_chars: usize) -> String {
     let visible: String = text
         .chars()
         .filter(|character| !is_invisible_formatting(*character))
@@ -135,7 +135,7 @@ fn sanitize(text: &str) -> String {
         })
         .collect();
     let one_line = visible.split_whitespace().collect::<Vec<_>>().join(" ");
-    truncate(&one_line)
+    truncate(&one_line, max_chars)
 }
 
 fn is_invisible_formatting(character: char) -> bool {
@@ -149,11 +149,11 @@ fn is_invisible_formatting(character: char) -> bool {
     )
 }
 
-fn truncate(text: &str) -> String {
-    if text.chars().count() <= MAX_SHOWN_CHARS {
+fn truncate(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
         return text.to_string();
     }
-    let mut truncated: String = text.chars().take(MAX_SHOWN_CHARS - 1).collect();
+    let mut truncated: String = text.chars().take(max_chars.saturating_sub(1)).collect();
     truncated.push('…');
     truncated
 }
@@ -247,13 +247,13 @@ mod tests {
 
     #[test]
     fn control_and_bidi_characters_are_stripped() {
-        let shown = sanitize("Ac\u{202E}me\u{0007}\tCorp\u{200B}");
+        let shown = one_safe_line("Ac\u{202E}me\u{0007}\tCorp\u{200B}", MAX_SHOWN_CHARS);
         assert_eq!(shown, "Acme Corp");
     }
 
     #[test]
     fn long_names_are_truncated() {
-        let shown = sanitize(&"a".repeat(200));
+        let shown = one_safe_line(&"a".repeat(200), MAX_SHOWN_CHARS);
         assert_eq!(shown.chars().count(), MAX_SHOWN_CHARS);
         assert!(shown.ends_with('…'));
     }
