@@ -692,6 +692,22 @@ mod tests {
     }
 
     #[test]
+    fn a_deeper_table_that_only_filters_tools_leaves_enabled_with_the_file_that_set_it() {
+        let fixture = Fixture::new();
+        let work = fixture.write("work/plugbay.toml", "[servers]\nlinear = \"initech\"\n");
+        let app = fixture.write(
+            "work/app/plugbay.toml",
+            "[servers]\nlinear = { exclude_tools = [\"delete_*\"] }\n",
+        );
+
+        let config = fixture.resolve("work/app");
+
+        let linear = only(&config, "linear");
+        assert_eq!(linear.provenance.get("enabled"), Some(&work));
+        assert_eq!(linear.provenance.get("exclude_tools"), Some(&app));
+    }
+
+    #[test]
     fn deeper_file_overrides_account() {
         let fixture = Fixture::new();
         fixture.write("work/plugbay.toml", "[servers]\nlinear = \"initech\"\n");
