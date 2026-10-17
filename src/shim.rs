@@ -13,6 +13,7 @@ use crate::project::ProjectHints;
 use crate::protocol::{self, Hello};
 
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(5);
+const DAEMON_RESTART_INTERVAL: Duration = Duration::from_secs(1);
 
 pub async fn run(paths: &Paths, project: Option<PathBuf>) -> anyhow::Result<()> {
     let hints = ProjectHints {
@@ -44,7 +45,9 @@ async fn connect_or_start_daemon(paths: &Paths) -> anyhow::Result<UnixStream> {
     }
 
     start_daemon(paths)?;
-    let deadline = tokio::time::Instant::now() + DAEMON_START_TIMEOUT;
+    let started_at = tokio::time::Instant::now();
+    let deadline = started_at + DAEMON_START_TIMEOUT;
+    let mut next_start = started_at + DAEMON_RESTART_INTERVAL;
     let mut delay = Duration::from_millis(20);
     loop {
         match UnixStream::connect(paths.socket()).await {
@@ -53,6 +56,11 @@ async fn connect_or_start_daemon(paths: &Paths) -> anyhow::Result<UnixStream> {
                 return Err(error).context("the daemon did not come up");
             }
             Err(_) => {
+                // The one we started gives way while an exiting daemon still holds the lock.
+                if tokio::time::Instant::now() >= next_start {
+                    start_daemon(paths)?;
+                    next_start += DAEMON_RESTART_INTERVAL;
+                }
                 tokio::time::sleep(delay).await;
                 delay = (delay * 2).min(Duration::from_millis(250));
             }

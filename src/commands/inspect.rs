@@ -5,19 +5,101 @@ use std::path::{Path, PathBuf};
 
 use anyhow::bail;
 
+use crate::commands::pins::closest_known_name;
 use crate::commands::{resolve_everywhere, resolve_here};
-use crate::config::{ConfigScope, ResolvedConfig, ResolvedServer, ServerTransport};
+use crate::config::{
+    self, ConfigScope, ResolvedConfig, ResolvedServer, ServerTransport, SessionPin,
+};
 use crate::credentials::{self, StoredLogin};
 use crate::identity::{self, VerifiedAccounts};
 use crate::paths::Paths;
-use crate::secrets;
-use crate::trust::{self, Trust};
+use crate::project::ProjectLocation;
+use crate::trust::Trust;
+use crate::{registry, secrets};
 
-pub async fn ls(paths: &Paths, project: Option<PathBuf>) -> anyhow::Result<()> {
+/// `available`: list every server that could be pinned (built in and catalog) instead.
+pub async fn ls(paths: &Paths, project: Option<PathBuf>, available: bool) -> anyhow::Result<()> {
     let config = resolve_here(paths, project).await?;
+    if available {
+        let catalog = catalog_definitions(paths, &config)?;
+        print!("{}", format_available(&config, &catalog, &paths.home));
+        return Ok(());
+    }
     let statuses = server_statuses(paths, &config).await;
     print!("{}", format_ls(&config, &statuses, &paths.home));
     fail_on_problems(config.problems.len())
+}
+
+/// Each catalog entry with where it connects, resolved as if a session switched it on.
+fn catalog_definitions(
+    paths: &Paths,
+    config: &ResolvedConfig,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let pins: BTreeMap<String, SessionPin> = config
+        .catalog
+        .iter()
+        .map(|name| (name.clone(), SessionPin::On { account: None }))
+        .collect();
+    let catalog = config::resolve_with_pins(paths, &ProjectLocation::global_only(), &pins)?;
+    let mut definitions = Vec::new();
+    for name in &config.catalog {
+        let target = match catalog.server(name).first() {
+            Some(server) => server.transport.target(),
+            None => format!("does not resolve: run `plugbay why {name}`"),
+        };
+        definitions.push((name.clone(), target));
+    }
+    Ok(definitions)
+}
+
+fn format_available(config: &ResolvedConfig, catalog: &[(String, String)], home: &Path) -> String {
+    let in_use_here = |name: &str| {
+        if config.server(name).is_empty() {
+            String::new()
+        } else {
+            "in use here".to_string()
+        }
+    };
+    let mut output = String::from("Built in\n");
+    let mut rows = Vec::new();
+    for entry in registry::all() {
+        let replaced = catalog.iter().any(|(name, _)| name == entry.name);
+        let note = if replaced {
+            "replaced by your catalog".to_string()
+        } else {
+            in_use_here(entry.name)
+        };
+        rows.push(vec![
+            entry.name.to_string(),
+            entry.title.to_string(),
+            entry.url.to_string(),
+            note,
+        ]);
+    }
+    output.push_str(&render_rows(&rows));
+
+    let global_config = config
+        .files
+        .iter()
+        .find(|file| file.scope == ConfigScope::Global)
+        .map_or("the global config".to_string(), |file| {
+            display_path(&file.path, home)
+        });
+    output.push_str(&format!("\nYour catalog ({global_config})\n"));
+    if catalog.is_empty() {
+        output.push_str(
+            "  empty: `plugbay add <name> --url <url>` or `plugbay add <name> -- <command>` adds one\n",
+        );
+    } else {
+        let rows: Vec<Vec<String>> = catalog
+            .iter()
+            .map(|(name, target)| vec![name.clone(), target.clone(), in_use_here(name)])
+            .collect();
+        output.push_str(&render_rows(&rows));
+    }
+    output
+        .push_str("\nPin one here with `plugbay use <name>` or `plugbay use <name>:<account>`.\n");
+    output
 }
 
 /// Every directory plugbay has seen, each with what resolves there.
@@ -55,7 +137,7 @@ pub async fn accounts(paths: &Paths, cd: Option<PathBuf>) -> anyhow::Result<()> 
             let key = (
                 server.name.clone(),
                 server.account.clone(),
-                server.identity.to_string(),
+                server.identity.0.clone(),
             );
             let usage = usages.entry(key).or_insert_with(|| AccountUsage {
                 server: server.clone(),
@@ -184,7 +266,6 @@ enum LoginStatus {
 }
 
 async fn server_statuses(paths: &Paths, config: &ResolvedConfig) -> Vec<ServerStatus> {
-    trust::grant_files_written_here(paths, config).await;
     let trust = Trust::new(paths);
     let verified = VerifiedAccounts::load(paths).await;
     let mut statuses = Vec::new();
@@ -257,7 +338,9 @@ fn format_ls(config: &ResolvedConfig, statuses: &[ServerStatus], home: &Path) ->
 
     output.push_str("\nServers\n");
     if config.servers.is_empty() {
-        output.push_str("  none\n");
+        output.push_str(
+            "  none yet: `plugbay ls --available` lists the servers you can pin with `plugbay use`\n",
+        );
     } else {
         let mut rows = vec![vec![
             "SERVER".to_string(),
@@ -398,6 +481,9 @@ fn format_why(config: &ResolvedConfig, name: &str, home: &Path) -> anyhow::Resul
     }
 
     if output.is_empty() {
+        if let Some(closest) = closest_known_name(config, name) {
+            bail!("no server named `{name}` is configured here; did you mean `{closest}`?");
+        }
         bail!("no server named `{name}` is configured here; `plugbay ls` lists them");
     }
     Ok(output)
@@ -405,7 +491,7 @@ fn format_why(config: &ResolvedConfig, name: &str, home: &Path) -> anyhow::Resul
 
 fn format_server_fields(server: &ResolvedServer, home: &Path) -> String {
     let mut output = format!("{}\n", server.display_name());
-    output.push_str(&format!("  identity  {}\n", server.identity));
+    output.push_str(&format!("  identity  {}\n", server.identity.masked()));
     output.push_str(&format!("  tools     {}__*\n\n", server.tool_prefix));
 
     let mut rows = vec![vec![
@@ -659,6 +745,38 @@ mod tests {
     fn ls_without_project_says_only_global_applies() {
         let config = ResolvedConfig::test_with(Vec::new(), Vec::new());
         insta::assert_snapshot!(format_ls(&config, &[], Path::new(HOME)));
+    }
+
+    #[test]
+    fn available_lists_built_in_and_catalog_servers() {
+        let mut config = sample_config();
+        config.catalog = vec!["playwright".to_string(), "linear".to_string()];
+        let catalog = vec![
+            (
+                "playwright".to_string(),
+                "npx -y @playwright/mcp".to_string(),
+            ),
+            (
+                "linear".to_string(),
+                "https://linear.example.test/mcp".to_string(),
+            ),
+        ];
+        insta::assert_snapshot!(format_available(&config, &catalog, Path::new(HOME)));
+    }
+
+    #[test]
+    fn available_explains_an_empty_catalog() {
+        let config = ResolvedConfig::test_with(Vec::new(), Vec::new());
+        let output = format_available(&config, &[], Path::new(HOME));
+        assert!(output.contains("Your catalog (the global config)\n  empty: `plugbay add"));
+    }
+
+    #[test]
+    fn why_suggests_the_server_a_typo_meant() {
+        let error = format_why(&sample_config(), "posthgo", Path::new(HOME))
+            .unwrap_err()
+            .to_string();
+        assert!(error.ends_with("did you mean `posthog`?"), "{error}");
     }
 
     #[test]

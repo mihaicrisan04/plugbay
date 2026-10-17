@@ -10,13 +10,12 @@
 //! item under a file lock first, so the daemon and CLI commands never lose each other's changes.
 
 use std::collections::BTreeMap;
-use std::fs::OpenOptions;
 
 use anyhow::Context;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-use crate::paths::Paths;
+use crate::paths::{Paths, state_file};
 use crate::secrets::keychain;
 
 const VAULT_SERVICE: &str = "plugbay-vault";
@@ -115,9 +114,7 @@ fn load() -> anyhow::Result<Contents> {
 
 fn save(json: &str) -> anyhow::Result<()> {
     match test_file() {
-        Some(file) => {
-            std::fs::write(&file, json).with_context(|| format!("writing {}", file.display()))
-        }
+        Some(file) => state_file::write_atomic(&file, json),
         None => keychain::write(VAULT_SERVICE, VAULT_ACCOUNT, json),
     }
 }
@@ -157,18 +154,7 @@ fn move_into_vault(service: &str, name: &str, secret: &str) {
 }
 
 fn lock() -> anyhow::Result<std::fs::File> {
-    let paths = Paths::from_env()?;
-    paths.ensure_state_dir()?;
-    let path = paths.state_dir.join("vault.lock");
-    let file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&path)
-        .with_context(|| format!("opening {}", path.display()))?;
-    file.lock()
-        .with_context(|| format!("locking {}", path.display()))?;
-    Ok(file)
+    state_file::lock(&Paths::from_env()?.vault_lock())
 }
 
 #[cfg(test)]

@@ -257,10 +257,11 @@ impl ResolvedServer {
 }
 
 impl ServerTransport {
-    /// One-line rendering for people: the url, or the command line with spaced args quoted.
+    /// One-line rendering for people: the url with secrets masked (see [`display_url`]), or the
+    /// command line with spaced args quoted. Never use it to connect.
     pub fn target(&self) -> String {
         match self {
-            ServerTransport::Http { url, .. } => url.to_string(),
+            ServerTransport::Http { url, .. } => display_url(url),
             ServerTransport::Stdio { command, args, .. } => {
                 let mut words = vec![quote_if_spaced(command)];
                 for arg in args {
@@ -269,6 +270,63 @@ impl ServerTransport {
                 words.join(" ")
             }
         }
+    }
+}
+
+const MASK: &str = "***";
+
+/// `url` for status text, prompts and logs: userinfo, query values, the fragment and
+/// token-looking path segments (`/mcp/sk-ak-…/sse`) are masked, since some servers take their
+/// API key there. Scheme, host, port and the rest of the path stay readable.
+pub fn display_url(url: &Url) -> String {
+    let mut shown = format!("{}://", url.scheme());
+    if !url.username().is_empty() || url.password().is_some() {
+        shown.push_str(MASK);
+        shown.push('@');
+    }
+    shown.push_str(url.host_str().unwrap_or_default());
+    if let Some(port) = url.port() {
+        shown.push_str(&format!(":{port}"));
+    }
+    let segments: Vec<&str> = url.path().split('/').map(mask_if_token).collect();
+    shown.push_str(&segments.join("/"));
+    if let Some(query) = url.query() {
+        let pairs: Vec<String> = query.split('&').map(mask_query_value).collect();
+        shown.push('?');
+        shown.push_str(&pairs.join("&"));
+    }
+    if url.fragment().is_some() {
+        shown.push('#');
+        shown.push_str(MASK);
+    }
+    shown
+}
+
+/// Replaces every occurrence of `url` in `text`, e.g. a transport error, with [`display_url`].
+pub fn mask_url_in(text: &str, url: &Url) -> String {
+    text.replace(url.as_str(), &display_url(url))
+}
+
+fn mask_query_value(pair: &str) -> String {
+    match pair.split_once('=') {
+        Some((key, value)) if !value.is_empty() => format!("{key}={MASK}"),
+        _ => mask_if_token(pair).to_string(),
+    }
+}
+
+/// Long runs of letters and digits look like keys; words, versions and short ids don't.
+fn mask_if_token(segment: &str) -> &str {
+    let token_characters = segment
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'));
+    let has_digit = segment.chars().any(|character| character.is_ascii_digit());
+    let has_letter = segment
+        .chars()
+        .any(|character| character.is_ascii_alphabetic());
+    if segment.len() >= 20 && token_characters && has_digit && has_letter {
+        MASK
+    } else {
+        segment
     }
 }
 
@@ -310,9 +368,14 @@ impl ServerIdentity {
     }
 }
 
-impl std::fmt::Display for ServerIdentity {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.0)
+impl ServerIdentity {
+    /// For logs: a url identity keeps its path, which may hold a key, so it is masked like
+    /// [`display_url`]. Stdio identities are hashes already.
+    pub fn masked(&self) -> String {
+        match Url::parse(&self.0) {
+            Ok(url) if matches!(url.scheme(), "http" | "https") => display_url(&url),
+            _ => self.0.clone(),
+        }
     }
 }
 
@@ -623,6 +686,22 @@ mod tests {
     }
 
     #[test]
+    fn a_deeper_table_that_only_filters_tools_leaves_enabled_with_the_file_that_set_it() {
+        let fixture = Fixture::new();
+        let work = fixture.write("work/plugbay.toml", "[servers]\nlinear = \"initech\"\n");
+        let app = fixture.write(
+            "work/app/plugbay.toml",
+            "[servers]\nlinear = { exclude_tools = [\"delete_*\"] }\n",
+        );
+
+        let config = fixture.resolve("work/app");
+
+        let linear = only(&config, "linear");
+        assert_eq!(linear.provenance.get("enabled"), Some(&work));
+        assert_eq!(linear.provenance.get("exclude_tools"), Some(&app));
+    }
+
+    #[test]
     fn deeper_file_overrides_account() {
         let fixture = Fixture::new();
         fixture.write("work/plugbay.toml", "[servers]\nlinear = \"initech\"\n");
@@ -820,6 +899,45 @@ mod tests {
 
         assert_eq!(remote.transport.target(), "https://example.com/mcp");
         assert_eq!(local.transport.target(), "tool serve \"my app\"");
+    }
+
+    #[test]
+    fn display_url_masks_query_values_userinfo_and_token_segments() {
+        let cases = [
+            (
+                "https://mcp.example.com/mcp?api_key=test-key-123&debug",
+                "https://mcp.example.com/mcp?api_key=***&debug",
+            ),
+            (
+                "https://user:test-password@mcp.example.com:8443/v1/mcp",
+                "https://***@mcp.example.com:8443/v1/mcp",
+            ),
+            (
+                "https://actions.example.com/mcp/sk-ak-0123456789abcdefghij/sse#frag",
+                "https://actions.example.com/mcp/***/sse#***",
+            ),
+            (
+                "http://[::1]:3000/servers/linear-workspace/mcp",
+                "http://[::1]:3000/servers/linear-workspace/mcp",
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                display_url(&Url::parse(input).unwrap()),
+                expected,
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn url_identities_are_masked_for_logs_but_stdio_hashes_are_not() {
+        let remote = ServerIdentity::for_url(
+            &Url::parse("https://actions.example.com/mcp/sk-ak-0123456789abcdefghij").unwrap(),
+        );
+        assert_eq!(remote.masked(), "https://actions.example.com/mcp/***");
+        let local = ServerIdentity::for_stdio("tool", &[]);
+        assert_eq!(local.masked(), local.0);
     }
 
     #[test]

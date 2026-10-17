@@ -7,11 +7,10 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{ConfigScope, ResolvedConfig};
-use crate::paths::Paths;
+use crate::paths::{Paths, state_file};
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct IndexFile {
@@ -38,8 +37,15 @@ pub async fn record(paths: &Paths, config: &ResolvedConfig) {
 }
 
 /// Recorded directories that still hold a config file, sorted so parents come before children.
+/// An unreadable index is logged and treated as empty; the next resolve rebuilds it.
 pub fn tracked_directories(paths: &Paths) -> anyhow::Result<Vec<PathBuf>> {
-    let index = read(paths)?;
+    let index: IndexFile = match state_file::read_toml(&paths.index_file()) {
+        Ok(index) => index,
+        Err(error) => {
+            tracing::warn!(error = format!("{error:#}"), "ignoring the config index");
+            IndexFile::default()
+        }
+    };
     let directories = index
         .directories
         .into_iter()
@@ -62,40 +68,17 @@ fn config_directories(config: &ResolvedConfig) -> BTreeSet<PathBuf> {
 }
 
 fn add_directories(paths: &Paths, directories: BTreeSet<PathBuf>) -> anyhow::Result<()> {
-    let mut index = read(paths)?;
-    let before = index.directories.len();
-    index.directories.extend(directories);
-    if index.directories.len() == before {
-        return Ok(());
-    }
-    write(paths, &index)
+    state_file::update_toml(&paths.index_file(), |index: &mut IndexFile| {
+        let before = index.directories.len();
+        index.directories.extend(directories);
+        index.directories.len() != before
+    })?;
+    Ok(())
 }
 
 fn holds_config_file(directory: &Path) -> bool {
     directory.join(crate::config::PROJECT_FILE).is_file()
         || directory.join(crate::config::LOCAL_FILE).is_file()
-}
-
-fn read(paths: &Paths) -> anyhow::Result<IndexFile> {
-    let path = paths.index_file();
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(IndexFile::default());
-        }
-        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
-    };
-    toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
-}
-
-/// Written to a temporary file and renamed, so a concurrent reader never sees half a file.
-fn write(paths: &Paths, index: &IndexFile) -> anyhow::Result<()> {
-    paths.ensure_state_dir()?;
-    let path = paths.index_file();
-    let text = toml::to_string(index).context("serialising the config index")?;
-    let temporary = path.with_extension(format!("toml.{}", std::process::id()));
-    std::fs::write(&temporary, text).with_context(|| format!("writing {}", temporary.display()))?;
-    std::fs::rename(&temporary, &path).with_context(|| format!("replacing {}", path.display()))
 }
 
 #[cfg(test)]
@@ -148,5 +131,26 @@ mod tests {
         std::fs::remove_file(project.join("plugbay.local.toml")).unwrap();
 
         assert!(tracked_directories(&paths).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_index_reads_as_empty_and_is_rebuilt() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::for_test(temp.path());
+        paths.ensure_state_dir().unwrap();
+        std::fs::write(paths.index_file(), "directories = [").unwrap();
+        assert!(tracked_directories(&paths).unwrap().is_empty());
+
+        let project = temp.path().join("app");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("plugbay.toml"), "").unwrap();
+        let config = config_with_files(vec![ConfigFile::test(
+            project.join("plugbay.toml").to_str().unwrap(),
+            ConfigScope::Project,
+            None,
+        )]);
+        record(&paths, &config).await;
+
+        assert_eq!(tracked_directories(&paths).unwrap(), vec![project]);
     }
 }

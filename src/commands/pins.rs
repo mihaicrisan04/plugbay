@@ -12,6 +12,7 @@ use crate::config::{self, LOCAL_FILE, PROJECT_FILE, ResolvedConfig};
 use crate::index;
 use crate::paths::Paths;
 use crate::project::ProjectLocation;
+use crate::{registry, secrets};
 
 #[derive(clap::Args, Debug)]
 pub struct PinOptions {
@@ -28,15 +29,19 @@ pub struct PinOptions {
 
 #[derive(clap::Args, Debug)]
 pub struct AddOptions {
-    /// Name to pin it by, e.g. `wa`.
+    /// Name to pin it by, e.g. `huggingface` or `playwright`.
     name: String,
-    /// Streamable HTTP endpoint of a remote server.
+    /// Streamable HTTP endpoint of a remote server: `--url https://huggingface.co/mcp`.
     #[arg(long, conflicts_with = "command")]
     url: Option<String>,
-    /// Environment for a stdio server, `NAME=value`; values may be secret refs like `${op://...}`.
+    /// Environment for a stdio server, `NAME=value`. Secrets must be refs like
+    /// `${keychain:service/account}` or `${op://vault/item/field}`, never the value itself.
     #[arg(long = "env", value_name = "NAME=VALUE", requires = "command")]
     env: Vec<String>,
-    /// Command line of a stdio server, after `--`: `plugbay add teams -- npx -y msteams-mcp`.
+    /// Replace a built-in server of the same name everywhere it is pinned.
+    #[arg(long)]
+    force: bool,
+    /// Command line of a stdio server, after `--`: `plugbay add playwright -- npx -y @playwright/mcp`.
     #[arg(last = true, value_name = "COMMAND")]
     command: Vec<String>,
 }
@@ -47,47 +52,60 @@ struct PinTarget {
     account: Option<String>,
 }
 
+/// What `use` writes for one server: no account (the tree's default), one, or several.
+#[derive(Debug, PartialEq, Eq)]
+struct ServerPin {
+    name: String,
+    accounts: Vec<String>,
+}
+
 pub async fn use_servers(
     paths: &Paths,
     cd: Option<PathBuf>,
     options: PinOptions,
 ) -> anyhow::Result<()> {
-    let targets = parse_targets(&options.servers)?;
+    let pins = group_by_server(&parse_targets(&options.servers)?)?;
     let destination = Destination::choose(paths, cd, &options)?;
+    let before = destination.resolve(paths)?;
     let original = read_or_empty(&destination.file)?;
     let mut document = parse(&original, &destination.file)?;
 
-    for target in &targets {
-        pin(&mut document, target)?;
+    for server_pin in &pins {
+        pin(&mut document, server_pin)?;
     }
     write(&destination.file, &document)?;
 
     let config = destination.resolve(paths)?;
     index::record(paths, &config).await;
-    let missing: Vec<String> = targets
+    let missing: Vec<String> = pins
         .iter()
-        .filter(|target| config.server(&target.name).is_empty())
-        .map(|target| why_not_enabled(&config, &target.name))
+        .filter(|server_pin| config.server(&server_pin.name).is_empty())
+        .map(|server_pin| why_not_enabled(&config, &server_pin.name))
         .collect();
     if !missing.is_empty() {
         restore(&destination.file, &original)?;
         bail!("nothing written:\n  {}", missing.join("\n  "));
     }
 
-    for target in &targets {
-        let enabled: Vec<String> = config
-            .server(&target.name)
-            .iter()
-            .map(|server| server.display_name())
-            .collect();
-        println!(
-            "Using {} in {}",
-            enabled.join(", "),
-            destination.display(&paths.home)
-        );
+    for server_pin in &pins {
+        let mut note = replaced_accounts_note(&before, &config, &server_pin.name);
+        for server in config.server(&server_pin.name) {
+            println!(
+                "Using {} in {}{note}",
+                server.display_name(),
+                destination.display(&paths.home)
+            );
+            note.clear();
+        }
     }
     notify_daemon_reload(paths).await;
     Ok(())
+}
+
+/// What `unuse` did, or found, for one server.
+enum Unpinned {
+    Removed,
+    AlreadyOff,
 }
 
 pub async fn unuse_servers(
@@ -104,12 +122,28 @@ pub async fn unuse_servers(
         );
     }
     let destination = Destination::choose(paths, cd, &options)?;
+    let before = destination.resolve(paths)?;
     let mut document = parse(&read_or_empty(&destination.file)?, &destination.file)?;
 
+    let mut outcomes = Vec::new();
     for target in &targets {
-        unpin(&mut document, &target.name)?;
+        let name = target.name.as_str();
+        let is_on = !before.server(name).is_empty() || has_problem_for(&before, name);
+        if is_on {
+            unpin(&mut document, name)?;
+            outcomes.push(Unpinned::Removed);
+        } else if is_known(&before, &document, name) {
+            outcomes.push(Unpinned::AlreadyOff);
+        } else {
+            bail!("nothing written: {}", unknown_server(&before, name));
+        }
     }
-    write(&destination.file, &document)?;
+    let any_removed = outcomes
+        .iter()
+        .any(|outcome| matches!(outcome, Unpinned::Removed));
+    if any_removed {
+        write(&destination.file, &document)?;
+    }
 
     // A server inherited from a parent directory is still on; switch it off here explicitly.
     let config = destination.resolve(paths)?;
@@ -124,7 +158,12 @@ pub async fn unuse_servers(
         write(&destination.file, &document)?;
     }
 
-    for target in &targets {
+    for (target, outcome) in targets.iter().zip(&outcomes) {
+        let file = destination.display(&paths.home);
+        if let Unpinned::AlreadyOff = outcome {
+            println!("{} is already off here; {file} is unchanged", target.name);
+            continue;
+        }
         let inherited = still_enabled
             .iter()
             .any(|enabled| enabled.name == target.name);
@@ -133,13 +172,11 @@ pub async fn unuse_servers(
         } else {
             ""
         };
-        println!(
-            "Not using {} in {}{note}",
-            target.name,
-            destination.display(&paths.home)
-        );
+        println!("Not using {} in {file}{note}", target.name);
     }
-    notify_daemon_reload(paths).await;
+    if any_removed {
+        notify_daemon_reload(paths).await;
+    }
     Ok(())
 }
 
@@ -147,6 +184,7 @@ pub async fn add(paths: &Paths, options: AddOptions) -> anyhow::Result<()> {
     if !config::is_valid_name(&options.name) {
         bail!("server names use lowercase letters, digits and `-` only");
     }
+    check_add_options(&options, &paths.global_config())?;
     let file = paths.global_config();
     let original = read_or_empty(&file)?;
     let mut document = parse(&original, &file)?;
@@ -182,7 +220,14 @@ pub async fn add(paths: &Paths, options: AddOptions) -> anyhow::Result<()> {
 pub async fn remove(paths: &Paths, name: &str) -> anyhow::Result<()> {
     let file = paths.global_config();
     let mut document = parse(&read_or_empty(&file)?, &file)?;
+    let built_in = registry::lookup(name);
     if servers_table(&mut document)?.remove(name).is_none() {
+        if built_in.is_some() {
+            bail!(
+                "{name} is built in, not in your catalog, so there is nothing to remove. \
+                 To stop using it, run `plugbay unuse {name}` (add `-g` for every directory)"
+            );
+        }
         bail!("{name} is not in the catalog ({})", file.display());
     }
     write(&file, &document)?;
@@ -194,11 +239,22 @@ pub async fn remove(paths: &Paths, name: &str) -> anyhow::Result<()> {
         .filter_map(|config| config.location.config_dir.as_deref())
         .map(|directory| display_path(directory, &paths.home))
         .collect();
-    if !still_pinned.is_empty() {
-        println!(
+    match built_in {
+        Some(entry) if still_pinned.is_empty() => println!(
+            "The built-in {name} ({}) applies again wherever it is pinned.",
+            entry.url
+        ),
+        Some(entry) => println!(
+            "The built-in {name} ({}) takes over where it is still pinned: {} \
+             (run `plugbay unuse {name}` there to stop using it)",
+            entry.url,
+            still_pinned.join(", ")
+        ),
+        None if !still_pinned.is_empty() => println!(
             "Still pinned in: {} (run `plugbay unuse {name}` there, or add it back)",
             still_pinned.join(", ")
-        );
+        ),
+        None => {}
     }
     notify_daemon_reload(paths).await;
     Ok(())
@@ -266,37 +322,103 @@ fn parse_targets(arguments: &[String]) -> anyhow::Result<Vec<PinTarget>> {
     Ok(targets)
 }
 
-/// Switches `target` on. An entry that defines the server keeps its definition and only gets
-/// its account (and `enabled`) changed; anything else becomes `name = "account"` or `name = true`.
-fn pin(document: &mut DocumentMut, target: &PinTarget) -> anyhow::Result<()> {
+/// `sentry:a sentry:b linear` → `sentry` with accounts a and b, `linear` with none.
+fn group_by_server(targets: &[PinTarget]) -> anyhow::Result<Vec<ServerPin>> {
+    let mut pins: Vec<ServerPin> = Vec::new();
+    for target in targets {
+        let Some(existing) = pins.iter_mut().find(|pin| pin.name == target.name) else {
+            pins.push(ServerPin {
+                name: target.name.clone(),
+                accounts: target.account.iter().cloned().collect(),
+            });
+            continue;
+        };
+        let Some(account) = &target.account else {
+            bail!(
+                "{name} is given more than once; to use several of its accounts, name each one: \
+                 `plugbay use {name}:<account> {name}:<other>`",
+                name = target.name
+            );
+        };
+        if existing.accounts.is_empty() {
+            bail!(
+                "{name} is given with and without an account; name every account to use several",
+                name = target.name
+            );
+        }
+        if !existing.accounts.contains(account) {
+            existing.accounts.push(account.clone());
+        }
+    }
+    Ok(pins)
+}
+
+/// Switches `server_pin` on. An entry that is a table keeps its settings (definition, tool
+/// filters) and only gets its account and `enabled` changed; anything else becomes
+/// `name = true`, `name = "account"` or `name = ["a", "b"]`.
+fn pin(document: &mut DocumentMut, server_pin: &ServerPin) -> anyhow::Result<()> {
     let servers = servers_table(document)?;
     if let Some(definition) = servers
-        .get_mut(&target.name)
+        .get_mut(&server_pin.name)
         .and_then(Item::as_table_like_mut)
     {
         definition.remove("enabled");
-        if let Some(account) = &target.account {
-            definition.remove("accounts");
-            definition.insert("account", toml_edit::value(account.as_str()));
+        match server_pin.accounts.as_slice() {
+            [] => {}
+            [account] => {
+                definition.remove("accounts");
+                definition.insert("account", toml_edit::value(account.as_str()));
+            }
+            accounts => {
+                definition.remove("account");
+                definition.insert("accounts", toml_edit::value(account_list(accounts)));
+            }
         }
         definition.fmt();
         return Ok(());
     }
-    let value = match &target.account {
-        Some(account) => toml_edit::value(account.as_str()),
-        None => toml_edit::value(true),
+    let value = match server_pin.accounts.as_slice() {
+        [] => toml_edit::value(true),
+        [account] => toml_edit::value(account.as_str()),
+        accounts => toml_edit::value(account_list(accounts)),
     };
-    servers.insert(&target.name, value);
+    servers.insert(&server_pin.name, value);
     Ok(())
 }
 
-/// Removes `name`'s pin, but keeps a definition (url or command) by switching it off instead.
+fn account_list(accounts: &[String]) -> toml_edit::Array {
+    accounts.iter().map(String::as_str).collect()
+}
+
+/// ` (was acme)` when `use` changed which accounts of `name` resolve here, else empty.
+fn replaced_accounts_note(before: &ResolvedConfig, after: &ResolvedConfig, name: &str) -> String {
+    let accounts = |config: &ResolvedConfig| -> Vec<String> {
+        let mut accounts: Vec<String> = config
+            .server(name)
+            .iter()
+            .map(|server| server.account.clone())
+            .collect();
+        accounts.sort();
+        accounts
+    };
+    let previous = accounts(before);
+    if previous.is_empty() || previous == accounts(after) {
+        return String::new();
+    }
+    format!(" (was {})", previous.join(", "))
+}
+
+/// Settings that only say "on, with this account": an entry holding nothing else is a plain pin.
+const PIN_ONLY_KEYS: [&str; 3] = ["enabled", "account", "accounts"];
+
+/// Removes `name`'s pin, but keeps a table with other settings (a definition, tool filters) by
+/// switching it off instead, so `use` can bring it back as it was.
 fn unpin(document: &mut DocumentMut, name: &str) -> anyhow::Result<()> {
     let servers = servers_table(document)?;
     let definition = servers
         .get_mut(name)
         .and_then(Item::as_table_like_mut)
-        .filter(|entry| entry.contains_key("url") || entry.contains_key("command"));
+        .filter(|entry| entry.iter().any(|(key, _)| !PIN_ONLY_KEYS.contains(&key)));
     match definition {
         Some(definition) => {
             definition.insert("enabled", toml_edit::value(false));
@@ -375,10 +497,7 @@ fn why_not_enabled(config: &ResolvedConfig, name: &str) -> String {
         .find(|problem| problem.servers.iter().any(|server| server == name))
     {
         if problem.is_unknown_server() {
-            return format!(
-                "plugbay doesn't know how to reach {name}: add it first with \
-                 `plugbay add {name} --url <url>` or `plugbay add {name} -- <command>`"
-            );
+            return unknown_server(config, name);
         }
         return format!("{name}: {}", problem.message);
     }
@@ -389,6 +508,110 @@ fn why_not_enabled(config: &ResolvedConfig, name: &str) -> String {
         );
     }
     format!("{name} did not resolve; run `plugbay why {name}`")
+}
+
+fn unknown_server(config: &ResolvedConfig, name: &str) -> String {
+    let did_you_mean = match closest_known_name(config, name) {
+        Some(closest) => format!("did you mean `{closest}`? Otherwise "),
+        None => String::new(),
+    };
+    format!(
+        "plugbay doesn't know how to reach {name}: {did_you_mean}add it first with \
+         `plugbay add {name} --url <url>` or `plugbay add {name} -- <command>` \
+         (`plugbay ls --available` lists what it knows)"
+    )
+}
+
+/// Every server name plugbay could pin here: built-in, catalog, and anything config mentions.
+fn known_names(config: &ResolvedConfig) -> Vec<&str> {
+    let mut names: Vec<&str> = registry::all().iter().map(|entry| entry.name).collect();
+    names.extend(config.catalog.iter().map(String::as_str));
+    names.extend(config.servers.iter().map(|server| server.name.as_str()));
+    names.extend(config.disabled.iter().map(|server| server.name.as_str()));
+    names
+}
+
+/// The known name a typo most likely meant: `sentri` → `sentry`.
+pub(super) fn closest_known_name<'a>(config: &'a ResolvedConfig, name: &str) -> Option<&'a str> {
+    const SIMILAR_ENOUGH: f64 = 0.8;
+    let mut best: Option<(&str, f64)> = None;
+    for candidate in known_names(config) {
+        let similarity = strsim::jaro_winkler(name, candidate);
+        let better = best.is_none_or(|(_, best_similarity)| similarity > best_similarity);
+        if similarity >= SIMILAR_ENOUGH && candidate != name && better {
+            best = Some((candidate, similarity));
+        }
+    }
+    best.map(|(candidate, _)| candidate)
+}
+
+/// Known but off here: built in, in the catalog, switched off, or mentioned in this file.
+fn is_known(config: &ResolvedConfig, document: &DocumentMut, name: &str) -> bool {
+    let in_this_file = document
+        .get("servers")
+        .and_then(Item::as_table_like)
+        .is_some_and(|servers| servers.contains_key(name));
+    in_this_file || known_names(config).contains(&name)
+}
+
+/// Refuses catalog entries that would quietly redirect pins, send traffic unencrypted, or
+/// write a secret into the config file.
+fn check_add_options(options: &AddOptions, global_config: &Path) -> anyhow::Result<()> {
+    let name = &options.name;
+    if let Some(entry) = registry::lookup(name)
+        && !options.force
+    {
+        bail!(
+            "{name} is built in ({}). A catalog entry named {name} would replace it in every \
+             directory: existing `{name} = ...` pins would connect to your definition instead. \
+             Pick another name (e.g. `{name}-self-hosted`), or pass `--force` if that is what you want",
+            entry.url
+        );
+    }
+    if let Some(url) = &options.url {
+        check_url(url)?;
+    }
+    for assignment in &options.env {
+        let Some((variable, value)) = assignment.split_once('=') else {
+            continue;
+        };
+        if secrets::looks_secret(variable)
+            && !value.is_empty()
+            && !secrets::contains_secret_ref(value)
+        {
+            bail!(
+                "`--env {variable}=...` would write a secret in plain text to {config}. \
+                 Store it in your keychain (macOS: `security add-generic-password -s {name} -a {variable} -w`) \
+                 and pass a reference instead: `--env '{variable}=${{keychain:{name}/{variable}}}'`. \
+                 `${{op://vault/item/field}}`, `${{env:{variable}}}` and `${{fnox:{variable}}}` work too. \
+                 If the value is not secret, add it to {config} by hand",
+                config = global_config.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `https`, or plain `http` to this machine only: anything else would send tokens in the clear.
+fn check_url(text: &str) -> anyhow::Result<()> {
+    let url = url::Url::parse(text).with_context(|| format!("`{text}` is not a valid url"))?;
+    let is_loopback = match url.host() {
+        Some(url::Host::Domain(domain)) => domain == "localhost",
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    };
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" if is_loopback => Ok(()),
+        "http" => bail!(
+            "`{text}` is plain http to another machine, so logins and tokens would travel \
+             unencrypted; use its https url (plain http is fine for localhost / 127.0.0.1)"
+        ),
+        scheme => {
+            bail!("`{text}`: plugbay connects over https (or http to localhost), not `{scheme}`")
+        }
+    }
 }
 
 fn has_problem_for(config: &ResolvedConfig, name: &str) -> bool {
@@ -428,10 +651,27 @@ fn restore(file: &Path, original: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    fn target(name: &str, account: Option<&str>) -> PinTarget {
-        PinTarget {
+    fn server_pin(name: &str, accounts: &[&str]) -> ServerPin {
+        ServerPin {
             name: name.to_string(),
-            account: account.map(str::to_string),
+            accounts: accounts.iter().map(|account| account.to_string()).collect(),
+        }
+    }
+
+    fn add_options(name: &str, url: Option<&str>, env: &[&str]) -> AddOptions {
+        AddOptions {
+            name: name.to_string(),
+            url: url.map(str::to_string),
+            env: env
+                .iter()
+                .map(|assignment| assignment.to_string())
+                .collect(),
+            command: if url.is_none() {
+                vec!["npx".to_string()]
+            } else {
+                Vec::new()
+            },
+            force: false,
         }
     }
 
@@ -445,8 +685,8 @@ mod tests {
     fn pin_adds_a_short_entry_and_keeps_comments() {
         let text = "# work\naccount = \"initech\"\n\n[servers]\nlinear = true # tracker\n";
         let result = edited(text, |document| {
-            pin(document, &target("sentry", Some("acme"))).unwrap();
-            pin(document, &target("vercel", None)).unwrap();
+            pin(document, &server_pin("sentry", &["acme"])).unwrap();
+            pin(document, &server_pin("vercel", &[])).unwrap();
         });
         assert_eq!(
             result,
@@ -461,6 +701,7 @@ mod tests {
             url: Some("http://127.0.0.1:7373/mcp".to_string()),
             env: Vec::new(),
             command: Vec::new(),
+            force: false,
         };
         let result = edited("", |document| {
             let definition = definition_table(&options).unwrap();
@@ -477,7 +718,7 @@ mod tests {
     #[test]
     fn pin_creates_the_servers_table() {
         let result = edited("", |document| {
-            pin(document, &target("linear", None)).unwrap()
+            pin(document, &server_pin("linear", &[])).unwrap()
         });
         assert_eq!(result, "[servers]\nlinear = true\n");
     }
@@ -486,7 +727,7 @@ mod tests {
     fn pin_switches_an_inline_definition_back_on() {
         let text = "[servers]\nwa = { url = \"http://127.0.0.1:7373/mcp\", enabled = false }\n";
         let result = edited(text, |document| {
-            pin(document, &target("wa", Some("home"))).unwrap()
+            pin(document, &server_pin("wa", &["home"])).unwrap()
         });
         assert_eq!(
             result,
@@ -498,7 +739,7 @@ mod tests {
     fn pin_keeps_a_definition_and_sets_its_account() {
         let text = "[servers.teams]\ncommand = \"npx\"\nenabled = false\n";
         let result = edited(text, |document| {
-            pin(document, &target("teams", Some("work"))).unwrap()
+            pin(document, &server_pin("teams", &["work"])).unwrap()
         });
         assert_eq!(
             result,
@@ -526,6 +767,7 @@ mod tests {
             url: Some("http://127.0.0.1:7373/mcp".to_string()),
             env: Vec::new(),
             command: Vec::new(),
+            force: false,
         };
         assert_eq!(
             definition_table(&remote).unwrap().to_string(),
@@ -541,11 +783,113 @@ mod tests {
                 "-y".to_string(),
                 "msteams-mcp".to_string(),
             ],
+            force: false,
         };
         assert_eq!(
             definition_table(&stdio).unwrap().to_string(),
             "command = \"npx\"\nargs = [\"-y\", \"msteams-mcp\"]\nenv = { REGION = \"eu\" }\nenabled = false\n"
         );
+    }
+
+    #[test]
+    fn two_accounts_of_one_server_become_the_list_form() {
+        let targets = parse_targets(&[
+            "sentry:a".to_string(),
+            "linear".to_string(),
+            "sentry:b".to_string(),
+            "sentry:a".to_string(),
+        ])
+        .unwrap();
+        let pins = group_by_server(&targets).unwrap();
+        assert_eq!(
+            pins,
+            [server_pin("sentry", &["a", "b"]), server_pin("linear", &[])]
+        );
+
+        let result = edited("", |document| pin(document, &pins[0]).unwrap());
+        assert_eq!(result, "[servers]\nsentry = [\"a\", \"b\"]\n");
+    }
+
+    #[test]
+    fn several_accounts_replace_a_tables_single_account() {
+        let text = "[servers]\nsentry = { account = \"a\", exclude_tools = [\"delete_*\"] }\n";
+        let result = edited(text, |document| {
+            pin(document, &server_pin("sentry", &["a", "b"])).unwrap()
+        });
+        assert_eq!(
+            result,
+            "[servers]\nsentry = { exclude_tools = [\"delete_*\"], accounts = [\"a\", \"b\"] }\n"
+        );
+    }
+
+    #[test]
+    fn a_server_with_and_without_an_account_is_refused() {
+        let targets = parse_targets(&["sentry".to_string(), "sentry:b".to_string()]).unwrap();
+        assert!(group_by_server(&targets).is_err());
+    }
+
+    #[test]
+    fn unpin_keeps_a_table_with_tool_filters_switched_off() {
+        let text = "[servers]\nposthog = { account = \"a\", exclude_tools = [\"delete_*\"] }\nsentry = { account = \"a\" }\n";
+        let result = edited(text, |document| {
+            unpin(document, "posthog").unwrap();
+            unpin(document, "sentry").unwrap();
+        });
+        assert_eq!(
+            result,
+            "[servers]\nposthog = { account = \"a\", exclude_tools = [\"delete_*\"], enabled = false }\n"
+        );
+
+        let back_on = edited(&result, |document| {
+            pin(document, &server_pin("posthog", &[])).unwrap()
+        });
+        assert_eq!(
+            back_on,
+            "[servers]\nposthog = { account = \"a\", exclude_tools = [\"delete_*\"] }\n"
+        );
+    }
+
+    #[test]
+    fn typos_suggest_the_closest_known_server() {
+        let config = ResolvedConfig::test_with(Vec::new(), Vec::new());
+        assert_eq!(closest_known_name(&config, "sentri"), Some("sentry"));
+        assert_eq!(closest_known_name(&config, "zzz"), None);
+        assert!(unknown_server(&config, "sentri").contains("did you mean `sentry`?"));
+    }
+
+    #[test]
+    fn add_refuses_to_shadow_a_built_in_server_without_force() {
+        let global = Path::new("/home/me/.config/plugbay/config.toml");
+        let mut options = add_options("linear", Some("https://evil.example.com/mcp"), &[]);
+        let error = check_add_options(&options, global).unwrap_err().to_string();
+        assert!(error.contains("--force"), "{error}");
+
+        options.force = true;
+        assert!(check_add_options(&options, global).is_ok());
+    }
+
+    #[test]
+    fn add_allows_plain_http_only_to_this_machine() {
+        assert!(check_url("https://huggingface.co/mcp").is_ok());
+        assert!(check_url("http://127.0.0.1:7373/mcp").is_ok());
+        assert!(check_url("http://localhost:7373/mcp").is_ok());
+        assert!(check_url("http://[::1]:7373/mcp").is_ok());
+        assert!(check_url("http://mcp.example.com/mcp").is_err());
+        assert!(check_url("ftp://127.0.0.1/mcp").is_err());
+    }
+
+    #[test]
+    fn add_refuses_plain_text_secrets_in_env() {
+        let global = Path::new("/home/me/.config/plugbay/config.toml");
+        let plain = add_options("teams", None, &["API_KEY=test-token"]);
+        let error = check_add_options(&plain, global).unwrap_err().to_string();
+        assert!(error.contains("${keychain:teams/API_KEY}"), "{error}");
+        assert!(!error.contains("test-token"), "{error}");
+
+        let reference = add_options("teams", None, &["API_KEY=${op://vault/teams/key}"]);
+        assert!(check_add_options(&reference, global).is_ok());
+        let not_secret = add_options("teams", None, &["REGION=eu"]);
+        assert!(check_add_options(&not_secret, global).is_ok());
     }
 
     #[test]

@@ -10,7 +10,7 @@ use crate::credentials::{self, StoredLogin};
 use crate::identity::{self, VerifiedAccounts};
 use crate::paths::Paths;
 use crate::protocol::{self, ControlRequest};
-use crate::trust::{self, Trust};
+use crate::trust::Trust;
 
 const DAEMON_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -127,10 +127,10 @@ fn check_state_dir(state_dir: &Path) -> Check {
     let metadata = match std::fs::metadata(state_dir) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Check::warn(
-                format!("state dir {} does not exist yet", state_dir.display()),
-                "it is created when the daemon first starts; start an agent or run `plugbay daemon`",
-            );
+            return Check::ok(format!(
+                "state dir {} not created yet (the daemon creates it on first start)",
+                state_dir.display()
+            ));
         }
         Err(error) => {
             return Check::error(
@@ -208,7 +208,6 @@ fn check_resolved_config(config: &ResolvedConfig) -> Vec<Check> {
 }
 
 async fn check_servers(paths: &Paths, config: &ResolvedConfig) -> Vec<Check> {
-    trust::grant_files_written_here(paths, config).await;
     let trust = Trust::new(paths);
     let verified = VerifiedAccounts::load(paths).await;
     let mut checks = Vec::new();
@@ -267,7 +266,6 @@ async fn check_server_credentials(server: &ResolvedServer) -> Option<Check> {
 /// Who the login turned out to be, when the server was asked: wrong for `expect`, or the same
 /// account as another label of this server (fine if intended, a mix-up if not).
 fn check_verified_account(server: &ResolvedServer, verified: &VerifiedAccounts) -> Option<Check> {
-    let shown = verified.shown(&server.identity, &server.account)?;
     let name = server.display_name();
     let relogin = format!("run `plugbay logout {name}`, then `plugbay login {name}`");
     if let Some(failure) = identity::expectation_failure(server, verified) {
@@ -276,6 +274,7 @@ fn check_verified_account(server: &ResolvedServer, verified: &VerifiedAccounts) 
             format!("{relogin} and pick the expected workspace"),
         ));
     }
+    let shown = verified.shown(&server.identity, &server.account)?;
 
     let same_login = verified.same_login_as(&server.identity, &server.account);
     if same_login.is_empty() {
@@ -491,6 +490,13 @@ mod tests {
             );
         }
         assert!(uses_op_refs(&server));
+    }
+
+    #[test]
+    fn a_fresh_install_without_a_state_dir_is_fine() {
+        let root = tempfile::TempDir::new().unwrap();
+        let missing = root.path().join("state");
+        assert_eq!(check_state_dir(&missing).status, Status::Ok);
     }
 
     #[test]

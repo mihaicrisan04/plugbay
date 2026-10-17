@@ -208,7 +208,7 @@ pub async fn forget(identity: &ServerIdentity, account: &str) -> anyhow::Result<
 }
 
 fn entry_name(identity: &ServerIdentity, account: &str) -> String {
-    format!("{identity}#{account}")
+    format!("{}#{account}", identity.0)
 }
 
 async fn read_keychain(

@@ -98,7 +98,10 @@ impl MergedConfig {
 
 impl MergedServer {
     fn apply(&mut self, entry: &ServerEntry, source: &Path, home: &Path) {
-        self.enabled = Some(Sourced::new(entry.enabled, source));
+        let already = self.enabled.as_ref().map(|enabled| enabled.value);
+        if already != Some(entry.enabled) {
+            self.enabled = Some(Sourced::new(entry.enabled, source));
+        }
         match &entry.account {
             AccountChange::Inherit => {}
             AccountChange::UseTreeDefault => self.accounts = None,

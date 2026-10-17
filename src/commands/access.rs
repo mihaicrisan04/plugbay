@@ -17,7 +17,7 @@ use crate::paths::Paths;
 use crate::project::ProjectLocation;
 use crate::protocol::{ControlRequest, send_control};
 use crate::secrets;
-use crate::trust::{self, Trust};
+use crate::trust::Trust;
 use crate::{credentials, identity, oauth};
 
 /// Where `plugbay login` reads a static API token from, instead of starting an OAuth login.
@@ -257,7 +257,7 @@ async fn login_with_token(
     println!(
         "Stored a token for {} (sent only to {}).",
         server.display_name(),
-        server.identity
+        server.identity.masked()
     );
     notify_credentials_changed(paths, server).await;
     Ok(())
@@ -314,8 +314,6 @@ pub async fn trust(paths: &Paths, cd: Option<PathBuf>, revoke: bool) -> anyhow::
     if revoke {
         return revoke_trust(paths, &config, &mut trust).await;
     }
-    trust::grant_files_written_here(paths, &config).await;
-
     let untrusted = trust.untrusted_files(&config);
     if untrusted.is_empty() {
         println!("Nothing to trust here: every config file is already trusted or runs nothing.");

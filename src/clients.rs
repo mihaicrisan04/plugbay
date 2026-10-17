@@ -404,7 +404,9 @@ pub async fn setup(paths: &Paths, clients: &[String], dry_run: bool) -> anyhow::
     if selected.contains(&Client::Codex) {
         setup_codex(paths, &shim, dry_run)?;
     }
-    println!("T3 Code: nothing to do, it runs Claude Code and Codex with their own MCP config");
+    if Client::ALL.iter().all(|client| selected.contains(client)) {
+        println!("T3 Code: nothing to do, it runs Claude Code and Codex with their own MCP config");
+    }
     Ok(())
 }
 

@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
-use toml_edit::{DocumentMut, Item, Table};
+use toml_edit::{DocumentMut, Item, Table, TableLike, Value};
 
 use super::claude::{self, ClaudeProjectState};
 use super::import::{
@@ -74,8 +74,8 @@ pub async fn migrate(paths: &Paths, options: MigrateOptions) -> anyhow::Result<(
         );
         return Ok(());
     }
-    let pin_files = pin_files(&migrations, &paths.home);
-    print_plan(paths, &migrations, &pin_files);
+    let pin_edits = plan_pin_edits(&pin_files(&migrations, &paths.home))?;
+    print_plan(paths, &migrations, &pin_edits);
     let servers: Vec<ImportedServer> = migrations
         .iter()
         .map(|migration| migration.server.clone())
@@ -93,7 +93,7 @@ pub async fn migrate(paths: &Paths, options: MigrateOptions) -> anyhow::Result<(
     let result = apply(
         paths,
         migrations,
-        &pin_files,
+        &pin_edits,
         &mut journal,
         options.keep_native,
     )
@@ -323,11 +323,12 @@ fn pin_files(migrations: &[Migration], home: &Path) -> PinFiles {
 }
 
 /// Inside a git checkout the pins are personal, so they go to `plugbay.local.toml` and stay
-/// out of the team's repo; elsewhere (`~/dev/work`) a plain `plugbay.toml`.
+/// out of the team's repo; elsewhere (`~/dev/work`) a plain `plugbay.toml`. A checkout outside
+/// `$HOME` (or reached through a symlink) counts too; only a dotfiles repo at `$HOME` is ignored.
 fn pin_file_for(directory: &Path, home: &Path) -> PathBuf {
     let in_checkout = directory
         .ancestors()
-        .take_while(|ancestor| ancestor.starts_with(home) && *ancestor != home)
+        .take_while(|ancestor| *ancestor != home)
         .any(|ancestor| ancestor.join(".git").exists());
     let file_name = if in_checkout {
         LOCAL_FILE
@@ -337,7 +338,119 @@ fn pin_file_for(directory: &Path, home: &Path) -> PathBuf {
     directory.join(file_name)
 }
 
-fn print_plan(paths: &Paths, migrations: &[Migration], pin_files: &PinFiles) {
+/// One pin file as migrate will leave it.
+struct PinFileEdit {
+    file: PathBuf,
+    document: DocumentMut,
+    /// One line per pin for the plan: `github = false`, `posthog: keeps exclude_tools, ...`.
+    changes: Vec<String>,
+    /// False when every pin already says what migrate means, so the file is left alone.
+    changed: bool,
+}
+
+/// What setting one pin did to the entry already in the file.
+#[derive(Debug, PartialEq, Eq)]
+enum PinChange {
+    Added,
+    Unchanged,
+    /// A table entry: only `enabled` changed, its other settings stay.
+    Switched {
+        kept: Vec<String>,
+    },
+    /// A plain value (`"acme"`, `true`, a list) replaced by `true` / `false`.
+    Replaced {
+        previous: String,
+    },
+}
+
+impl PinChange {
+    fn describe(&self, key: &str, on: bool) -> String {
+        let state = if on { "on" } else { "off" };
+        match self {
+            PinChange::Added => format!("{key} = {on}"),
+            PinChange::Unchanged => format!("{key}: already {state} here, unchanged"),
+            PinChange::Switched { kept } => {
+                let enabled = if on {
+                    "removes enabled = false"
+                } else {
+                    "sets enabled = false"
+                };
+                if kept.is_empty() {
+                    format!("{key}: {enabled}")
+                } else {
+                    format!("{key}: keeps {}, {enabled}", kept.join(", "))
+                }
+            }
+            PinChange::Replaced { previous } => format!("{key}: replaces {previous} with {on}"),
+        }
+    }
+}
+
+/// Reads each pin file and merges migrate's pins into what it already holds.
+fn plan_pin_edits(pin_files: &PinFiles) -> anyhow::Result<Vec<PinFileEdit>> {
+    let mut edits = Vec::new();
+    for (file, pins) in pin_files {
+        let mut document = parse(&read_optional(file)?.unwrap_or_default(), file)?;
+        let servers = servers_table(&mut document)?;
+        let mut changes = Vec::new();
+        let mut changed = false;
+        for (key, on) in pins {
+            let change = merge_pin(servers, key, *on);
+            changed |= change != PinChange::Unchanged;
+            changes.push(change.describe(key, *on));
+        }
+        edits.push(PinFileEdit {
+            file: file.clone(),
+            document,
+            changes,
+            changed,
+        });
+    }
+    Ok(edits)
+}
+
+/// Switches `key` on or off, keeping an existing table's other settings (`exclude_tools`,
+/// `account`, ...). An existing account pin already means on, so it stays.
+fn merge_pin(servers: &mut dyn TableLike, key: &str, on: bool) -> PinChange {
+    let Some(existing) = servers.get_mut(key) else {
+        servers.insert(key, toml_edit::value(on));
+        return PinChange::Added;
+    };
+    if let Some(table) = existing.as_table_like_mut() {
+        let is_on = table.get("enabled").and_then(Item::as_bool) != Some(false);
+        if is_on == on {
+            return PinChange::Unchanged;
+        }
+        if on {
+            table.remove("enabled");
+        } else {
+            table.insert("enabled", toml_edit::value(false));
+        }
+        table.fmt();
+        let kept = table
+            .iter()
+            .map(|(name, _)| name.to_string())
+            .filter(|name| name != "enabled")
+            .collect();
+        return PinChange::Switched { kept };
+    }
+    let Some(value) = existing.as_value_mut() else {
+        *existing = toml_edit::value(on);
+        return PinChange::Added;
+    };
+    let is_on = value.as_bool() != Some(false);
+    if is_on == on {
+        return PinChange::Unchanged;
+    }
+    let decor = value.decor().clone();
+    value.decor_mut().clear();
+    let previous = value.to_string();
+    *value = Value::from(on);
+    *value.decor_mut() = decor;
+    PinChange::Replaced { previous }
+}
+
+fn print_plan(paths: &Paths, migrations: &[Migration], pin_edits: &[PinFileEdit]) {
     let home = &paths.home;
     println!("Definitions → {}", display(&paths.global_config(), home));
     for migration in migrations {
@@ -363,14 +476,14 @@ fn print_plan(paths: &Paths, migrations: &[Migration], pin_files: &PinFiles) {
         }
     }
 
-    if !pin_files.is_empty() {
+    if !pin_edits.is_empty() {
         println!("\nPins");
-        for (file, pins) in pin_files {
-            let described: Vec<String> = pins
-                .iter()
-                .map(|(key, on)| format!("{key} = {on}"))
-                .collect();
-            println!("  {:<44} {}", display(file, home), described.join(", "));
+        for edit in pin_edits {
+            println!(
+                "  {:<44} {}",
+                display(&edit.file, home),
+                edit.changes.join("; ")
+            );
         }
     }
 
@@ -380,7 +493,7 @@ fn print_plan(paths: &Paths, migrations: &[Migration], pin_files: &PinFiles) {
 async fn apply(
     paths: &Paths,
     migrations: Vec<Migration>,
-    pin_files: &PinFiles,
+    pin_edits: &[PinFileEdit],
     journal: &mut Journal,
     keep_native: bool,
 ) -> anyhow::Result<()> {
@@ -408,15 +521,10 @@ async fn apply(
         display(&global_config, &paths.home)
     );
 
-    for (file, pins) in pin_files {
-        journal.back_up(file)?;
-        let mut document = parse(&read_optional(file)?.unwrap_or_default(), file)?;
-        let servers = servers_table(&mut document)?;
-        for (key, on) in pins {
-            servers.insert(key, toml_edit::value(*on));
-        }
-        write(file, &document)?;
-        println!("Pinned in {}", display(file, &paths.home));
+    for edit in pin_edits.iter().filter(|edit| edit.changed) {
+        journal.back_up(&edit.file)?;
+        write(&edit.file, &edit.document)?;
+        println!("Pinned in {}", display(&edit.file, &paths.home));
     }
 
     register_plugbay(paths, journal).await?;
@@ -461,8 +569,9 @@ async fn store_bearer_token(
         .is_some()
     {
         println!(
-            "{}: a token is already stored for {identity}; kept it",
-            server.key
+            "{}: a token is already stored for {}; kept it",
+            server.key,
+            identity.masked()
         );
         return Ok(());
     }
@@ -612,6 +721,9 @@ struct Journal {
     /// rewrites it constantly, so it is only where removed entries can be copied back from.
     #[serde(default)]
     claude_config_backup: Option<PathBuf>,
+    /// Set by `--undo`, so a second undo can't restore old backups over newer edits.
+    #[serde(default)]
+    undone: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -714,7 +826,14 @@ fn migration_time(directory: &Path) -> u64 {
 /// Rolls back the last migration: files restored (created ones removed), keychain entries and
 /// tokens it created deleted, Claude Code entries it removed added back from the backup.
 async fn undo(paths: &Paths) -> anyhow::Result<()> {
-    let journal = Journal::load_latest(paths)?;
+    let mut journal = Journal::load_latest(paths)?;
+    if journal.undone {
+        bail!(
+            "the last migration ({}) was already undone; undoing it again would overwrite \
+             changes made since. Run `plugbay migrate` to plan a new one",
+            journal.directory.display()
+        );
+    }
     println!("Undoing the migration in {}", journal.directory.display());
 
     for file in &journal.files {
@@ -772,6 +891,8 @@ async fn undo(paths: &Paths) -> anyhow::Result<()> {
             not_restored.join(", ")
         );
     }
+    journal.undone = true;
+    journal.save()?;
     crate::commands::notify_daemon_reload(paths).await;
     Ok(())
 }
@@ -831,7 +952,7 @@ fn keychain_entry_name(reference: &str) -> Option<&str> {
         .strip_prefix('/')
 }
 
-fn servers_table(document: &mut DocumentMut) -> anyhow::Result<&mut dyn toml_edit::TableLike> {
+fn servers_table(document: &mut DocumentMut) -> anyhow::Result<&mut dyn TableLike> {
     document
         .entry("servers")
         .or_insert_with(|| Item::Table(Table::new()))
@@ -940,6 +1061,76 @@ mod tests {
             tops,
             vec![PathBuf::from("/home/me/a"), PathBuf::from("/home/me/b")]
         );
+    }
+
+    fn merged(text: &str, key: &str, on: bool) -> (String, String) {
+        let mut document: DocumentMut = text.parse().unwrap();
+        let change = merge_pin(servers_table(&mut document).unwrap(), key, on);
+        (document.to_string(), change.describe(key, on))
+    }
+
+    #[test]
+    fn merging_a_pin_keeps_an_existing_tables_settings() {
+        let text = "[servers]\nposthog = { exclude_tools = [\"delete_*\"] } # careful\n";
+
+        let (on, on_change) = merged(text, "posthog", true);
+        assert_eq!(on, text);
+        assert_eq!(on_change, "posthog: already on here, unchanged");
+
+        let (off, off_change) = merged(text, "posthog", false);
+        assert_eq!(
+            off,
+            "[servers]\nposthog = { exclude_tools = [\"delete_*\"], enabled = false } # careful\n"
+        );
+        assert_eq!(
+            off_change,
+            "posthog: keeps exclude_tools, sets enabled = false"
+        );
+    }
+
+    #[test]
+    fn merging_a_pin_keeps_an_account_but_reports_replacing_it_with_false() {
+        let text = "[servers]\nsentry = \"acme\" # client\n";
+        assert_eq!(merged(text, "sentry", true).0, text);
+
+        let (off, change) = merged(text, "sentry", false);
+        assert_eq!(off, "[servers]\nsentry = false # client\n");
+        assert_eq!(change, "sentry: replaces \"acme\" with false");
+    }
+
+    #[test]
+    fn merging_a_pin_into_an_empty_file_adds_it() {
+        let (text, change) = merged("", "github", false);
+        assert_eq!(text, "[servers]\ngithub = false\n");
+        assert_eq!(change, "github = false");
+    }
+
+    #[test]
+    fn pins_inside_a_checkout_go_to_the_local_file_even_outside_home() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = temp.path().join("elsewhere/repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("app")).unwrap();
+        let home = temp.path().join("home");
+
+        assert_eq!(pin_file_for(&repo, &home), repo.join(LOCAL_FILE));
+        assert_eq!(
+            pin_file_for(&repo.join("app"), &home),
+            repo.join("app").join(LOCAL_FILE)
+        );
+        let plain = temp.path().join("elsewhere");
+        assert_eq!(pin_file_for(&plain, &home), plain.join(PROJECT_FILE));
+    }
+
+    #[test]
+    fn a_dotfiles_repo_at_home_does_not_make_every_pin_local() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(home.join(".git")).unwrap();
+        let work = home.join("dev/work");
+        std::fs::create_dir_all(&work).unwrap();
+
+        assert_eq!(pin_file_for(&work, &home), work.join(PROJECT_FILE));
     }
 
     #[test]
