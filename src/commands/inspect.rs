@@ -14,7 +14,7 @@ use crate::credentials::{self, StoredLogin};
 use crate::identity::{self, VerifiedAccounts};
 use crate::paths::Paths;
 use crate::project::ProjectLocation;
-use crate::trust::{self, Trust};
+use crate::trust::Trust;
 use crate::{registry, secrets};
 
 /// `available`: list every server that could be pinned (built in and catalog) instead.
@@ -266,7 +266,6 @@ enum LoginStatus {
 }
 
 async fn server_statuses(paths: &Paths, config: &ResolvedConfig) -> Vec<ServerStatus> {
-    trust::grant_files_written_here(paths, config).await;
     let trust = Trust::new(paths);
     let verified = VerifiedAccounts::load(paths).await;
     let mut statuses = Vec::new();

@@ -1,36 +1,44 @@
 //! One agent connection: resolves its project's config and serves the aggregated upstream tools.
 
+mod enable;
+mod login;
+mod prompt;
+mod render;
+mod tools;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, SystemTime};
 
 use parking_lot::Mutex;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ElicitRequestParams,
-    ElicitationAction, ElicitationSchema, EnumSchema, Implementation, InitializeRequestParams,
-    InitializeResult, ListToolsResult, PaginatedRequestParams, PrimitiveSchemaDefinition,
+    CallToolRequestParams, CallToolResponse, CallToolResult, Implementation,
+    InitializeRequestParams, InitializeResult, ListToolsResult, PaginatedRequestParams,
     ProtocolVersion, ServerCapabilities, Tool,
 };
-use rmcp::service::{ElicitationMode, NotificationContext, RequestContext};
+use rmcp::service::{NotificationContext, RequestContext};
 use rmcp::{ErrorData as McpError, Peer, RoleServer, ServerHandler};
-use serde::Deserialize;
 
-use crate::config::{self, ConfigFile, ResolvedConfig, ResolvedServer, ServerIdentity, SessionPin};
+use crate::config::{self, ResolvedConfig, ResolvedServer, ServerIdentity, SessionPin};
 use crate::identity::{self, VerifiedAccounts};
 use crate::index;
 use crate::paths::Paths;
 use crate::project::{self, ProjectHints, ProjectLocation};
-use crate::trust::{self, Trust};
-use crate::upstream::{ConnectError, Lease, UpstreamPool};
-use crate::{oauth, registry};
+use crate::trust::Trust;
+use crate::upstream::{ConnectError, Lease, Upstream, UpstreamKey, UpstreamPool};
 
-const TOOL_SEPARATOR: &str = "__";
-const MAX_TOOL_NAME_LENGTH: usize = 64;
-const STATUS_TOOL: &str = "plugbay__status";
-const ENABLE_TOOL: &str = "plugbay__enable";
-const DISABLE_TOOL: &str = "plugbay__disable";
+use self::prompt::TrustPromptKey;
+use self::tools::{
+    DISABLE_TOOL, ENABLE_TOOL, STATUS_TOOL, TOOL_SEPARATOR, disable_tool, enable_tool,
+    error_result, exposed_tools, login_tool, status_tool, text_result,
+};
+
 const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// How long a refresh (and so the first tool listing) waits for upstreams. Codex gives an MCP
+/// server 10 s to start and list its tools; later arrivals are announced with `tools/list_changed`.
+const READY_DEADLINE: Duration = Duration::from_secs(8);
 
 /// State every session in one daemon shares.
 pub struct Shared {
@@ -38,8 +46,8 @@ pub struct Shared {
     pub pool: Arc<UpstreamPool>,
     trust: Mutex<Trust>,
     sessions: Mutex<Vec<Weak<Session>>>,
-    /// Config dirs whose trust prompt was already shown; one prompt per folder per daemon run.
-    trust_prompted: Mutex<HashSet<PathBuf>>,
+    /// Untrusted config already put to the human this daemon run; an edit makes a new key, so it asks again.
+    trust_prompted: Mutex<HashSet<TrustPromptKey>>,
     /// Authorization URLs of logins waiting for the browser, so repeated `__login` calls reuse them.
     logins_in_progress: Mutex<HashMap<(ServerIdentity, String), String>>,
 }
@@ -64,14 +72,15 @@ impl Shared {
 
     /// Re-resolves every session, e.g. after `plugbay login` or `plugbay trust`.
     pub async fn reload_all(&self) {
-        for session in self.live_sessions() {
-            session.refresh_and_notify().await;
-        }
+        let sessions = self.live_sessions();
+        futures::future::join_all(sessions.iter().map(|session| session.refresh_and_notify()))
+            .await;
     }
 
     /// Drops every `allow_once` grant, e.g. after `plugbay trust --revoke`, and re-checks every session.
     pub async fn forget_session_trust(&self) {
         *self.trust.lock() = Trust::new(&self.paths);
+        self.trust_prompted.lock().clear();
         self.reload_all().await;
     }
 
@@ -86,9 +95,17 @@ pub struct Session {
     hints: Mutex<ProjectHints>,
     /// Servers the agent switched on or off with `plugbay__enable` / `plugbay__disable`; never saved.
     pins: Mutex<BTreeMap<String, SessionPin>>,
-    state: tokio::sync::Mutex<SessionState>,
+    /// Never held across an `.await`, so a slow upstream can't block status or other servers' calls.
+    state: Mutex<SessionState>,
+    /// Held from resolving config to applying it, so an older resolution never overwrites a newer one.
+    refreshing: tokio::sync::Mutex<()>,
+    first_refresh: tokio::sync::OnceCell<()>,
+    /// Signalled whenever a connection attempt finishes.
+    connections_settled: tokio::sync::watch::Sender<()>,
+    next_attempt: AtomicU64,
     peer: OnceLock<Peer<RoleServer>>,
-    tools_listed: std::sync::atomic::AtomicBool,
+    initialized: AtomicBool,
+    tools_listed: AtomicBool,
 }
 
 #[derive(Default)]
@@ -113,6 +130,11 @@ struct ActiveServer {
 }
 
 enum ServerStatus {
+    /// A background task is connecting; it fills in the outcome for this `attempt`.
+    Connecting {
+        attempt: u64,
+        key: UpstreamKey,
+    },
     Connected(Lease),
     NeedsLogin {
         challenge: String,
@@ -123,6 +145,19 @@ enum ServerStatus {
     WrongAccount(String),
 }
 
+/// What a tool call turns into, decided under the state lock and carried out after it.
+enum Route {
+    Upstream {
+        upstream: Arc<Upstream>,
+        display_name: String,
+    },
+    Login {
+        server: Box<ResolvedServer>,
+        challenge: String,
+    },
+    Refuse(String),
+}
+
 impl Session {
     pub fn new(shared: Arc<Shared>, hints: ProjectHints) -> Arc<Self> {
         let session = Arc::new_cyclic(|this| Self {
@@ -130,9 +165,14 @@ impl Session {
             shared: shared.clone(),
             hints: Mutex::new(hints),
             pins: Mutex::new(BTreeMap::new()),
-            state: tokio::sync::Mutex::new(SessionState::default()),
+            state: Mutex::new(SessionState::default()),
+            refreshing: tokio::sync::Mutex::new(()),
+            first_refresh: tokio::sync::OnceCell::new(),
+            connections_settled: tokio::sync::watch::Sender::new(()),
+            next_attempt: AtomicU64::new(0),
             peer: OnceLock::new(),
-            tools_listed: std::sync::atomic::AtomicBool::new(false),
+            initialized: AtomicBool::new(false),
+            tools_listed: AtomicBool::new(false),
         });
         shared.register(&session);
         session
@@ -155,97 +195,174 @@ impl Session {
         }
     }
 
+    /// The first refresh runs once, however many requests arrive while it is in flight.
     async fn ensure_ready(&self) {
-        let needs_first_refresh = self.state.lock().await.resolved.is_none();
-        if needs_first_refresh {
-            self.refresh().await;
-        }
+        self.first_refresh
+            .get_or_init(|| self.refresh_and_notify())
+            .await;
     }
 
-    /// Re-resolves config and reconnects whatever changed. Returns true when the exposed tools may differ.
+    pub async fn refresh_and_notify(&self) {
+        let changed = self.refresh().await;
+        if changed {
+            self.notify_tools_changed().await;
+        }
+        self.offer_trust_prompt();
+    }
+
+    /// Re-resolves config and reconnects whatever changed, waiting up to [`READY_DEADLINE`] for new
+    /// connections. Returns true when the exposed tools may differ.
     async fn refresh(&self) -> bool {
+        let _refreshing = self.refreshing.lock().await;
         let resolved = self.resolve_config();
         if let Ok(config) = &resolved.outcome {
-            trust::grant_files_written_here(&self.shared.paths, config).await;
             index::record(&self.shared.paths, config).await;
         }
-        let verified = VerifiedAccounts::load(&self.shared.paths).await;
-        let mut state = self.state.lock().await;
-        let previous_servers = std::mem::take(&mut state.servers);
-        let previous_shape = tool_shape(&previous_servers);
+        let wanted = self.wanted_servers(&resolved);
+        let working_dir = resolved.location.working_dir.clone();
 
-        let wanted = match &resolved.outcome {
-            Ok(config) => config.servers.clone(),
+        let (previous_shape, to_connect, replaced) = {
+            let mut state = self.state.lock();
+            let previous = std::mem::take(&mut state.servers);
+            let previous_shape = tool_shape(&previous);
+            let plan = self.plan_servers(wanted, previous, working_dir.as_ref());
+            state.servers = plan.servers;
+            state.resolved = Some(resolved);
+            (previous_shape, plan.to_connect, plan.replaced)
+        };
+
+        let attempts: Vec<u64> = to_connect.iter().map(|(attempt, _)| *attempt).collect();
+        for (attempt, server) in to_connect {
+            self.spawn_connect(attempt, server, working_dir.clone());
+        }
+        self.wait_for_attempts(&attempts).await;
+        // Old leases go only after new ones exist, so an unchanged upstream isn't closed and reopened.
+        drop(replaced);
+
+        let verified = VerifiedAccounts::load(&self.shared.paths).await;
+        let mut state = self.state.lock();
+        turn_off_wrong_accounts(&mut state.servers, &verified);
+        tool_shape(&state.servers) != previous_shape
+    }
+
+    /// Every server config enables, with whether its executable parts are trusted.
+    fn wanted_servers(&self, resolved: &Resolved) -> Vec<(ResolvedServer, bool)> {
+        let config = match &resolved.outcome {
+            Ok(config) => config,
             Err(error) => {
                 tracing::warn!(%error, "config did not resolve");
-                Vec::new()
+                return Vec::new();
             }
         };
-        let working_dir = resolved.location.working_dir.clone();
-        let mut reusable = previous_servers;
-        let mut next_servers = Vec::with_capacity(wanted.len());
-        let mut connecting = Vec::new();
+        let trust = self.shared.trust.lock();
+        config
+            .servers
+            .iter()
+            .map(|server| (server.clone(), trust.is_server_trusted(server, config)))
+            .collect()
+    }
 
-        for server in wanted {
+    fn plan_servers(
+        &self,
+        wanted: Vec<(ResolvedServer, bool)>,
+        previous: Vec<ActiveServer>,
+        working_dir: Option<&PathBuf>,
+    ) -> RefreshPlan {
+        let mut reusable = previous;
+        let mut plan = RefreshPlan::default();
+        for (server, trusted) in wanted {
             // Trust first: a revoked grant must drop an already connected server too.
-            if !self.is_trusted(&server, resolved.outcome.as_ref().ok()) {
-                next_servers.push(ActiveServer {
+            if !trusted {
+                plan.servers.push(ActiveServer {
                     server,
                     status: ServerStatus::Untrusted,
                 });
-            } else if let Some(index) = reusable
+                continue;
+            }
+            let key = UpstreamKey::for_server(&server, working_dir);
+            if let Some(index) = reusable
                 .iter()
-                .position(|active| active.can_be_reused_for(&server))
+                .position(|active| active.can_be_reused_for(&key))
             {
-                next_servers.push(reusable.swap_remove(index));
-            } else {
-                connecting.push(server);
+                let mut active = reusable.swap_remove(index);
+                active.server = server;
+                plan.servers.push(active);
+                continue;
             }
+            let attempt = self.next_attempt.fetch_add(1, Ordering::SeqCst);
+            plan.servers.push(ActiveServer {
+                server: server.clone(),
+                status: ServerStatus::Connecting { attempt, key },
+            });
+            plan.to_connect.push((attempt, server));
         }
-        // Old leases go only after new ones exist, so an unchanged upstream isn't closed and reopened.
-        let connected = futures::future::join_all(
-            connecting
-                .into_iter()
-                .map(|server| self.connect(server, working_dir.clone())),
-        )
-        .await;
-        next_servers.extend(connected);
-        drop(reusable);
-        turn_off_wrong_accounts(&mut next_servers, &verified);
-
-        let changed = tool_shape(&next_servers) != previous_shape || state.resolved.is_none();
-        state.servers = next_servers;
-        state.resolved = Some(resolved);
-        changed
+        plan.replaced = reusable;
+        plan
     }
 
-    async fn connect(&self, server: ResolvedServer, working_dir: Option<PathBuf>) -> ActiveServer {
-        let status = match self
-            .shared
-            .pool
-            .acquire(&server, working_dir.as_ref())
-            .await
-        {
-            Ok(lease) => ServerStatus::Connected(lease),
-            Err(ConnectError::NeedsLogin { challenge }) => ServerStatus::NeedsLogin { challenge },
-            Err(ConnectError::Failed(error)) => {
-                tracing::warn!(server = %server.display_name(), error = format!("{error:#}"), "upstream failed");
-                ServerStatus::Failed(format!("{error:#}"))
+    /// Connects in the background; the outcome lands in whichever entry still waits for `attempt`.
+    fn spawn_connect(&self, attempt: u64, server: ResolvedServer, working_dir: Option<PathBuf>) {
+        let pool = self.shared.pool.clone();
+        let session = self.this.clone();
+        tokio::spawn(async move {
+            let status = connect(&pool, &server, working_dir.as_ref()).await;
+            if let Some(session) = session.upgrade() {
+                session.finish_connecting(attempt, status).await;
             }
-        };
-        ActiveServer { server, status }
+        });
     }
 
-    fn is_trusted(&self, server: &ResolvedServer, config: Option<&ResolvedConfig>) -> bool {
-        let Some(config) = config else {
-            return false;
+    async fn finish_connecting(&self, attempt: u64, status: ServerStatus) {
+        let verified = VerifiedAccounts::load(&self.shared.paths).await;
+        let exposes_tools = {
+            let mut state = self.state.lock();
+            let Some(active) = state
+                .servers
+                .iter_mut()
+                .find(|active| active.is_connecting(attempt))
+            else {
+                // A newer refresh dropped this server; its lease goes with `status`.
+                return;
+            };
+            active.status = status;
+            turn_off_wrong_accounts(std::slice::from_mut(active), &verified);
+            active.exposes_tools()
         };
-        self.shared.trust.lock().is_server_trusted(server, config)
+        self.connections_settled.send_replace(());
+        if exposes_tools {
+            self.notify_tools_changed().await;
+        }
+    }
+
+    /// Waits until none of `attempts` is still connecting, or [`READY_DEADLINE`] passes.
+    async fn wait_for_attempts(&self, attempts: &[u64]) {
+        if attempts.is_empty() {
+            return;
+        }
+        let mut settled = self.connections_settled.subscribe();
+        let all_settled = settled.wait_for(|()| !self.any_connecting(attempts));
+        match tokio::time::timeout(READY_DEADLINE, all_settled).await {
+            Ok(Ok(_settled)) => {}
+            Ok(Err(error)) => tracing::debug!(%error, "stopped waiting for connections"),
+            Err(_elapsed) => tracing::info!(
+                "some servers are still connecting; the client hears when their tools arrive"
+            ),
+        }
+    }
+
+    fn any_connecting(&self, attempts: &[u64]) -> bool {
+        let state = self.state.lock();
+        attempts.iter().any(|attempt| {
+            state
+                .servers
+                .iter()
+                .any(|active| active.is_connecting(*attempt))
+        })
     }
 
     /// A crashed stdio server or dropped remote connection is replaced on the next call instead of failing until a config edit.
     async fn reconnect_if_an_upstream_died(&self) {
-        let any_closed = self.state.lock().await.servers.iter().any(|active| {
+        let any_closed = self.state.lock().servers.iter().any(|active| {
             matches!(&active.status, ServerStatus::Connected(lease) if lease.upstream.is_closed())
         });
         if any_closed {
@@ -254,15 +371,8 @@ impl Session {
         }
     }
 
-    pub async fn refresh_and_notify(&self) {
-        let changed = self.refresh().await;
-        if changed {
-            self.notify_tools_changed().await;
-        }
-    }
-
     async fn notify_tools_changed(&self) {
-        let listed = self.tools_listed.load(std::sync::atomic::Ordering::SeqCst);
+        let listed = self.tools_listed.load(Ordering::SeqCst);
         let Some(peer) = self.peer.get().filter(|_| listed) else {
             return;
         };
@@ -273,90 +383,93 @@ impl Session {
 
     async fn list_all_tools(&self) -> Vec<Tool> {
         self.ensure_ready().await;
-        let state = self.state.lock().await;
         let mut tools = vec![status_tool(), disable_tool()];
-        if let Some(Resolved {
-            outcome: Ok(config),
-            ..
-        }) = &state.resolved
+        let mut connected = Vec::new();
         {
-            tools.push(enable_tool(&servers_to_enable(config)));
-        }
-
-        for active in &state.servers {
-            match &active.status {
-                ServerStatus::Connected(lease) => match lease.upstream.tools().await {
-                    Ok(upstream_tools) => {
-                        tools.extend(exposed_tools(&active.server, upstream_tools))
+            let state = self.state.lock();
+            if let Some(config) = state.config() {
+                tools.push(enable_tool(&enable::servers_to_enable(config)));
+            }
+            for active in &state.servers {
+                match &active.status {
+                    ServerStatus::Connected(lease) => {
+                        connected.push((active.server.clone(), lease.upstream.clone()));
                     }
-                    Err(error) => {
-                        tracing::warn!(server = %active.server.display_name(), error = format!("{error:#}"), "listing tools failed");
-                    }
-                },
-                ServerStatus::NeedsLogin { .. } => tools.push(login_tool(&active.server)),
-                ServerStatus::Untrusted
-                | ServerStatus::Failed(_)
-                | ServerStatus::WrongAccount(_) => {}
+                    ServerStatus::NeedsLogin { .. } => tools.push(login_tool(&active.server)),
+                    ServerStatus::Connecting { .. }
+                    | ServerStatus::Untrusted
+                    | ServerStatus::Failed(_)
+                    | ServerStatus::WrongAccount(_) => {}
+                }
             }
         }
+
+        let listed = futures::future::join_all(
+            connected
+                .into_iter()
+                .map(|(server, upstream)| self.tools_of(server, upstream)),
+        )
+        .await;
+        tools.extend(listed.into_iter().flatten());
         tools
+    }
+
+    /// One server's tools, or none when it doesn't answer within [`READY_DEADLINE`]: the listing
+    /// carries on and the client is told when it lands.
+    async fn tools_of(&self, server: ResolvedServer, upstream: Arc<Upstream>) -> Vec<Tool> {
+        let mut listing = tokio::spawn(async move { upstream.tools().await });
+        let Ok(joined) = tokio::time::timeout(READY_DEADLINE, &mut listing).await else {
+            tracing::info!(server = %server.display_name(), "listing tools is slow; the client hears when they arrive");
+            self.notify_when_listed(listing);
+            return Vec::new();
+        };
+        let listed = match joined {
+            Ok(listed) => listed,
+            Err(error) => Err(error.into()),
+        };
+        match listed {
+            Ok(upstream_tools) => exposed_tools(&server, upstream_tools),
+            Err(error) => {
+                tracing::warn!(server = %server.display_name(), error = format!("{error:#}"), "listing tools failed");
+                Vec::new()
+            }
+        }
+    }
+
+    fn notify_when_listed(&self, listing: tokio::task::JoinHandle<anyhow::Result<Vec<Tool>>>) {
+        let session = self.this.clone();
+        tokio::spawn(async move {
+            let listed = matches!(listing.await, Ok(Ok(_)));
+            if let Some(session) = session.upgrade().filter(|_| listed) {
+                session.notify_tools_changed().await;
+            }
+        });
     }
 
     async fn call(&self, request: CallToolRequestParams) -> CallToolResult {
         self.ensure_ready().await;
-        self.reconnect_if_an_upstream_died().await;
         if request.name == STATUS_TOOL {
             return text_result(self.status_report().await);
         }
-        if request.name == ENABLE_TOOL {
-            return self.enable(request.arguments).await;
-        }
-        if request.name == DISABLE_TOOL {
-            return self.disable(request.arguments).await;
+        self.reconnect_if_an_upstream_died().await;
+        match request.name.as_ref() {
+            ENABLE_TOOL => return self.enable(request.arguments).await,
+            DISABLE_TOOL => return self.disable(request.arguments).await,
+            _ => {}
         }
         let Some((prefix, tool_name)) = request.name.split_once(TOOL_SEPARATOR) else {
             return error_result(format!("unknown tool `{}`", request.name));
         };
 
-        let state = self.state.lock().await;
-        let Some(active) = state
-            .servers
-            .iter()
-            .find(|active| active.server.tool_prefix == prefix)
-        else {
-            return error_result(format!(
-                "no server `{prefix}` here; call {STATUS_TOOL} to see what is configured"
-            ));
-        };
-        let display_name = active.server.display_name();
-
-        match &active.status {
-            ServerStatus::NeedsLogin { challenge } if tool_name == "login" => {
-                let server = active.server.clone();
-                let challenge = challenge.clone();
-                drop(state);
-                self.start_login(server, &challenge).await
-            }
-            ServerStatus::NeedsLogin { .. } => error_result(format!(
-                "{display_name} needs a login: call `{prefix}__login`, or ask the human to run `plugbay login {display_name}` (with `--token` if it takes an API token)"
-            )),
-            ServerStatus::Untrusted => error_result(format!(
-                "{display_name} runs a local command from config that is not trusted yet; ask the human to run `plugbay trust` in the project directory"
-            )),
-            ServerStatus::Failed(error) => {
-                error_result(format!("{display_name} is unavailable: {error}"))
-            }
-            ServerStatus::WrongAccount(message) => error_result(message.clone()),
-            ServerStatus::Connected(_) if !active.server.tool_filter.allows(tool_name) => {
-                error_result(format!(
-                    "`{tool_name}` is filtered out for {display_name} by plugbay config"
-                ))
-            }
-            ServerStatus::Connected(lease) => {
+        match self.route(prefix, tool_name) {
+            Route::Refuse(message) => error_result(message),
+            Route::Login { server, challenge } => self.start_login(*server, &challenge).await,
+            Route::Upstream {
+                upstream,
+                display_name,
+            } => {
                 let mut upstream_request = request.clone();
                 upstream_request.name = tool_name.to_string().into();
-                let upstream = lease.upstream.clone();
-                drop(state);
                 match upstream.call_tool(upstream_request).await {
                     Ok(result) => result,
                     Err(error) => error_result(format!("{display_name} failed: {error:#}")),
@@ -365,208 +478,67 @@ impl Session {
         }
     }
 
-    async fn start_login(&self, server: ResolvedServer, challenge: &str) -> CallToolResult {
-        let login_key = (server.identity.clone(), server.account.clone());
-        if let Some(url) = self.shared.logins_in_progress.lock().get(&login_key) {
-            return text_result(format!(
-                "A login for {} is already waiting. Open this URL to finish it: {url}",
-                server.display_name()
-            ));
-        }
-
-        let flow = match oauth::start_login(&server, Some(challenge)).await {
-            Ok(flow) => flow,
-            Err(error) => {
-                return error_result(format!(
-                    "could not start login for {}: {error:#}",
-                    server.display_name()
-                ));
-            }
-        };
-        let url = flow.authorization_url.clone();
-        self.shared
-            .logins_in_progress
-            .lock()
-            .insert(login_key.clone(), url.clone());
-
-        tokio::spawn({
-            let shared = self.shared.clone();
-            let display_name = server.display_name();
-            async move {
-                match flow.finish().await {
-                    Ok(()) => tracing::info!(server = %display_name, "login completed"),
-                    Err(error) => {
-                        tracing::warn!(server = %display_name, error = format!("{error:#}"), "login failed")
-                    }
-                }
-                shared.logins_in_progress.lock().remove(&login_key);
-                shared.reload_all().await;
-            }
-        });
-        self.show_login_url(&server, &url);
-
-        text_result(format!(
-            "Opened the browser to log in to {name}. If nothing opened, visit:\n{url}\n\n\
-             Once the login completes its tools appear automatically (clients that ignore tool list \
-             changes, like Codex, pick them up in the next session).",
-            name = server.display_name()
-        ))
-    }
-
-    /// Asks the client to open the URL when it supports URL elicitation, else opens the browser ourselves.
-    fn show_login_url(&self, server: &ResolvedServer, url: &str) {
-        let peer = self
-            .peer
-            .get()
-            .filter(|peer| {
-                peer.supported_elicitation_modes()
-                    .contains(&ElicitationMode::Url)
-            })
-            .cloned();
-        let Some(peer) = peer.zip(url::Url::parse(url).ok()) else {
-            if let Err(error) = open::that_detached(url) {
-                tracing::warn!(%error, "could not open the browser");
-            }
-            return;
-        };
-
-        let (peer, parsed_url) = peer;
-        let message = format!("Log in to {} for plugbay", server.display_name());
-        let elicitation_id = format!("plugbay-login-{}", server.display_name());
-        tokio::spawn(async move {
-            if let Err(error) = peer.elicit_url(message, parsed_url, elicitation_id).await {
-                tracing::debug!(%error, "URL elicitation failed");
-            }
-        });
-    }
-
-    /// Switches a catalog or registry server on for this session only, keeping the pin only if it works.
-    async fn enable(&self, arguments: Option<rmcp::model::JsonObject>) -> CallToolResult {
-        let arguments: EnableArguments = match parse_arguments(arguments) {
-            Ok(arguments) => arguments,
-            Err(message) => return error_result(message),
-        };
-        let account_is_valid = arguments
-            .account
-            .as_deref()
-            .is_none_or(config::is_valid_name);
-        if !config::is_valid_name(&arguments.server) || !account_is_valid {
-            return error_result(
-                "server names and accounts use lowercase letters, digits and `-` only".to_string(),
-            );
-        }
-
-        let pin = SessionPin::On {
-            account: arguments.account.clone(),
-        };
-        let previous = self.pins.lock().insert(arguments.server.clone(), pin);
-        self.refresh_and_notify().await;
-
-        match self.describe_enabled(&arguments.server).await {
-            Ok(message) => text_result(message),
-            Err(message) => {
-                self.restore_pin(&arguments.server, previous).await;
-                error_result(message)
-            }
-        }
-    }
-
-    async fn disable(&self, arguments: Option<rmcp::model::JsonObject>) -> CallToolResult {
-        let arguments: DisableArguments = match parse_arguments(arguments) {
-            Ok(arguments) => arguments,
-            Err(message) => return error_result(message),
-        };
-        let is_on = self
-            .state
-            .lock()
-            .await
+    fn route(&self, prefix: &str, tool_name: &str) -> Route {
+        let state = self.state.lock();
+        let Some(active) = state
             .servers
             .iter()
-            .any(|active| active.server.name == arguments.server);
-        if !is_on {
-            return error_result(format!(
-                "{} is not on in this session; call {STATUS_TOOL} to see what is",
-                arguments.server
+            .find(|active| active.server.tool_prefix == prefix)
+        else {
+            return Route::Refuse(format!(
+                "no server `{prefix}` here; call {STATUS_TOOL} to see what is configured"
             ));
-        }
-        self.pins
-            .lock()
-            .insert(arguments.server.clone(), SessionPin::Off);
-        self.refresh_and_notify().await;
-        text_result(format!(
-            "{} is off for the rest of this session (config files are unchanged).",
-            arguments.server
-        ))
-    }
-
-    async fn restore_pin(&self, server: &str, previous: Option<SessionPin>) {
-        {
-            let mut pins = self.pins.lock();
-            match previous {
-                Some(pin) => pins.insert(server.to_string(), pin),
-                None => pins.remove(server),
-            };
-        }
-        self.refresh_and_notify().await;
-    }
-
-    /// What enabling `name` led to, or why it can't stay on.
-    async fn describe_enabled(&self, name: &str) -> Result<String, String> {
-        let state = self.state.lock().await;
-        let config = match state.resolved.as_ref().map(|resolved| &resolved.outcome) {
-            Some(Ok(config)) => config,
-            Some(Err(error)) => return Err(format!("the config does not resolve: {error}")),
-            None => return Err("plugbay has not resolved any config yet".to_string()),
         };
-        let active: Vec<&ActiveServer> = state
-            .servers
-            .iter()
-            .filter(|active| active.server.name == name)
-            .collect();
-        if active.is_empty() {
-            return Err(why_not_enabled(config, name));
-        }
+        let display_name = active.server.display_name();
 
-        let mut lines = Vec::new();
-        for active in active {
-            let display_name = active.server.display_name();
-            let prefix = &active.server.tool_prefix;
-            match &active.status {
-                ServerStatus::Connected(_) => lines.push(format!(
-                    "{display_name} is on for this session; its tools are {prefix}{TOOL_SEPARATOR}*. \
-                     Nothing is saved: to keep it for this project the human can run `plugbay use {display_name}`."
-                )),
-                ServerStatus::NeedsLogin { .. } => lines.push(format!(
-                    "{display_name} is on but needs a login: call {prefix}{TOOL_SEPARATOR}login, \
-                     or ask the human to run `plugbay login {display_name}`."
-                )),
-                ServerStatus::Untrusted => {
-                    return Err(format!(
-                        "{display_name} runs a command from config that is not trusted yet; ask the human to run `plugbay trust`"
-                    ));
-                }
-                ServerStatus::Failed(error) => {
-                    return Err(format!("{display_name} could not start: {error}"));
-                }
-                ServerStatus::WrongAccount(message) => return Err(message.clone()),
+        match &active.status {
+            ServerStatus::NeedsLogin { challenge } if tool_name == "login" => Route::Login {
+                server: Box::new(active.server.clone()),
+                challenge: challenge.clone(),
+            },
+            ServerStatus::NeedsLogin { .. } => Route::Refuse(format!(
+                "{display_name} needs a login: call `{prefix}__login`, or ask the human to run `plugbay login {display_name}` (with `--token` if it takes an API token)"
+            )),
+            ServerStatus::Connecting { .. } => Route::Refuse(format!(
+                "{display_name} is still connecting; try again in a moment, or call {STATUS_TOOL}"
+            )),
+            ServerStatus::Untrusted => Route::Refuse(format!(
+                "{display_name} runs a local command or reads secrets from config that is not trusted yet; ask the human to run `plugbay trust` in the project directory"
+            )),
+            ServerStatus::Failed(error) => {
+                Route::Refuse(format!("{display_name} is unavailable: {error}"))
             }
+            ServerStatus::WrongAccount(message) => Route::Refuse(message.clone()),
+            ServerStatus::Connected(_) if !active.server.tool_filter.allows(tool_name) => {
+                Route::Refuse(format!(
+                    "`{tool_name}` is filtered out for {display_name} by plugbay config"
+                ))
+            }
+            ServerStatus::Connected(lease) => Route::Upstream {
+                upstream: lease.upstream.clone(),
+                display_name,
+            },
         }
-        Ok(lines.join("\n"))
     }
 
     async fn status_report(&self) -> String {
-        let state = self.state.lock().await;
-        let Some(resolved) = &state.resolved else {
-            return "plugbay has not resolved any config yet".to_string();
-        };
         let verified = VerifiedAccounts::load(&self.shared.paths).await;
-        let mut report = status_text(resolved, &state.servers, &verified);
+        let mut report = {
+            let state = self.state.lock();
+            let Some(resolved) = &state.resolved else {
+                return "plugbay has not resolved any config yet".to_string();
+            };
+            render::status_text(resolved, &state.servers, &verified)
+        };
         let pins = self.pins.lock();
         if !pins.is_empty() {
             let described: Vec<String> = pins
                 .iter()
                 .map(|(name, pin)| match pin {
-                    SessionPin::On { .. } => format!("{name} on"),
+                    SessionPin::On {
+                        account: Some(account),
+                    } => format!("{name}:{account} on"),
+                    SessionPin::On { account: None } => format!("{name} on"),
                     SessionPin::Off => format!("{name} off"),
                 })
                 .collect();
@@ -615,97 +587,6 @@ impl Session {
         true
     }
 
-    /// One in-agent prompt per folder for config that runs commands or reads secrets.
-    async fn prompt_for_trust(&self, peer: &Peer<RoleServer>) -> bool {
-        let Some(pending) = self.pending_trust().await else {
-            return false;
-        };
-        if !self
-            .shared
-            .trust_prompted
-            .lock()
-            .insert(pending.config_dir.clone())
-        {
-            return false;
-        }
-        if !peer
-            .supported_elicitation_modes()
-            .contains(&ElicitationMode::Form)
-        {
-            tracing::info!(
-                "client cannot show the trust prompt; instructions point to `plugbay trust`"
-            );
-            return false;
-        }
-
-        let message = format!(
-            "plugbay: the config for {} runs local commands or reads secrets:\n{}\n\nAllow them?",
-            pending.config_dir.display(),
-            pending.commands.join("\n")
-        );
-        let Some(decision) = ask_trust_decision(peer, message).await else {
-            return false;
-        };
-
-        let mut trust = self.shared.trust.lock();
-        match decision {
-            TrustDecision::Deny => return false,
-            TrustDecision::AllowOnce => {
-                for file in &pending.files {
-                    trust.grant_for_session(file);
-                }
-            }
-            TrustDecision::AllowAlways => {
-                for file in &pending.files {
-                    if let Err(error) = trust.grant_always(file) {
-                        tracing::warn!(
-                            error = format!("{error:#}"),
-                            "could not save trust; allowing for this session"
-                        );
-                        trust.grant_for_session(file);
-                    }
-                }
-            }
-        }
-        true
-    }
-
-    async fn pending_trust(&self) -> Option<PendingTrust> {
-        let state = self.state.lock().await;
-        let resolved = state.resolved.as_ref()?;
-        let config = resolved.outcome.as_ref().ok()?;
-        let config_dir = resolved.location.config_dir.clone()?;
-
-        let files: Vec<ConfigFile> = self
-            .shared
-            .trust
-            .lock()
-            .untrusted_files(config)
-            .into_iter()
-            .cloned()
-            .collect();
-        if files.is_empty() {
-            return None;
-        }
-        let commands = state
-            .servers
-            .iter()
-            .filter(|active| matches!(active.status, ServerStatus::Untrusted))
-            .map(|active| {
-                format!(
-                    "  {}: {}",
-                    active.server.display_name(),
-                    active.server.transport.target()
-                )
-            })
-            .collect();
-        Some(PendingTrust {
-            config_dir,
-            files,
-            commands,
-        })
-    }
-
     /// Re-resolves when a config file changes and relays upstream tool changes, until the session ends.
     fn spawn_watcher(self: &Arc<Self>) {
         let session = Arc::downgrade(self);
@@ -734,7 +615,7 @@ impl Session {
                 let Some(session) = session.upgrade() else {
                     break;
                 };
-                if session.config_changed_on_disk().await {
+                if session.config_changed_on_disk() {
                     tracing::info!("config changed, re-resolving");
                     session.refresh_and_notify().await;
                 }
@@ -742,8 +623,8 @@ impl Session {
         });
     }
 
-    async fn config_changed_on_disk(&self) -> bool {
-        let state = self.state.lock().await;
+    fn config_changed_on_disk(&self) -> bool {
+        let state = self.state.lock();
         let Some(resolved) = &state.resolved else {
             return false;
         };
@@ -755,37 +636,38 @@ impl Session {
         let Some(peer) = self.peer.get().cloned() else {
             return;
         };
-        let root_changed_project = self.discover_project_from_roots(&peer).await;
-        self.ensure_ready().await;
-        if root_changed_project {
+        if self.discover_project_from_roots(&peer).await {
             self.refresh_and_notify().await;
-        }
-        if self.prompt_for_trust(&peer).await {
-            self.refresh_and_notify().await;
+        } else {
+            self.offer_trust_prompt();
         }
     }
 }
 
 impl ServerHandler for Session {
     fn get_info(&self) -> InitializeResult {
-        let resolved = self.resolve_config();
+        let verified = VerifiedAccounts::read_or_empty(&self.shared.paths);
+        let instructions = {
+            let state = self.state.lock();
+            match &state.resolved {
+                Some(resolved) => render::instructions(resolved, &state.servers, &verified),
+                None => render::not_resolved_yet(),
+            }
+        };
         let capabilities = ServerCapabilities::builder()
             .enable_tools()
             .enable_tool_list_changed()
             .build();
         InitializeResult::new(capabilities)
             .with_server_info(Implementation::new("plugbay", crate::protocol::VERSION))
-            .with_instructions(instructions(
-                &resolved,
-                &self.shared.trust.lock(),
-                &VerifiedAccounts::read_or_empty(&self.shared.paths),
-            ))
+            .with_instructions(instructions)
     }
 
     fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
         std::borrow::Cow::Borrowed(ProtocolVersion::known_up_to(&ProtocolVersion::V_2025_11_25))
     }
 
+    /// Connects upstreams before answering, so the instructions name only servers that work.
     async fn initialize(
         &self,
         request: InitializeRequestParams,
@@ -796,6 +678,7 @@ impl ServerHandler for Session {
             tracing::debug!("client initialized twice");
         }
         tracing::info!(client = %request.client_info.name, "session started");
+        self.ensure_ready().await;
         self.negotiate_initialize(&request)
     }
 
@@ -803,6 +686,7 @@ impl ServerHandler for Session {
         let Some(session) = self.this.upgrade() else {
             return;
         };
+        self.initialized.store(true, Ordering::SeqCst);
         session.spawn_watcher();
         tokio::spawn(session.after_initialized());
     }
@@ -812,9 +696,9 @@ impl ServerHandler for Session {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
+        // Set first, so a server that lands while this listing runs still triggers a change.
+        self.tools_listed.store(true, Ordering::SeqCst);
         let tools = self.list_all_tools().await;
-        self.tools_listed
-            .store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(ListToolsResult::with_all_items(tools))
     }
 
@@ -827,62 +711,34 @@ impl ServerHandler for Session {
     }
 }
 
-/// Config waiting for the human's trust decision.
-struct PendingTrust {
-    config_dir: PathBuf,
-    files: Vec<ConfigFile>,
-    /// One line per server that would run: `name:account: command args`.
-    commands: Vec<String>,
+/// What a refresh keeps, starts and lets go.
+#[derive(Default)]
+struct RefreshPlan {
+    servers: Vec<ActiveServer>,
+    to_connect: Vec<(u64, ResolvedServer)>,
+    /// Entries no longer wanted, held until the new connections exist.
+    replaced: Vec<ActiveServer>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum TrustDecision {
-    AllowOnce,
-    AllowAlways,
-    Deny,
-}
-
-/// A single-enum form, so clients that map elicitations onto approval UIs (T3's Codex) show three buttons.
-async fn ask_trust_decision(peer: &Peer<RoleServer>, message: String) -> Option<TrustDecision> {
-    let choices = EnumSchema::builder(vec![
-        "allow_once".to_string(),
-        "allow_always".to_string(),
-        "deny".to_string(),
-    ])
-    .enum_titles(vec![
-        "Allow for this session".to_string(),
-        "Always allow in this folder".to_string(),
-        "Deny".to_string(),
-    ])
-    .map_err(|error| tracing::warn!(%error, "building the trust prompt"))
-    .ok()?
-    .build();
-    let schema = ElicitationSchema::new(BTreeMap::from([(
-        "decision".to_string(),
-        PrimitiveSchemaDefinition::Enum(choices),
-    )]))
-    .with_required(vec!["decision".to_string()]);
-
-    let request = ElicitRequestParams::FormElicitationParams {
-        meta: None,
-        message,
-        requested_schema: schema,
-    };
-    let response = match peer.create_elicitation(request).await {
-        Ok(response) => response,
-        Err(error) => {
-            tracing::info!(%error, "trust prompt failed");
-            return None;
-        }
-    };
-    if response.action != ElicitationAction::Accept {
-        return None;
+impl SessionState {
+    fn config(&self) -> Option<&ResolvedConfig> {
+        self.resolved.as_ref()?.outcome.as_ref().ok()
     }
-    let decision = response.content?.get("decision")?.clone();
-    serde_json::from_value(decision)
-        .map_err(|error| tracing::warn!(%error, "unexpected trust prompt answer"))
-        .ok()
+}
+
+async fn connect(
+    pool: &Arc<UpstreamPool>,
+    server: &ResolvedServer,
+    working_dir: Option<&PathBuf>,
+) -> ServerStatus {
+    match pool.acquire(server, working_dir).await {
+        Ok(lease) => ServerStatus::Connected(lease),
+        Err(ConnectError::NeedsLogin { challenge }) => ServerStatus::NeedsLogin { challenge },
+        Err(ConnectError::Failed(error)) => {
+            tracing::warn!(server = %server.display_name(), error = format!("{error:#}"), "upstream failed");
+            ServerStatus::Failed(format!("{error:#}"))
+        }
+    }
 }
 
 /// Applies `expect` to every connected server; its lease goes, so the agent sees no tools for it.
@@ -899,10 +755,33 @@ fn turn_off_wrong_accounts(servers: &mut [ActiveServer], verified: &VerifiedAcco
 }
 
 impl ActiveServer {
-    fn can_be_reused_for(&self, server: &ResolvedServer) -> bool {
-        let still_connected =
-            matches!(&self.status, ServerStatus::Connected(lease) if !lease.upstream.is_closed());
-        still_connected && self.server == *server
+    /// A live or pending connection to the same upstream serves the new config too (only filters
+    /// or metadata changed).
+    fn can_be_reused_for(&self, key: &UpstreamKey) -> bool {
+        match &self.status {
+            ServerStatus::Connected(lease) => {
+                !lease.upstream.is_closed() && lease.upstream.key() == key
+            }
+            ServerStatus::Connecting {
+                key: pending_key, ..
+            } => pending_key == key,
+            ServerStatus::NeedsLogin { .. }
+            | ServerStatus::Untrusted
+            | ServerStatus::Failed(_)
+            | ServerStatus::WrongAccount(_) => false,
+        }
+    }
+
+    fn is_connecting(&self, attempt: u64) -> bool {
+        matches!(self.status, ServerStatus::Connecting { attempt: pending, .. } if pending == attempt)
+    }
+
+    /// Real tools or a login stub.
+    fn exposes_tools(&self) -> bool {
+        matches!(
+            self.status,
+            ServerStatus::Connected(_) | ServerStatus::NeedsLogin { .. }
+        )
     }
 }
 
@@ -915,298 +794,14 @@ fn tool_shape(servers: &[ActiveServer]) -> Vec<(ResolvedServer, &'static str)> {
             let status = match active.status {
                 ServerStatus::Connected(_) => "connected",
                 ServerStatus::NeedsLogin { .. } => "login",
-                ServerStatus::Untrusted
+                ServerStatus::Connecting { .. }
+                | ServerStatus::Untrusted
                 | ServerStatus::Failed(_)
                 | ServerStatus::WrongAccount(_) => "hidden",
             };
             (active.server.clone(), status)
         })
         .collect()
-}
-
-fn exposed_tools(server: &ResolvedServer, upstream_tools: Vec<Tool>) -> Vec<Tool> {
-    let mut exposed = Vec::new();
-    for mut tool in upstream_tools {
-        if !server.tool_filter.allows(&tool.name) {
-            continue;
-        }
-        let name = format!("{}{TOOL_SEPARATOR}{}", server.tool_prefix, tool.name);
-        if name.len() > MAX_TOOL_NAME_LENGTH {
-            tracing::warn!(tool = %name, "skipping tool: name longer than {MAX_TOOL_NAME_LENGTH} characters");
-            continue;
-        }
-        tool.name = name.into();
-        exposed.push(tool);
-    }
-    exposed
-}
-
-fn status_tool() -> Tool {
-    Tool::new(
-        STATUS_TOOL,
-        "Show which MCP servers and accounts plugbay resolved for this project, and why any are missing.",
-        Arc::new(empty_input_schema()),
-    )
-}
-
-#[derive(Deserialize)]
-struct EnableArguments {
-    server: String,
-    account: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct DisableArguments {
-    server: String,
-}
-
-fn parse_arguments<T: serde::de::DeserializeOwned>(
-    arguments: Option<rmcp::model::JsonObject>,
-) -> Result<T, String> {
-    let arguments = serde_json::Value::Object(arguments.unwrap_or_default());
-    serde_json::from_value(arguments).map_err(|error| format!("invalid arguments: {error}"))
-}
-
-/// Servers plugbay knows how to reach that are off here: the catalog, ones switched off, the registry.
-fn servers_to_enable(config: &ResolvedConfig) -> Vec<String> {
-    let mut names: Vec<String> = config.catalog.clone();
-    names.extend(config.disabled.iter().map(|disabled| disabled.name.clone()));
-    names.extend(registry::all().iter().map(|entry| entry.name.to_string()));
-    names.retain(|name| config.server(name).is_empty());
-    names.sort();
-    names.dedup();
-    names
-}
-
-fn why_not_enabled(config: &ResolvedConfig, name: &str) -> String {
-    if let Some(problem) = config.problems.iter().find(|problem| {
-        problem.servers.iter().any(|server| server == name) && !problem.is_unknown_server()
-    }) {
-        return format!("{name} can't be enabled: {}", problem.message);
-    }
-    format!(
-        "plugbay doesn't know a server named {name}. Known: {}. The human can define one with \
-         `plugbay add {name} --url <url>` or `plugbay add {name} -- <command>`.",
-        servers_to_enable(config).join(", ")
-    )
-}
-
-fn enable_tool(available: &[String]) -> Tool {
-    let description = format!(
-        "Turn on an MCP server for this session only (nothing is saved); its tools appear right after. \
-         Use only when the human asks for a server. Pass the account the human names; if a server has \
-         several accounts and they did not say which, ask. Available: {}.",
-        available.join(", ")
-    );
-    Tool::new(
-        ENABLE_TOOL,
-        description,
-        Arc::new(object_schema(
-            serde_json::json!({
-                "server": { "type": "string", "description": "Server name, e.g. `linear`." },
-                "account": { "type": "string", "description": "Account label, e.g. `initech`. Defaults to the project's account." }
-            }),
-            &["server"],
-        )),
-    )
-}
-
-fn disable_tool() -> Tool {
-    Tool::new(
-        DISABLE_TOOL,
-        "Turn off an MCP server for the rest of this session (nothing is saved).",
-        Arc::new(object_schema(
-            serde_json::json!({
-                "server": { "type": "string", "description": "Server name, e.g. `linear`." }
-            }),
-            &["server"],
-        )),
-    )
-}
-
-fn object_schema(properties: serde_json::Value, required: &[&str]) -> rmcp::model::JsonObject {
-    let mut schema = empty_input_schema();
-    schema.insert("properties".to_string(), properties);
-    schema.insert("required".to_string(), serde_json::json!(required));
-    schema
-}
-
-fn login_tool(server: &ResolvedServer) -> Tool {
-    Tool::new(
-        format!("{}{TOOL_SEPARATOR}login", server.tool_prefix),
-        format!(
-            "Log in to {} ({}) so its tools become available. Opens the browser for the human to approve.",
-            server.display_name(),
-            server.transport.target()
-        ),
-        Arc::new(empty_input_schema()),
-    )
-}
-
-fn empty_input_schema() -> rmcp::model::JsonObject {
-    let mut schema = rmcp::model::JsonObject::new();
-    schema.insert(
-        "type".to_string(),
-        serde_json::Value::String("object".to_string()),
-    );
-    schema
-}
-
-/// Server instructions: the agent (and the human reading along) see which account each server uses.
-fn instructions(resolved: &Resolved, trust: &Trust, verified: &VerifiedAccounts) -> String {
-    let config = match &resolved.outcome {
-        Ok(config) => config,
-        Err(error) => {
-            return format!(
-                "plugbay could not read the MCP config for this project: {error}. Ask the human to run `plugbay doctor`."
-            );
-        }
-    };
-    let project = match &resolved.location.config_dir {
-        Some(dir) => dir.display().to_string(),
-        None => "no project (global config only)".to_string(),
-    };
-
-    let mut lines = vec![format!(
-        "plugbay routes MCP servers for {project}. Tools are named <server>__<tool>."
-    )];
-    if config.servers.is_empty() {
-        lines.push("No servers are configured here.".to_string());
-    } else {
-        lines.push("Accounts in use (use the right one for this project):".to_string());
-        lines.extend(
-            config
-                .servers
-                .iter()
-                .map(|server| account_line(server, verified)),
-        );
-    }
-    let has_untrusted = config
-        .servers
-        .iter()
-        .any(|server| !trust.is_server_trusted(server, config));
-    if has_untrusted {
-        lines.push(
-            "Some servers run local commands from config that is not trusted yet, so they are off. \
-             Ask the human to run `plugbay trust` in the project directory."
-                .to_string(),
-        );
-    }
-    if !config.problems.is_empty() {
-        lines.push(format!("Config problems: {}", problem_summary(config)));
-    }
-    lines.push(format!(
-        "If a server or tool seems missing, call {STATUS_TOOL}. \
-         To turn on another server for this session when the human asks, call {ENABLE_TOOL}."
-    ));
-    lines.join("\n")
-}
-
-fn account_line(server: &ResolvedServer, verified: &VerifiedAccounts) -> String {
-    let title = registry::lookup(&server.name).map_or(server.name.as_str(), |entry| entry.title);
-    let details: Vec<String> = server
-        .account_metadata
-        .iter()
-        .filter(|(key, _)| key.as_str() != identity::EXPECT_KEY)
-        .map(|(key, value)| format!("{key} {value}"))
-        .collect();
-    let mut line = format!("- {title} → {}", server.account);
-    if !details.is_empty() {
-        line.push_str(&format!(" ({})", details.join(", ")));
-    }
-    if let Some(shown) = verified.shown(&server.identity, &server.account) {
-        line.push_str(&format!(" (verified: {shown})"));
-    }
-    if server.tool_prefix != server.name {
-        line.push_str(&format!(
-            ", tools prefixed {}{TOOL_SEPARATOR}",
-            server.tool_prefix
-        ));
-    }
-    if let Some(failure) = identity::expectation_failure(server, verified) {
-        line.push_str(&format!(". Off: {failure}"));
-    }
-    line
-}
-
-fn problem_summary(config: &ResolvedConfig) -> String {
-    config
-        .problems
-        .iter()
-        .map(|problem| problem.message.as_str())
-        .collect::<Vec<_>>()
-        .join("; ")
-}
-
-fn status_text(
-    resolved: &Resolved,
-    servers: &[ActiveServer],
-    verified: &VerifiedAccounts,
-) -> String {
-    let mut lines = Vec::new();
-    match &resolved.location.config_dir {
-        Some(dir) => lines.push(format!("project: {}", dir.display())),
-        None => lines.push("project: none (global config only)".to_string()),
-    }
-    if let Some(working_dir) = &resolved.location.working_dir
-        && Some(working_dir) != resolved.location.config_dir.as_ref()
-    {
-        lines.push(format!("working dir: {}", working_dir.display()));
-    }
-
-    let config = match &resolved.outcome {
-        Ok(config) => config,
-        Err(error) => {
-            lines.push(format!("config error: {error}"));
-            return lines.join("\n");
-        }
-    };
-    lines.push("config files:".to_string());
-    lines.extend(
-        config
-            .files
-            .iter()
-            .map(|file| format!("  {}", file.path.display())),
-    );
-
-    lines.push("servers:".to_string());
-    if servers.is_empty() {
-        lines.push("  (none)".to_string());
-    }
-    for active in servers {
-        let status = match &active.status {
-            ServerStatus::Connected(_) => {
-                match verified.shown(&active.server.identity, &active.server.account) {
-                    Some(shown) => format!("connected (verified: {shown})"),
-                    None => "connected".to_string(),
-                }
-            }
-            ServerStatus::NeedsLogin { .. } => format!(
-                "needs login: call {}__login or run `plugbay login {}` (add `--token` for an API token)",
-                active.server.tool_prefix,
-                active.server.display_name()
-            ),
-            ServerStatus::Untrusted => "off: config not trusted, run `plugbay trust`".to_string(),
-            ServerStatus::Failed(error) => format!("failed: {error}"),
-            ServerStatus::WrongAccount(message) => format!("off: {message}"),
-        };
-        lines.push(format!(
-            "  {} ({}) — {status}",
-            active.server.display_name(),
-            active.server.transport.target()
-        ));
-    }
-    for disabled in &config.disabled {
-        lines.push(format!(
-            "  {} — disabled by {}",
-            disabled.name,
-            disabled.disabled_by.display()
-        ));
-    }
-    for problem in &config.problems {
-        lines.push(format!("problem: {}", problem.message));
-    }
-    lines.join("\n")
 }
 
 fn stamp_files(paths: &[PathBuf]) -> Vec<FileStamp> {
@@ -1217,59 +812,4 @@ fn stamp_files(paths: &[PathBuf]) -> Vec<FileStamp> {
             Some((metadata.modified().ok()?, metadata.len()))
         })
         .collect()
-}
-
-fn text_result(text: String) -> CallToolResult {
-    CallToolResult::success(vec![ContentBlock::text(text)])
-}
-
-fn error_result(text: String) -> CallToolResult {
-    CallToolResult::error(vec![ContentBlock::text(text)])
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const LINEAR: &str = "https://mcp.linear.app/mcp";
-
-    fn linear(account: &str, metadata: &[(&str, &str)]) -> ResolvedServer {
-        let mut server = ResolvedServer::test_http("linear", account, LINEAR);
-        for (key, value) in metadata {
-            server
-                .account_metadata
-                .insert(key.to_string(), value.to_string());
-        }
-        server
-    }
-
-    #[test]
-    fn account_line_shows_metadata_and_the_verified_login_but_not_expect() {
-        let server = linear("initech", &[("team", "WP"), ("expect", "Initech")]);
-        let verified = VerifiedAccounts::test_with(&[(LINEAR, "initech", "Initech")]);
-        assert_eq!(
-            account_line(&server, &verified),
-            "- Linear → initech (team WP) (verified: Initech)"
-        );
-    }
-
-    #[test]
-    fn account_line_says_why_a_wrong_account_is_off() {
-        let server = linear("personal", &[("expect", "mihaicrisan")]);
-        let verified = VerifiedAccounts::test_with(&[(LINEAR, "personal", "Initech")]);
-        let line = account_line(&server, &verified);
-        assert!(
-            line.starts_with("- Linear → personal (verified: Initech). Off: linear:personal is logged in as Initech"),
-            "{line}"
-        );
-    }
-
-    #[test]
-    fn account_line_without_a_verified_login_is_unchanged() {
-        let server = linear("personal", &[("expect", "mihaicrisan")]);
-        assert_eq!(
-            account_line(&server, &VerifiedAccounts::default()),
-            "- Linear → personal"
-        );
-    }
 }

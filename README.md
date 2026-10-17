@@ -210,7 +210,7 @@ The full reference is [docs/config-schema.md](docs/config-schema.md).
 
 - **Config never holds secrets.** OAuth logins and API tokens live in the OS keychain. Secrets for stdio servers are references (`op://`, `keychain:`, `env:`, `fnox:`) resolved at runtime. A token is never taken as a command-line argument.
 - **Credentials are bound to server identity plus account.** The identity is the server URL, OAuth issuer or stdio command hash, so a repo that redefines `linear` to point elsewhere gets no token.
-- **Trust only for executable config that arrived from elsewhere.** Stdio commands and secret references in a file as cloned or pulled need one approval, from the human in the agent's prompt or with `plugbay trust`. Files written on this machine are trusted on sight. Remote-only config never asks.
+- **Trust only for executable config.** Stdio commands and secret references in a project file need one approval, from the human in the agent's prompt or with `plugbay trust`, and again whenever those parts change. The global config (where `plugbay add` and `migrate` put definitions) is always trusted, and remote-only config never asks.
 - **Agents can't widen access.** `plugbay__enable` only accepts servers plugbay already knows; an agent can't pass a URL or a command.
 - **Upstream metadata is hostile input.** OAuth endpoints and URLs that servers advertise are validated before any token is sent.
 
