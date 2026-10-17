@@ -30,9 +30,11 @@ use crate::paths::Paths;
 #[derive(Parser)]
 #[command(name = "plugbay", version, about)]
 struct Cli {
-    /// Log filter, e.g. `info`, `debug`, `plugbay=trace`. Falls back to `PLUGBAY_LOG`.
-    #[arg(long, global = true, env = "PLUGBAY_LOG", default_value = "info")]
-    log_level: String,
+    /// Log level for plugbay itself (`debug`, `trace`; dependencies stay at `warn`), or a full
+    /// filter like `debug,rmcp=debug` for everything. Defaults to `warn` for commands and `info`
+    /// for `connect` and `daemon`. Falls back to `PLUGBAY_LOG`.
+    #[arg(long, global = true, env = "PLUGBAY_LOG")]
+    log_level: Option<String>,
 
     /// Act as if started in this directory instead of the current one.
     #[arg(
@@ -58,16 +60,22 @@ enum Command {
         #[arg(long, default_value_t = 600)]
         idle_timeout: u64,
     },
-    /// Ask a running daemon to exit.
+    /// Ask a running daemon to exit (agents start a new one on their next connection).
     Stop,
     /// List the servers resolved for a directory.
     Ls {
         /// Every directory with a plugbay config that plugbay has seen, not just this one.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "available")]
         all: bool,
+        /// Every server you can pin: built in, and the catalog in your global config.
+        #[arg(long)]
+        available: bool,
     },
     /// Show which config file set each field of a server.
-    Why { server: String },
+    Why {
+        /// Server name as pinned, e.g. `linear`.
+        server: String,
+    },
     /// Pin servers for this directory: `plugbay use linear:initech sentry`.
     Use(commands::PinOptions),
     /// Remove pins, or switch off servers this directory inherits.
@@ -75,7 +83,10 @@ enum Command {
     /// Add a server definition to the catalog in the global config, pinned nowhere yet.
     Add(commands::AddOptions),
     /// Remove a server definition from the catalog.
-    Remove { name: String },
+    Remove {
+        /// Catalog entry to remove; `plugbay unuse` stops using a server in one directory.
+        name: String,
+    },
     /// Every server account in use, whether it is logged in, and where it is used.
     Accounts,
     /// Log in with OAuth (`plugbay login linear:initech`) or store an API token (`--token`).
@@ -87,7 +98,10 @@ enum Command {
         token: commands::TokenOptions,
     },
     /// Forget the stored OAuth login or token for a server account.
-    Logout { target: String },
+    Logout {
+        /// `server` or `server:account`, e.g. `linear:initech`.
+        target: String,
+    },
     /// Trust the executable parts (stdio commands, secret refs) of the config files for a directory.
     Trust {
         /// Remove trust instead of granting it.
@@ -123,9 +137,11 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn run(cli: Cli, paths: Paths) -> anyhow::Result<()> {
+    let log_level = cli.log_level.as_deref();
     match cli.command {
-        Command::Daemon { .. } => logging::init_daemon(&paths, &cli.log_level)?,
-        _ => logging::init_stderr(&cli.log_level),
+        Command::Daemon { .. } => logging::init_daemon(&paths, log_level.unwrap_or("info"))?,
+        Command::Connect => logging::init_stderr(log_level.unwrap_or("info")),
+        _ => logging::init_stderr(log_level.unwrap_or("warn")),
     }
 
     let cd = cli.cd;
@@ -135,8 +151,8 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<()> {
             daemon::run(&paths, Duration::from_secs(idle_timeout)).await
         }
         Command::Stop => commands::stop(&paths).await,
-        Command::Ls { all: false } => commands::ls(&paths, cd).await,
-        Command::Ls { all: true } => commands::ls_all(&paths, cd).await,
+        Command::Ls { all: true, .. } => commands::ls_all(&paths, cd).await,
+        Command::Ls { available, .. } => commands::ls(&paths, cd, available).await,
         Command::Why { server } => commands::why(&paths, &server, cd).await,
         Command::Use(options) => commands::use_servers(&paths, cd, options).await,
         Command::Unuse(options) => commands::unuse_servers(&paths, cd, options).await,
