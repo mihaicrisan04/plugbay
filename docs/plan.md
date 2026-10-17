@@ -179,6 +179,18 @@ From an audit of the session runtime; Mihai approved each.
 4. Real-service checks from the gaps list; one shared "what resolved here" report model; Linux Secret Service edge cases
 5. Side quest: PR to T3 Code wiring `onElicitation` into its Claude adapter so trust prompts work there
 
+## Backlog: waiting on Mihai
+
+The release and launch are parked until these are done (added 2026-10-17). Agents: remind Mihai when release or launch work comes up.
+
+- [ ] Developer ID Application certificate for team `QJLTVSB2G4` (only an Apple Development one exists on the Mac), exported as `.p12`
+- [ ] App Store Connect API key (Team Keys, Developer role) for notarization: `.p8`, Key ID, Issuer ID
+- [ ] Actions secrets `MACOS_CERTIFICATE_P12`, `MACOS_CERTIFICATE_PASSWORD`, `APPLE_API_KEY_P8`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER_ID` (commands in docs/releasing.md)
+- [ ] `HOMEBREW_TAP_TOKEN`: fine-grained token, Contents read/write on `mihaicrisan04/homebrew-tap`
+- [ ] Logo SVG edits (`docs/assets/logo-{light,dark}.svg`): commit or discard
+
+Then, on Mihai's go-ahead: tag `v0.2.1`, check `codesign -dv` shows `TeamIdentifier=QJLTVSB2G4` on the brew-installed binary, update the README's keychain note, test `brew install` on a clean machine, re-record `demo.gif` if output changed, and review the launch drafts (`~/dev/personal/plugbay-launch/drafts.md`; replace the invented "One morning Claude…" story) before anything is posted.
+
 ## Naming
 
 - `plugbay` (may change). Short alias TBD: avoid `pg` (reads as Postgres); `pb` or `plug` are candidates
