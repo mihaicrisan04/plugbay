@@ -8,8 +8,9 @@ Releases are cut by pushing a `v*` tag. `.github/workflows/release.yml` builds t
 2. Create a fine-grained personal access token with access to `mihaicrisan04/homebrew-tap` only, permission **Contents: read and write**.
 3. Add it to the plugbay repo as the Actions secret `HOMEBREW_TAP_TOKEN` (Settings > Secrets and variables > Actions, or `gh secret set HOMEBREW_TAP_TOKEN -R mihaicrisan04/plugbay`).
 4. Optionally enable private vulnerability reporting (Settings > Security), which `SECURITY.md` points to.
+5. macOS signing (team `QJLTVSB2G4`), see [below](#macos-signing-and-notarization).
 
-The release itself uses the built-in `GITHUB_TOKEN`; only the tap update needs the extra secret.
+The release itself uses the built-in `GITHUB_TOKEN`; only the tap update and signing need extra secrets.
 
 ## Cutting a release
 
@@ -78,13 +79,30 @@ After a real release, render against the published checksums instead (`gh releas
 
 ## Platform notes
 
-### macOS keychain prompts after upgrades
+### macOS signing and notarization
 
-The release binaries are not signed with a Developer ID (the linker only ad-hoc signs them). macOS ties "Always Allow" keychain access to the code signature, and an ad-hoc signature changes with every build, so after `brew upgrade` macOS asks again whether plugbay may read its keychain.
+macOS ties "Always Allow" keychain access to the code signature. The linker only ad-hoc signs, and an ad-hoc signature changes with every build, so an unsigned plugbay asks again after every `brew upgrade` (one prompt: every secret lives in the `plugbay-vault` item, see `src/vault.rs`). Signed with a Developer ID under a fixed identifier (`io.github.mihaicrisan04.plugbay`), the identity stays the same across upgrades and the prompt is gone. The first signed version still asks once, since the item was last allowed for an unsigned build.
 
-plugbay keeps every secret it stores in one keychain item (`plugbay-vault`, see `src/vault.rs`), so that is **one** prompt per upgrade, not one per login. Users upgrading from a build that stored one item per login get one prompt per old item, once, as they are copied into the vault.
+The **sign and notarize** step runs `packaging/macos/sign.sh` on both macOS targets: it imports the certificate into a throwaway keychain, signs with the hardened runtime and a timestamp, and notarizes through `xcrun notarytool`. A bare binary can't be stapled, so Gatekeeper checks the notarization online. Without the secrets it warns and leaves the binary ad-hoc signed.
 
-**Before launch:** sign with a Developer ID Application certificate in the release workflow (`codesign --options runtime --timestamp`) and notarize with `xcrun notarytool`. The identity then stays stable across upgrades and the prompt disappears. Needs an Apple Developer account, plus the certificate and an App Store Connect API key (or app-specific password) as Actions secrets.
+One-time setup (the account holder does this):
+
+1. **Developer ID Application certificate.** Xcode > Settings > Accounts > the team > Manage Certificates > + > Developer ID Application (or a CSR at developer.apple.com > Certificates). In Keychain Access, export it together with its private key as a `.p12` with a password.
+2. **App Store Connect API key** for notarization. App Store Connect > Users and Access > Integrations > App Store Connect API > Team Keys > generate one with the Developer role. Download the `.p8` (only possible once) and note its Key ID and the Issuer ID shown above the list.
+3. Add the secrets (each command reads the value from a file or a hidden prompt, so nothing lands in shell history):
+
+   ```sh
+   repo=mihaicrisan04/plugbay
+   base64 -i DeveloperID.p12 | gh secret set MACOS_CERTIFICATE_P12 -R $repo
+   gh secret set MACOS_CERTIFICATE_PASSWORD -R $repo        # prompts for the .p12 password
+   gh secret set APPLE_API_KEY_P8 -R $repo < AuthKey_XXXXXXXXXX.p8
+   gh secret set APPLE_API_KEY_ID -R $repo                  # prompts
+   gh secret set APPLE_API_ISSUER_ID -R $repo               # prompts
+   ```
+
+4. Move the `.p12` and `.p8` somewhere safe (1Password) and off the disk.
+
+Check a released binary with `codesign -dv --verbose=2 $(which plugbay)` (look for `TeamIdentifier=QJLTVSB2G4`) and `spctl --assess --type install -v $(which plugbay)`.
 
 ### Linux
 
