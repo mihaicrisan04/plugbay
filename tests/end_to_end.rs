@@ -1176,6 +1176,32 @@ async fn enabling_another_account_than_the_project_sets_needs_the_human() {
 }
 
 #[tokio::test]
+async fn conflicting_account_pins_still_need_the_human_to_switch() {
+    let sandbox = Sandbox::new();
+    sandbox.append_to_global_config(&format!(
+        "\n[servers.echo-copy]\ncommand = \"{}\"\nenabled = false\n",
+        echo_server_binary().display()
+    ));
+    write_project(
+        &sandbox.projects.join("conflict"),
+        "[servers]\necho = \"client-a\"\necho-copy = \"client-b\"\n",
+    );
+    let client = sandbox.connect("conflict").await;
+
+    let refused = call_with(
+        &client,
+        "plugbay__enable",
+        serde_json::json!({ "server": "echo", "account": "client-b" }),
+    )
+    .await;
+    assert!(refused.contains("needs the human's approval"), "{refused}");
+    assert!(refused.contains("plugbay use echo:client-b"), "{refused}");
+    let tools = tool_names(&client).await;
+    assert!(!tools.contains(&"echo__whoami".to_string()), "{tools:?}");
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
 async fn a_slow_upstream_does_not_hold_up_the_others() {
     let sandbox = Sandbox::new();
     sandbox.append_to_global_config(&format!(

@@ -51,50 +51,54 @@ impl Session {
     /// A project's config picks the account on purpose (client A's repo uses client A's
     /// workspace), so only the human may move this session to another one.
     async fn approve_account(&self, server: &str, account: &str) -> Result<(), String> {
-        let bound = self.accounts_config_picks(server);
-        if bound.is_empty() || bound.iter().any(|bound| bound == account) {
-            return Ok(());
-        }
-        let current = bound.join(", ");
-        let refusal = format!(
-            "{server} uses {current} in this project's plugbay config, and switching it to {account} \
-             needs the human's approval. Ask the human to run `plugbay use {server}:{account}` if \
-             they want {account} here."
-        );
-        let Some(peer) = self.peer.get().filter(|peer| supports_forms(peer)) else {
-            return Err(refusal);
+        let question = match self.account_config_picks(server) {
+            ConfigAccount::Unset => return Ok(()),
+            ConfigAccount::Picks(picked) if picked.iter().any(|picked| picked == account) => {
+                return Ok(());
+            }
+            ConfigAccount::Picks(picked) => AccountQuestion::switch(server, &picked, account),
+            ConfigAccount::Unclear(problem) => AccountQuestion::unclear(server, &problem, account),
         };
-        let message =
-            format!("plugbay: switch {server} from {current} to {account} for this session?");
-        let keep = format!("Keep {current}");
+        let Some(peer) = self.peer.get().filter(|peer| supports_forms(peer)) else {
+            return Err(question.refusal);
+        };
         let choices = [
             ("switch", "Switch for this session"),
-            ("keep", keep.as_str()),
+            ("keep", question.keep.as_str()),
         ];
-        match ask_human(peer, message, &choices).await.as_deref() {
+        match ask_human(peer, question.prompt, &choices).await.as_deref() {
             Some("switch") => Ok(()),
-            _ => Err(refusal),
+            _ => Err(question.refusal),
         }
     }
 
-    /// The accounts config files give `server` here when it is on, ignoring this session's own pin
-    /// for it. Empty when no file names one (the server would use `default`).
-    fn accounts_config_picks(&self, server: &str) -> Vec<String> {
+    /// What config files say about `server`'s account here, ignoring this session's own pin for it.
+    fn account_config_picks(&self, server: &str) -> ConfigAccount {
         let mut pins = self.pins.lock().clone();
         pins.insert(server.to_string(), SessionPin::On { account: None });
         let config = match config::resolve_with_pins(&self.shared.paths, &self.location(), &pins) {
             Ok(config) => config,
             Err(error) => {
-                tracing::debug!(error = format!("{error:#}"), "config did not resolve");
-                return Vec::new();
+                return ConfigAccount::Unclear(format!("the config does not resolve: {error:#}"));
             }
         };
-        config
-            .server(server)
+        let resolved = config.server(server);
+        if resolved.is_empty() {
+            return match excluding_problem(&config, server) {
+                Some(problem) => ConfigAccount::Unclear(problem),
+                None => ConfigAccount::Unset,
+            };
+        }
+        let picked: Vec<String> = resolved
             .into_iter()
             .filter(|resolved| resolved.provenance.contains_key("account"))
             .map(|resolved| resolved.account.clone())
-            .collect()
+            .collect();
+        if picked.is_empty() {
+            ConfigAccount::Unset
+        } else {
+            ConfigAccount::Picks(picked)
+        }
     }
 
     pub(super) async fn disable(&self, arguments: Option<JsonObject>) -> CallToolResult {
@@ -184,6 +188,65 @@ impl Session {
     }
 }
 
+enum ConfigAccount {
+    /// No file names one: the server would use `default`.
+    Unset,
+    Picks(Vec<String>),
+    /// A config problem (e.g. two names for one server with different accounts) left the server
+    /// out, so the account the files mean can't be told; their pins would otherwise go unseen.
+    Unclear(String),
+}
+
+/// The elicitation for using another account than config gives, and the refusal without it.
+struct AccountQuestion {
+    prompt: String,
+    keep: String,
+    refusal: String,
+}
+
+impl AccountQuestion {
+    fn switch(server: &str, picked: &[String], account: &str) -> Self {
+        let current = picked.join(", ");
+        Self {
+            prompt: format!(
+                "plugbay: switch {server} from {current} to {account} for this session?"
+            ),
+            keep: format!("Keep {current}"),
+            refusal: format!(
+                "{server} uses {current} in this project's plugbay config, and switching it to {account} \
+                 needs the human's approval. Ask the human to run `plugbay use {server}:{account}` if \
+                 they want {account} here."
+            ),
+        }
+    }
+
+    fn unclear(server: &str, problem: &str, account: &str) -> Self {
+        Self {
+            prompt: format!(
+                "plugbay: the config here doesn't settle which account {server} uses ({problem}). \
+                 Use {account} for this session?"
+            ),
+            keep: "Don't switch".to_string(),
+            refusal: format!(
+                "the config here doesn't settle which account {server} uses ({problem}), so using \
+                 {account} needs the human's approval. Ask the human to fix the config or run \
+                 `plugbay use {server}:{account}`."
+            ),
+        }
+    }
+}
+
+/// The problem that left `server` out of the resolved config, unless it is simply undefined.
+fn excluding_problem(config: &ResolvedConfig, server: &str) -> Option<String> {
+    config
+        .problems
+        .iter()
+        .find(|problem| {
+            problem.servers.iter().any(|name| name == server) && !problem.is_unknown_server()
+        })
+        .map(|problem| problem.message.clone())
+}
+
 /// Servers plugbay knows how to reach that are off here: the catalog, ones switched off, the registry.
 pub(super) fn servers_to_enable(config: &ResolvedConfig) -> Vec<String> {
     let mut names: Vec<String> = config.catalog.clone();
@@ -196,10 +259,8 @@ pub(super) fn servers_to_enable(config: &ResolvedConfig) -> Vec<String> {
 }
 
 fn why_not_enabled(config: &ResolvedConfig, name: &str) -> String {
-    if let Some(problem) = config.problems.iter().find(|problem| {
-        problem.servers.iter().any(|server| server == name) && !problem.is_unknown_server()
-    }) {
-        return format!("{name} can't be enabled: {}", problem.message);
+    if let Some(problem) = excluding_problem(config, name) {
+        return format!("{name} can't be enabled: {problem}");
     }
     format!(
         "plugbay doesn't know a server named {name}. Known: {}. The human can define one with \
