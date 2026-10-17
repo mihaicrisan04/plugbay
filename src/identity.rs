@@ -135,7 +135,7 @@ impl VerifiedAccounts {
 
 /// Matches the keychain entry name, so a record follows exactly one stored login.
 fn record_key(identity: &ServerIdentity, account: &str) -> String {
-    format!("{identity}#{account}")
+    format!("{}#{account}", identity.0)
 }
 
 /// The text from `[accounts.<server>.<account>] expect = "..."`, if set.

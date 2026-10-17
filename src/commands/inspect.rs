@@ -137,7 +137,7 @@ pub async fn accounts(paths: &Paths, cd: Option<PathBuf>) -> anyhow::Result<()> 
             let key = (
                 server.name.clone(),
                 server.account.clone(),
-                server.identity.to_string(),
+                server.identity.0.clone(),
             );
             let usage = usages.entry(key).or_insert_with(|| AccountUsage {
                 server: server.clone(),
@@ -491,7 +491,7 @@ fn format_why(config: &ResolvedConfig, name: &str, home: &Path) -> anyhow::Resul
 
 fn format_server_fields(server: &ResolvedServer, home: &Path) -> String {
     let mut output = format!("{}\n", server.display_name());
-    output.push_str(&format!("  identity  {}\n", server.identity));
+    output.push_str(&format!("  identity  {}\n", server.identity.masked()));
     output.push_str(&format!("  tools     {}__*\n\n", server.tool_prefix));
 
     let mut rows = vec![vec![

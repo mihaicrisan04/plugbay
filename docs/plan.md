@@ -153,12 +153,13 @@ From an audit of the session runtime; Mihai approved each.
 - **`initialize` waits for the first refresh** (bounded as above), so the server instructions list only servers whose tools are exposed. Failed, untrusted, still connecting, wrong-account and needs-login servers go on one "Not available right now" line pointing to `plugbay__status`. Stdio servers with only the implicit `default` account show no account label
 - **`plugbay__enable` can't switch a pinned account on its own.** If config files give the server an account here (a server pin or the tree's `account = ...`) and the agent asks for another, the human is asked through elicitation ("switch <server> from <a> to <b> for this session?"). Declined, or no elicitation in the client: refused, telling the agent to ask the human to run `plugbay use <server>:<account>`. No prompt when no file names an account or the account is the same
 - An in-agent login (`<server>__login`) forgets the cached verified account, like the CLI login, so the next connection is verified afresh
+- **Identities are never shown raw.** `ServerIdentity` has no `Display`; every message, status line and CLI output uses `masked()` (conflict problems, `why`, `login --token`, `migrate`), so a key in a url path or userinfo can't reach the model. The raw form is only a credential key
 
 ## Known gaps after v0.1 (follow-ups)
 
 - No byte cap on remote (HTTP) upstream responses: rmcp's HTTP adapter buffers whole JSON bodies. Stdio messages are capped at 16 MiB
 - Upstream stderr is logged with resolved secret env values redacted (lines capped at 4 KiB); other secrets a server prints itself are not caught
-- Server urls are masked for display (userinfo, query values, fragment, token-looking path segments), but the masking of path tokens is a heuristic, and `ServerIdentity` itself (the credential key) still holds the full path and userinfo; only logs use `ServerIdentity::masked()`
+- Server urls are masked for display (userinfo, query values, fragment, token-looking path segments), but the masking of path tokens is a heuristic, and `ServerIdentity` itself (the credential key) still holds the full path and userinfo; it is rendered only through `ServerIdentity::masked()`
 - Version skew: after an upgrade the running daemon keeps the old version until `plugbay stop` (doctor warns). Retiring it when a newer shim connects was rejected for now: a retired daemon still serving old sessions would no longer receive `logout` / `trust --revoke` control messages
 - Remote MCP requests don't follow redirects and have a 10s connect timeout; a read only times out after 10 minutes of silence (the longest tool call), so idle event streams reconnect at most that often
 - OAuth registration is DCR-only until we host a CIMD document; no manual `client_id` flow yet

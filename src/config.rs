@@ -379,12 +379,6 @@ impl ServerIdentity {
     }
 }
 
-impl std::fmt::Display for ServerIdentity {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
 impl ToolFilter {
     pub fn new(include: Vec<String>, exclude: Vec<String>) -> Self {
         Self {

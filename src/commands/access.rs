@@ -257,7 +257,7 @@ async fn login_with_token(
     println!(
         "Stored a token for {} (sent only to {}).",
         server.display_name(),
-        server.identity
+        server.identity.masked()
     );
     notify_credentials_changed(paths, server).await;
     Ok(())

@@ -569,8 +569,9 @@ async fn store_bearer_token(
         .is_some()
     {
         println!(
-            "{}: a token is already stored for {identity}; kept it",
-            server.key
+            "{}: a token is already stored for {}; kept it",
+            server.key,
+            identity.masked()
         );
         return Ok(());
     }

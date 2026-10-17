@@ -65,7 +65,7 @@ pub async fn stop(paths: &Paths) -> anyhow::Result<()> {
 /// the old ones. Silent when none is running.
 pub async fn notify_credentials_changed(paths: &Paths, server: &config::ResolvedServer) {
     let request = ControlRequest::CredentialsChanged {
-        identity: server.identity.to_string(),
+        identity: server.identity.0.clone(),
         account: server.account.clone(),
     };
     if let Err(error) = crate::protocol::send_control(paths, request).await {

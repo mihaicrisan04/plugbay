@@ -523,9 +523,10 @@ fn identity_conflict_message(
         entries.push(format!("`{name}` → {}", accounts.join(", ")));
     }
     format!(
-        "{} point at the same server ({identity}) with different accounts; \
+        "{} point at the same server ({}) with different accounts; \
          to expose several accounts, list them on one entry: `name = [\"a\", \"b\"]`",
-        entries.join(" and ")
+        entries.join(" and "),
+        identity.masked()
     )
 }
 
@@ -641,6 +642,28 @@ mod tests {
                 .message
                 .contains("https://mcp.sentry.dev/mcp")
         );
+    }
+
+    #[test]
+    fn conflict_messages_mask_credentials_in_the_server_url() {
+        let fixture = Fixture::new();
+        let url = "https://user:test-password@mcp.example.com/mcp/test0token0abcdefghij0123";
+        fixture.write(
+            "app/plugbay.toml",
+            &format!(
+                "[servers]\nfirst = {{ url = \"{url}\", account = \"a\" }}\nsecond = {{ url = \"{url}\", account = \"b\" }}\n"
+            ),
+        );
+
+        let config = fixture.resolve("app");
+
+        let message = &config.problems[0].message;
+        assert!(
+            message.contains("https://***@mcp.example.com/mcp/***"),
+            "{message}"
+        );
+        assert!(!message.contains("test-password"), "{message}");
+        assert!(!message.contains("test0token0"), "{message}");
     }
 
     #[test]
