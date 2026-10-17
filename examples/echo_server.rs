@@ -1,6 +1,6 @@
 //! A tiny stdio MCP server for plugbay's end-to-end tests.
 //! `whoami` reports `ECHO_ACCOUNT` and the process id, so tests can see which account and
-//! which shared upstream process answered.
+//! which shared upstream process answered. `ECHO_LIST_DELAY_MS` makes `tools/list` slow.
 
 use std::sync::Arc;
 
@@ -23,6 +23,11 @@ impl ServerHandler for EchoServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
+        let delay_millis = std::env::var("ECHO_LIST_DELAY_MS")
+            .ok()
+            .and_then(|millis| millis.parse().ok())
+            .unwrap_or(0);
+        tokio::time::sleep(std::time::Duration::from_millis(delay_millis)).await;
         Ok(ListToolsResult::with_all_items(vec![
             tool("whoami", "Report the account and process id"),
             tool("echo", "Echo the `text` argument"),

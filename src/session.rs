@@ -20,6 +20,7 @@ use rmcp::model::{
 };
 use rmcp::service::{NotificationContext, RequestContext};
 use rmcp::{ErrorData as McpError, Peer, RoleServer, ServerHandler};
+use tokio::time::Instant;
 
 use crate::config::{self, ResolvedConfig, ResolvedServer, ServerIdentity, SessionPin};
 use crate::identity::{self, VerifiedAccounts};
@@ -27,7 +28,7 @@ use crate::index;
 use crate::paths::Paths;
 use crate::project::{self, ProjectHints, ProjectLocation};
 use crate::trust::Trust;
-use crate::upstream::{ConnectError, Lease, Upstream, UpstreamKey, UpstreamPool};
+use crate::upstream::{ConnectError, Lease, MayConnect, Upstream, UpstreamKey, UpstreamPool};
 
 use self::prompt::TrustPromptKey;
 use self::tools::{
@@ -36,9 +37,23 @@ use self::tools::{
 };
 
 const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(2);
-/// How long a refresh (and so the first tool listing) waits for upstreams. Codex gives an MCP
-/// server 10 s to start and list its tools; later arrivals are announced with `tools/list_changed`.
+/// How long a session start (`initialize` plus the first tool listing together), or a later
+/// refresh or listing, waits for upstreams. Codex gives an MCP server 10 s to start and list its
+/// tools; later arrivals are announced with `tools/list_changed`.
 const READY_DEADLINE: Duration = Duration::from_secs(8);
+
+/// [`READY_DEADLINE`], or less via `PLUGBAY_READY_DEADLINE_MS` (for tests, which would otherwise
+/// sit through it). It can only shorten the wait.
+fn ready_deadline() -> Duration {
+    static DEADLINE: OnceLock<Duration> = OnceLock::new();
+    *DEADLINE.get_or_init(|| {
+        let configured = std::env::var("PLUGBAY_READY_DEADLINE_MS")
+            .ok()
+            .and_then(|millis| millis.parse().ok())
+            .map(Duration::from_millis);
+        configured.map_or(READY_DEADLINE, |deadline| deadline.min(READY_DEADLINE))
+    })
+}
 
 /// State every session in one daemon shares.
 pub struct Shared {
@@ -99,10 +114,17 @@ pub struct Session {
     state: Mutex<SessionState>,
     /// Held from resolving config to applying it, so an older resolution never overwrites a newer one.
     refreshing: tokio::sync::Mutex<()>,
+    /// Held by `plugbay__enable` / `__disable` from changing a pin to rolling it back, so a failed
+    /// enable never restores its old pin over a newer one.
+    pin_changes: tokio::sync::Mutex<()>,
     first_refresh: tokio::sync::OnceCell<()>,
     /// Signalled whenever a connection attempt finishes.
     connections_settled: tokio::sync::watch::Sender<()>,
     next_attempt: AtomicU64,
+    /// `initialize` and the first tool listing share this one budget, counted from the connection.
+    startup_deadline: Instant,
+    /// Set when the client disconnects; pending connection attempts stop for good.
+    ended: AtomicBool,
     peer: OnceLock<Peer<RoleServer>>,
     initialized: AtomicBool,
     tools_listed: AtomicBool,
@@ -130,10 +152,12 @@ struct ActiveServer {
 }
 
 enum ServerStatus {
-    /// A background task is connecting; it fills in the outcome for this `attempt`.
+    /// A background task is connecting; it fills in the outcome for this `attempt`. The session
+    /// aborts it when the entry is replaced or the session ends.
     Connecting {
         attempt: u64,
         key: UpstreamKey,
+        task: tokio::task::AbortHandle,
     },
     Connected(Lease),
     NeedsLogin {
@@ -167,9 +191,12 @@ impl Session {
             pins: Mutex::new(BTreeMap::new()),
             state: Mutex::new(SessionState::default()),
             refreshing: tokio::sync::Mutex::new(()),
+            pin_changes: tokio::sync::Mutex::new(()),
             first_refresh: tokio::sync::OnceCell::new(),
             connections_settled: tokio::sync::watch::Sender::new(()),
             next_attempt: AtomicU64::new(0),
+            startup_deadline: Instant::now() + ready_deadline(),
+            ended: AtomicBool::new(false),
             peer: OnceLock::new(),
             initialized: AtomicBool::new(false),
             tools_listed: AtomicBool::new(false),
@@ -202,6 +229,27 @@ impl Session {
             .await;
     }
 
+    /// Called when the client disconnects. Background work (a trust prompt's reload, a watcher
+    /// tick) may still hold the session, so connection attempts are stopped here, not on drop.
+    pub fn end(&self) {
+        self.ended.store(true, Ordering::SeqCst);
+        for active in &self.state.lock().servers {
+            active.stop_connecting();
+        }
+        self.connections_settled.send_replace(());
+    }
+
+    /// When the current wait for upstreams gives up: the startup budget while it lasts, so
+    /// `initialize` and the first listing don't each get a full one; afterwards a fresh one.
+    fn wait_deadline(&self) -> Instant {
+        let now = Instant::now();
+        if now < self.startup_deadline {
+            self.startup_deadline
+        } else {
+            now + ready_deadline()
+        }
+    }
+
     pub async fn refresh_and_notify(&self) {
         let changed = self.refresh().await;
         if changed {
@@ -210,10 +258,14 @@ impl Session {
         self.offer_trust_prompt();
     }
 
-    /// Re-resolves config and reconnects whatever changed, waiting up to [`READY_DEADLINE`] for new
-    /// connections. Returns true when the exposed tools may differ.
+    /// Re-resolves config and reconnects whatever changed, waiting until [`Self::wait_deadline`]
+    /// for new connections. Returns true when the exposed tools may differ.
     async fn refresh(&self) -> bool {
         let _refreshing = self.refreshing.lock().await;
+        if self.ended.load(Ordering::SeqCst) {
+            return false;
+        }
+        let deadline = self.wait_deadline();
         let resolved = self.resolve_config();
         if let Ok(config) = &resolved.outcome {
             index::record(&self.shared.paths, config).await;
@@ -221,21 +273,21 @@ impl Session {
         let wanted = self.wanted_servers(&resolved);
         let working_dir = resolved.location.working_dir.clone();
 
-        let (previous_shape, to_connect, replaced) = {
+        let (previous_shape, attempts, replaced) = {
             let mut state = self.state.lock();
             let previous = std::mem::take(&mut state.servers);
             let previous_shape = tool_shape(&previous);
             let plan = self.plan_servers(wanted, previous, working_dir.as_ref());
             state.servers = plan.servers;
             state.resolved = Some(resolved);
-            (previous_shape, plan.to_connect, plan.replaced)
+            (previous_shape, plan.attempts, plan.replaced)
         };
 
-        let attempts: Vec<u64> = to_connect.iter().map(|(attempt, _)| *attempt).collect();
-        for (attempt, server) in to_connect {
-            self.spawn_connect(attempt, server, working_dir.clone());
+        // A replaced attempt (e.g. its trust was revoked) must not go on to start anything.
+        for active in &replaced {
+            active.stop_connecting();
         }
-        self.wait_for_attempts(&attempts).await;
+        self.wait_for_attempts(&attempts, deadline).await;
         // Old leases go only after new ones exist, so an unchanged upstream isn't closed and reopened.
         drop(replaced);
 
@@ -290,26 +342,62 @@ impl Session {
                 continue;
             }
             let attempt = self.next_attempt.fetch_add(1, Ordering::SeqCst);
+            let task = self.spawn_connect(attempt, server.clone(), working_dir.cloned());
             plan.servers.push(ActiveServer {
-                server: server.clone(),
-                status: ServerStatus::Connecting { attempt, key },
+                server,
+                status: ServerStatus::Connecting { attempt, key, task },
             });
-            plan.to_connect.push((attempt, server));
+            plan.attempts.push(attempt);
         }
         plan.replaced = reusable;
         plan
     }
 
     /// Connects in the background; the outcome lands in whichever entry still waits for `attempt`.
-    fn spawn_connect(&self, attempt: u64, server: ResolvedServer, working_dir: Option<PathBuf>) {
+    fn spawn_connect(
+        &self,
+        attempt: u64,
+        server: ResolvedServer,
+        working_dir: Option<PathBuf>,
+    ) -> tokio::task::AbortHandle {
         let pool = self.shared.pool.clone();
         let session = self.this.clone();
-        tokio::spawn(async move {
-            let status = connect(&pool, &server, working_dir.as_ref()).await;
+        let task = tokio::spawn(async move {
+            let may_connect = || {
+                session
+                    .upgrade()
+                    .is_some_and(|session| session.may_still_connect(attempt))
+            };
+            let status = connect(&pool, &server, working_dir.as_ref(), &may_connect).await;
             if let Some(session) = session.upgrade() {
                 session.finish_connecting(attempt, status).await;
             }
         });
+        task.abort_handle()
+    }
+
+    /// Asked by a connect task once its secrets resolved, right before it starts the process or
+    /// sends credentials: trust is read afresh, so a revoke that a pending refresh hasn't applied
+    /// yet still stops it.
+    fn may_still_connect(&self, attempt: u64) -> bool {
+        if self.ended.load(Ordering::SeqCst) {
+            return false;
+        }
+        let state = self.state.lock();
+        let Some(config) = state.config() else {
+            return false;
+        };
+        let Some(active) = state
+            .servers
+            .iter()
+            .find(|active| active.is_connecting(attempt))
+        else {
+            return false;
+        };
+        self.shared
+            .trust
+            .lock()
+            .is_server_trusted(&active.server, config)
     }
 
     async fn finish_connecting(&self, attempt: u64, status: ServerStatus) {
@@ -334,14 +422,15 @@ impl Session {
         }
     }
 
-    /// Waits until none of `attempts` is still connecting, or [`READY_DEADLINE`] passes.
-    async fn wait_for_attempts(&self, attempts: &[u64]) {
+    /// Waits until none of `attempts` is still connecting, or `deadline` passes.
+    async fn wait_for_attempts(&self, attempts: &[u64], deadline: Instant) {
         if attempts.is_empty() {
             return;
         }
         let mut settled = self.connections_settled.subscribe();
-        let all_settled = settled.wait_for(|()| !self.any_connecting(attempts));
-        match tokio::time::timeout(READY_DEADLINE, all_settled).await {
+        let all_settled = settled
+            .wait_for(|()| self.ended.load(Ordering::SeqCst) || !self.any_connecting(attempts));
+        match tokio::time::timeout_at(deadline, all_settled).await {
             Ok(Ok(_settled)) => {}
             Ok(Err(error)) => tracing::debug!(%error, "stopped waiting for connections"),
             Err(_elapsed) => tracing::info!(
@@ -404,21 +493,27 @@ impl Session {
             }
         }
 
+        let deadline = self.wait_deadline();
         let listed = futures::future::join_all(
             connected
                 .into_iter()
-                .map(|(server, upstream)| self.tools_of(server, upstream)),
+                .map(|(server, upstream)| self.tools_of(server, upstream, deadline)),
         )
         .await;
         tools.extend(listed.into_iter().flatten());
         tools
     }
 
-    /// One server's tools, or none when it doesn't answer within [`READY_DEADLINE`]: the listing
-    /// carries on and the client is told when it lands.
-    async fn tools_of(&self, server: ResolvedServer, upstream: Arc<Upstream>) -> Vec<Tool> {
+    /// One server's tools, or none when it doesn't answer by `deadline`: the listing carries on
+    /// and the client is told when it lands.
+    async fn tools_of(
+        &self,
+        server: ResolvedServer,
+        upstream: Arc<Upstream>,
+        deadline: Instant,
+    ) -> Vec<Tool> {
         let mut listing = tokio::spawn(async move { upstream.tools().await });
-        let Ok(joined) = tokio::time::timeout(READY_DEADLINE, &mut listing).await else {
+        let Ok(joined) = tokio::time::timeout_at(deadline, &mut listing).await else {
             tracing::info!(server = %server.display_name(), "listing tools is slow; the client hears when they arrive");
             self.notify_when_listed(listing);
             return Vec::new();
@@ -715,7 +810,8 @@ impl ServerHandler for Session {
 #[derive(Default)]
 struct RefreshPlan {
     servers: Vec<ActiveServer>,
-    to_connect: Vec<(u64, ResolvedServer)>,
+    /// Connection attempts it started.
+    attempts: Vec<u64>,
     /// Entries no longer wanted, held until the new connections exist.
     replaced: Vec<ActiveServer>,
 }
@@ -730,10 +826,15 @@ async fn connect(
     pool: &Arc<UpstreamPool>,
     server: &ResolvedServer,
     working_dir: Option<&PathBuf>,
+    may_connect: MayConnect<'_>,
 ) -> ServerStatus {
-    match pool.acquire(server, working_dir).await {
+    match pool.acquire(server, working_dir, may_connect).await {
         Ok(lease) => ServerStatus::Connected(lease),
         Err(ConnectError::NeedsLogin { challenge }) => ServerStatus::NeedsLogin { challenge },
+        Err(ConnectError::Withdrawn) => {
+            tracing::info!(server = %server.display_name(), "trust was withdrawn before connecting");
+            ServerStatus::Untrusted
+        }
         Err(ConnectError::Failed(error)) => {
             tracing::warn!(server = %server.display_name(), error = format!("{error:#}"), "upstream failed");
             ServerStatus::Failed(format!("{error:#}"))
@@ -769,6 +870,12 @@ impl ActiveServer {
             | ServerStatus::Untrusted
             | ServerStatus::Failed(_)
             | ServerStatus::WrongAccount(_) => false,
+        }
+    }
+
+    fn stop_connecting(&self) {
+        if let ServerStatus::Connecting { task, .. } = &self.status {
+            task.abort();
         }
     }
 

@@ -20,15 +20,22 @@ use tokio::sync::Notify;
 /// A client whose human answers every plugbay prompt with the same choice, e.g. `allow_once`.
 #[derive(Clone)]
 struct AnsweringClient {
-    answer: &'static str,
+    first_answer: &'static str,
+    later_answer: &'static str,
     prompts: Arc<std::sync::Mutex<Vec<String>>>,
     changed: Arc<Notify>,
 }
 
 impl AnsweringClient {
     fn new(answer: &'static str) -> Self {
+        Self::first_then(answer, answer)
+    }
+
+    /// Answers the first prompt with `first_answer` and every later one with `later_answer`.
+    fn first_then(first_answer: &'static str, later_answer: &'static str) -> Self {
         Self {
-            answer,
+            first_answer,
+            later_answer,
             prompts: Arc::default(),
             changed: Arc::default(),
         }
@@ -52,9 +59,17 @@ impl ClientHandler for AnsweringClient {
         request: ElicitRequestParams,
         _context: RequestContext<RoleClient>,
     ) -> Result<ElicitResult, rmcp::ErrorData> {
-        self.prompts.lock().unwrap().push(format!("{request:?}"));
+        let answer = {
+            let mut prompts = self.prompts.lock().unwrap();
+            prompts.push(format!("{request:?}"));
+            if prompts.len() == 1 {
+                self.first_answer
+            } else {
+                self.later_answer
+            }
+        };
         Ok(ElicitResult::new(ElicitationAction::Accept)
-            .with_content(serde_json::json!({ "decision": self.answer })))
+            .with_content(serde_json::json!({ "decision": answer })))
     }
 
     async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
@@ -77,11 +92,30 @@ struct Sandbox {
     _temp: TempDir,
     plugbay_home: PathBuf,
     projects: PathBuf,
+    /// Passed to the daemon as `PLUGBAY_READY_DEADLINE_MS`; the daemon's 8 s otherwise.
+    ready_deadline: Option<Duration>,
 }
 
+/// Stands in for `fnox get <NAME>`: `SLOW_TOKEN` answers after 3 s, `FAILS_SLOWLY` fails after 2 s.
+const FAKE_FNOX: &str = r#"#!/bin/sh
+case "$2" in
+  SLOW_TOKEN) sleep 3; echo test-token ;;
+  FAILS_SLOWLY) sleep 2; echo "no such secret" >&2; exit 1 ;;
+  *) echo test-token ;;
+esac
+"#;
+
 impl Sandbox {
+    /// A sandbox whose daemon waits at most `ready_deadline` for upstreams, so slow-server
+    /// tests don't sit through the full 8 s.
+    fn with_ready_deadline(ready_deadline: Duration) -> Self {
+        let mut sandbox = Self::new();
+        sandbox.ready_deadline = Some(ready_deadline);
+        sandbox
+    }
+
     /// Global config defines `echo` once (disabled); projects only pick the account,
-    /// so they hold nothing executable and need no trust.
+    /// so they hold nothing executable and need no trust. A fake `fnox` is on the daemon's PATH.
     fn new() -> Self {
         let temp = TempDir::new().unwrap();
         let root = temp.path().canonicalize().unwrap();
@@ -104,6 +138,7 @@ env = {{ ECHO_ACCOUNT = "client-b" }}
             echo = echo_server_binary().display()
         );
         std::fs::write(plugbay_home.join("config/config.toml"), global_config).unwrap();
+        install_fake_fnox(&plugbay_home.join("bin"));
 
         write_project(
             &projects.join("client-a"),
@@ -120,6 +155,7 @@ env = {{ ECHO_ACCOUNT = "client-b" }}
             _temp: temp,
             plugbay_home,
             projects,
+            ready_deadline: None,
         }
     }
 
@@ -153,8 +189,23 @@ env = {{ ECHO_ACCOUNT = "client-b" }}
                 self.plugbay_home.join("vault.json"),
             )
             .env_remove("CLAUDE_PROJECT_DIR")
-            .env("PLUGBAY_LOG", "debug");
+            .env("PLUGBAY_LOG", "debug")
+            .env("PATH", self.path_with_fake_tools());
+        if let Some(deadline) = self.ready_deadline {
+            command.env(
+                "PLUGBAY_READY_DEADLINE_MS",
+                deadline.as_millis().to_string(),
+            );
+        }
         TokioChildProcess::new(command).unwrap()
+    }
+
+    fn path_with_fake_tools(&self) -> String {
+        format!(
+            "{}:{}",
+            self.plugbay_home.join("bin").display(),
+            std::env::var("PATH").unwrap_or_default()
+        )
     }
 
     fn append_to_global_config(&self, tables: &str) {
@@ -197,6 +248,15 @@ impl Drop for Sandbox {
             .env("PLUGBAY_HOME", &self.plugbay_home)
             .output();
     }
+}
+
+fn install_fake_fnox(bin: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::create_dir_all(bin).unwrap();
+    let fnox = bin.join("fnox");
+    std::fs::write(&fnox, FAKE_FNOX).unwrap();
+    std::fs::set_permissions(&fnox, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 fn write_project(dir: &Path, contents: &str) {
@@ -1203,9 +1263,9 @@ async fn conflicting_account_pins_still_need_the_human_to_switch() {
 
 #[tokio::test]
 async fn a_slow_upstream_does_not_hold_up_the_others() {
-    let sandbox = Sandbox::new();
+    let sandbox = Sandbox::with_ready_deadline(Duration::from_secs(2));
     sandbox.append_to_global_config(&format!(
-        "\n[servers.slow]\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"sleep 12; exec {}\"]\n",
+        "\n[servers.slow]\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"sleep 4; exec {}\"]\n",
         echo_server_binary().display()
     ));
     let (client, changed) = sandbox.connect_watching("client-b").await;
@@ -1229,5 +1289,155 @@ async fn a_slow_upstream_does_not_hold_up_the_others() {
         .await
         .expect("the slow server's arrival should send tools/list_changed");
     wait_for_tool(&sandbox, &client, "slow__whoami").await;
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn initialize_and_the_first_listing_share_one_startup_budget() {
+    let sandbox = Sandbox::with_ready_deadline(Duration::from_secs(3));
+    sandbox.append_to_global_config(&format!(
+        "\n[servers.sluggish]\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"sleep 2; exec {}\"]\nenv = {{ ECHO_LIST_DELAY_MS = \"30000\" }}\nenabled = false\n",
+        echo_server_binary().display()
+    ));
+    write_project(
+        &sandbox.projects.join("sluggish"),
+        "[servers]\necho = \"client-b\"\nsluggish = true\n",
+    );
+    let warm_up = sandbox.connect("quiet").await;
+    warm_up.cancel().await.unwrap();
+
+    let started = tokio::time::Instant::now();
+    let client = sandbox.connect("sluggish").await;
+    let tools = tool_names(&client).await;
+    let elapsed = started.elapsed();
+
+    assert!(tools.contains(&"echo__whoami".to_string()), "{tools:?}");
+    assert!(
+        !tools.contains(&"sluggish__whoami".to_string()),
+        "{tools:?}"
+    );
+    // One 3 s budget covers both; separate ones would take 2 s to initialize plus 3 s to list.
+    assert!(elapsed < Duration::from_millis(4300), "took {elapsed:?}");
+    client.cancel().await.unwrap();
+}
+
+/// A project server whose env waits on the fake `fnox` (3 s) and that creates `marker` if it
+/// ever starts.
+fn slow_secret_config(marker: &Path) -> String {
+    format!(
+        "[servers]\nlocal = {{ command = \"/bin/sh\", args = [\"-c\", \"touch {marker}; exec {echo}\"], env = {{ TOKEN = \"${{fnox:SLOW_TOKEN}}\" }} }}\n",
+        marker = marker.display(),
+        echo = echo_server_binary().display()
+    )
+}
+
+async fn wait_for_status<H: ClientHandler>(
+    sandbox: &Sandbox,
+    client: &RunningService<RoleClient, H>,
+    needle: &str,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = call_text(client, "plugbay__status").await;
+        if status.contains(needle) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "status never said {needle}: {status}\ndaemon log:\n{}",
+            sandbox.daemon_log()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn revoking_trust_stops_a_connection_still_resolving_secrets() {
+    let sandbox = Sandbox::new();
+    let marker = sandbox.plugbay_home.join("local-started");
+    write_project(
+        &sandbox.projects.join("slow-secret"),
+        &slow_secret_config(&marker),
+    );
+    let human = AnsweringClient::first_then("allow_always", "deny");
+    let client = human
+        .clone()
+        .serve(sandbox.transport("slow-secret"))
+        .await
+        .unwrap();
+    wait_for_status(&sandbox, &client, "— connecting").await;
+
+    let revoked =
+        tokio::task::block_in_place(|| sandbox.plugbay(&["trust", "--revoke"], "slow-secret"));
+    assert!(revoked.contains("Revoked trust"), "{revoked}");
+    // The revoke's reload waits for the attempt to settle, so the secret has resolved by now.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    assert!(
+        !marker.exists(),
+        "the command ran after its trust was revoked; daemon log:\n{}",
+        sandbox.daemon_log()
+    );
+    wait_for_status(&sandbox, &client, "not trusted").await;
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_client_that_leaves_stops_its_pending_connections() {
+    let sandbox = Sandbox::new();
+    let marker = sandbox.plugbay_home.join("local-started");
+    write_project(
+        &sandbox.projects.join("slow-secret"),
+        &slow_secret_config(&marker),
+    );
+    let human = AnsweringClient::new("allow_once");
+    let client = human
+        .clone()
+        .serve(sandbox.transport("slow-secret"))
+        .await
+        .unwrap();
+    wait_for_status(&sandbox, &client, "— connecting").await;
+
+    client.cancel().await.unwrap();
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    assert!(
+        !marker.exists(),
+        "the command ran after its client left; daemon log:\n{}",
+        sandbox.daemon_log()
+    );
+}
+
+#[tokio::test]
+async fn a_failed_enable_does_not_undo_a_newer_one() {
+    let sandbox = Sandbox::new();
+    sandbox.append_to_global_config(
+        "\n[accounts.echo.bad]\nenv = { ECHO_ACCOUNT = \"${fnox:FAILS_SLOWLY}\" }\n",
+    );
+    write_project(&sandbox.projects.join("open"), "");
+    let client = sandbox.connect("open").await;
+
+    let enable_bad = call_with(
+        &client,
+        "plugbay__enable",
+        serde_json::json!({ "server": "echo", "account": "bad" }),
+    );
+    let enable_good = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        call_with(
+            &client,
+            "plugbay__enable",
+            serde_json::json!({ "server": "echo", "account": "client-a" }),
+        )
+        .await
+    };
+    let (bad, good) = tokio::join!(enable_bad, enable_good);
+
+    assert!(bad.contains("could not start"), "{bad}");
+    assert!(good.contains("echo:client-a is on"), "{good}");
+    let status = call_text(&client, "plugbay__status").await;
+    assert!(status.contains("echo:client-a on"), "{status}");
+    let whoami = call_text(&client, "echo__whoami").await;
+    assert!(whoami.starts_with("account=client-a "), "{whoami}");
     client.cancel().await.unwrap();
 }

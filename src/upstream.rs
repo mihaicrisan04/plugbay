@@ -73,6 +73,10 @@ pub enum ConnectError {
     /// Carries the server's `WWW-Authenticate` challenge, which tells the login where to discover OAuth.
     #[error("not logged in")]
     NeedsLogin { challenge: String },
+    /// The caller withdrew its go-ahead (e.g. trust was revoked) before the process started or
+    /// credentials went out.
+    #[error("no longer allowed to connect")]
+    Withdrawn,
     #[error(transparent)]
     Failed(#[from] anyhow::Error),
 }
@@ -215,14 +219,24 @@ struct PoolEntry {
 /// A session's claim on an upstream. Dropping it lets the pool close the connection once nobody uses it.
 pub struct Lease {
     pub upstream: Arc<Upstream>,
-    pool: Arc<UpstreamPool>,
+    _claim: Claim,
 }
 
-impl Drop for Lease {
+/// One use of a pool entry, given back on drop, so an aborted connection attempt releases it too.
+struct Claim {
+    pool: Arc<UpstreamPool>,
+    key: UpstreamKey,
+}
+
+impl Drop for Claim {
     fn drop(&mut self) {
-        self.pool.release(&self.upstream.key);
+        self.pool.release(&self.key);
     }
 }
+
+/// Asked right before a process starts or credentials are sent, after secrets resolved, so a
+/// go-ahead withdrawn while they resolved still stops the connection.
+pub type MayConnect<'a> = &'a (dyn Fn() -> bool + Send + Sync);
 
 impl UpstreamPool {
     pub fn new(paths: Paths) -> Arc<Self> {
@@ -250,34 +264,26 @@ impl UpstreamPool {
         self: &Arc<Self>,
         server: &ResolvedServer,
         working_dir: Option<&PathBuf>,
+        may_connect: MayConnect<'_>,
     ) -> Result<Lease, ConnectError> {
         let key = UpstreamKey::for_server(server, working_dir);
-        let slot = self.claim(&key);
+        let (slot, claim) = self.claim(&key);
 
         let mut connection = slot.lock().await;
         if let Some(upstream) = connection.as_ref().filter(|upstream| !upstream.is_closed()) {
             return Ok(Lease {
                 upstream: upstream.clone(),
-                pool: self.clone(),
+                _claim: claim,
             });
         }
 
-        match connect(server, &key, self.changes.clone()).await {
-            Ok(upstream) => {
-                let upstream = Arc::new(upstream);
-                *connection = Some(upstream.clone());
-                self.verify_account(&upstream);
-                Ok(Lease {
-                    upstream,
-                    pool: self.clone(),
-                })
-            }
-            Err(error) => {
-                drop(connection);
-                self.release(&key);
-                Err(error)
-            }
-        }
+        let upstream = Arc::new(connect(server, &key, self.changes.clone(), may_connect).await?);
+        *connection = Some(upstream.clone());
+        self.verify_account(&upstream);
+        Ok(Lease {
+            upstream,
+            _claim: claim,
+        })
     }
 
     /// Once per connection: the credentials it was made with are the ones the answer describes.
@@ -366,7 +372,10 @@ impl UpstreamPool {
         self.lock_entries().len()
     }
 
-    fn claim(&self, key: &UpstreamKey) -> Arc<tokio::sync::Mutex<Option<Arc<Upstream>>>> {
+    fn claim(
+        self: &Arc<Self>,
+        key: &UpstreamKey,
+    ) -> (Arc<tokio::sync::Mutex<Option<Arc<Upstream>>>>, Claim) {
         let mut entries = self.lock_entries();
         let entry = entries.entry(key.clone()).or_insert_with(|| PoolEntry {
             slot: Arc::new(tokio::sync::Mutex::new(None)),
@@ -375,7 +384,11 @@ impl UpstreamPool {
         });
         entry.leases += 1;
         entry.idle_since = None;
-        entry.slot.clone()
+        let claim = Claim {
+            pool: self.clone(),
+            key: key.clone(),
+        };
+        (entry.slot.clone(), claim)
     }
 
     fn release(&self, key: &UpstreamKey) {
@@ -411,20 +424,21 @@ async fn connect(
     server: &ResolvedServer,
     key: &UpstreamKey,
     changes: broadcast::Sender<UpstreamKey>,
+    may_connect: MayConnect<'_>,
 ) -> Result<Upstream, ConnectError> {
     let client = UpstreamClient::new(key.clone(), changes);
     tracing::info!(server = %server.display_name(), identity = key.identity.masked(), "connecting upstream");
 
     let (service, process) = match &server.transport {
         ServerTransport::Http { url, headers } => (
-            connect_http(server, url, headers, client)
+            connect_http(server, url, headers, client, may_connect)
                 .await
                 .map_err(|error| mask_url_in_error(error, url))?,
             None,
         ),
         ServerTransport::Stdio { env, .. } => {
             let (service, process) =
-                connect_stdio(server, env, key.working_dir.as_deref(), client).await?;
+                connect_stdio(server, env, key.working_dir.as_deref(), client, may_connect).await?;
             (service, Some(parking_lot::Mutex::new(process)))
         }
     };
@@ -444,6 +458,7 @@ async fn connect_http(
     url: &Url,
     headers: &BTreeMap<String, String>,
     client: UpstreamClient,
+    may_connect: MayConnect<'_>,
 ) -> Result<RunningService<RoleClient, UpstreamClient>, ConnectError> {
     let http_client = http_client()?;
     let mut resolved_headers = secrets::resolve_map(headers)
@@ -455,6 +470,7 @@ async fn connect_http(
             url,
             &resolved_headers,
             HttpClient::Plain(http_client),
+            may_connect,
         )
         .await;
     }
@@ -467,7 +483,7 @@ async fn connect_http(
             Some(oauth_client) => HttpClient::OAuth(oauth_client),
             None => HttpClient::Plain(http_client),
         };
-        return serve_http(client, url, &resolved_headers, http_client).await;
+        return serve_http(client, url, &resolved_headers, http_client, may_connect).await;
     };
 
     // Headers set in config win: they are the more specific choice for this project.
@@ -477,6 +493,7 @@ async fn connect_http(
         url,
         &resolved_headers,
         HttpClient::Plain(http_client),
+        may_connect,
     )
     .await
     {
@@ -511,7 +528,11 @@ async fn serve_http(
     url: &Url,
     headers: &BTreeMap<String, String>,
     http_client: HttpClient,
+    may_connect: MayConnect<'_>,
 ) -> Result<RunningService<RoleClient, UpstreamClient>, ConnectError> {
+    if !may_connect() {
+        return Err(ConnectError::Withdrawn);
+    }
     let config = StreamableHttpClientTransportConfig::with_uri(url.as_str())
         .custom_headers(header_map(headers)?);
     match http_client {
@@ -542,6 +563,7 @@ async fn connect_stdio(
     env: &BTreeMap<String, String>,
     working_dir: Option<&Path>,
     client: UpstreamClient,
+    may_connect: MayConnect<'_>,
 ) -> Result<(RunningService<RoleClient, UpstreamClient>, StdioProcess), ConnectError> {
     let ServerTransport::Stdio { command, args, .. } = &server.transport else {
         return Err(ConnectError::Failed(anyhow::anyhow!(
@@ -553,6 +575,9 @@ async fn connect_stdio(
         .await
         .with_context(|| format!("resolving env for {}", server.display_name()))?;
 
+    if !may_connect() {
+        return Err(ConnectError::Withdrawn);
+    }
     let (process, pipes) = stdio::spawn(stdio::SpawnRequest {
         server_name: server.display_name(),
         command,
@@ -722,7 +747,7 @@ mod tests {
         let (url, target_hits) = redirecting_server().await;
         let headers = BTreeMap::from([("x-api-key".to_string(), "test-token".to_string())]);
         let http_client = HttpClient::Plain(http_client().unwrap());
-        let connected = serve_http(test_client(), &url, &headers, http_client).await;
+        let connected = serve_http(test_client(), &url, &headers, http_client, &|| true).await;
         assert!(connected.is_err());
         assert_eq!(target_hits.load(Ordering::SeqCst), 0);
     }

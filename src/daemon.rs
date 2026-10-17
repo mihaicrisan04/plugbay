@@ -141,6 +141,16 @@ where
 {
     tracing::info!(?hints, "session connected");
     let session = Session::new(shared, hints);
+    let served = serve_until_closed(session.clone(), transport).await;
+    session.end();
+    served
+}
+
+async fn serve_until_closed<T, E, A>(session: Arc<Session>, transport: T) -> anyhow::Result<()>
+where
+    T: rmcp::transport::IntoTransport<rmcp::RoleServer, E, A>,
+    E: std::error::Error + Send + Sync + 'static,
+{
     let service = session
         .serve(transport)
         .await

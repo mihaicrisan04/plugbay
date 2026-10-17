@@ -33,6 +33,7 @@ impl Session {
             return error_result(refusal);
         }
 
+        let _pin_change = self.pin_changes.lock().await;
         let pin = SessionPin::On {
             account: arguments.account.clone(),
         };
@@ -106,6 +107,7 @@ impl Session {
             Ok(arguments) => arguments,
             Err(message) => return error_result(message),
         };
+        let _pin_change = self.pin_changes.lock().await;
         let is_on = self
             .state
             .lock()
