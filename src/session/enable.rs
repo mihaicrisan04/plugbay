@@ -1,5 +1,7 @@
 //! `plugbay__enable` / `plugbay__disable`: servers an agent switches on or off for its session only.
 
+use std::collections::BTreeMap;
+
 use rmcp::model::{CallToolResult, JsonObject};
 
 use super::prompt::{ask_human, supports_forms};
@@ -13,6 +15,38 @@ use crate::registry;
 use crate::report::ServerState;
 
 impl Session {
+    /// The pins a moved session's `plugbay__enable` / `plugbay__disable` calls left on its last
+    /// daemon, applied before the first refresh. They are checked like the tools' arguments, and
+    /// only servers plugbay knows here are kept. An account switch the human approved there isn't
+    /// asked again: the hello comes over the owner-only socket, like every tool call.
+    pub fn restore_pins(&self, pins: BTreeMap<String, SessionPin>) {
+        if pins.is_empty() {
+            return;
+        }
+        let config =
+            match config::resolve_with_pins(&self.shared.paths, &self.location(), &BTreeMap::new())
+            {
+                Ok(config) => config,
+                Err(error) => {
+                    tracing::warn!(
+                        error = format!("{error:#}"),
+                        "dropped the moved session's pins: the config does not resolve"
+                    );
+                    return;
+                }
+            };
+        let known = servers_to_enable(&config);
+        let mut kept = self.pins.lock();
+        for (server, pin) in pins {
+            if is_restorable(&config, &known, &server, &pin) {
+                tracing::info!(server, ?pin, "restored a pin of the moved session");
+                kept.insert(server, pin);
+            } else {
+                tracing::warn!(server, "dropped a pin of the moved session: unknown server");
+            }
+        }
+    }
+
     /// Switches a catalog or registry server on for this session only, keeping the pin only if it works.
     pub(super) async fn enable(&self, arguments: Option<JsonObject>) -> CallToolResult {
         let arguments: EnableArguments = match parse_arguments(arguments) {
@@ -244,6 +278,22 @@ fn excluding_problem(config: &ResolvedConfig, server: &str) -> Option<String> {
             problem.servers.iter().any(|name| name == server) && !problem.is_unknown_server()
         })
         .map(|problem| problem.message.clone())
+}
+
+fn is_restorable(
+    config: &ResolvedConfig,
+    known: &[String],
+    server: &str,
+    pin: &SessionPin,
+) -> bool {
+    let account_is_valid = match pin {
+        SessionPin::On {
+            account: Some(account),
+        } => config::is_valid_name(account),
+        SessionPin::On { account: None } | SessionPin::Off => true,
+    };
+    let is_known = known.iter().any(|name| name == server) || !config.server(server).is_empty();
+    config::is_valid_name(server) && account_is_valid && is_known
 }
 
 /// Servers plugbay knows how to reach that are off here: the catalog, ones switched off, the registry.

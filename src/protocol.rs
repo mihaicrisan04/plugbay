@@ -2,6 +2,7 @@
 //! connection carries plain MCP JSON-RPC; after a `Control` hello the daemon writes one
 //! `ControlResponse` line and closes.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -10,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
+use crate::config::SessionPin;
 use crate::paths::Paths;
 use crate::project::ProjectHints;
 use crate::report::ServerState;
@@ -32,15 +34,32 @@ pub fn version() -> &'static str {
     VERSION
 }
 
-/// Whether `candidate` is a strictly newer plugbay than `current`. Versions that don't parse
-/// are never newer, so nothing unexpected can retire a daemon.
-pub fn is_newer(candidate: &str, current: &str) -> bool {
-    match (
-        semver::Version::parse(candidate),
-        semver::Version::parse(current),
-    ) {
-        (Ok(candidate), Ok(current)) => candidate > current,
-        _ => false,
+/// How a peer's plugbay version compares with this process's [`version()`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Skew {
+    Same,
+    PeerOlder,
+    PeerNewer,
+    /// Different, and at least one doesn't parse: never older or newer, so nothing unexpected
+    /// can retire a daemon.
+    Unknown,
+}
+
+pub fn skew(peer: &str) -> Skew {
+    compare(peer, version())
+}
+
+fn compare(peer: &str, ours: &str) -> Skew {
+    if peer == ours {
+        return Skew::Same;
+    }
+    match (semver::Version::parse(peer), semver::Version::parse(ours)) {
+        (Ok(peer), Ok(ours)) => match peer.cmp(&ours) {
+            std::cmp::Ordering::Less => Skew::PeerOlder,
+            std::cmp::Ordering::Equal => Skew::Same,
+            std::cmp::Ordering::Greater => Skew::PeerNewer,
+        },
+        _ => Skew::Unknown,
     }
 }
 
@@ -54,6 +73,10 @@ pub enum Hello {
         /// upgrades). Older shims and CLI sessions can't, so a daemon serving one never retires.
         #[serde(default)]
         reconnects: bool,
+        /// A moved session's `plugbay__enable` / `plugbay__disable` results on its last daemon,
+        /// for the new one to apply before its first refresh.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        pins: BTreeMap<String, SessionPin>,
     },
     Control {
         version: String,
@@ -86,9 +109,6 @@ pub enum ControlRequest {
     Retire,
 }
 
-/// The message of a daemon accepting `retire`.
-pub const RETIRING: &str = "retiring";
-
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ControlResponse {
     pub version: String,
@@ -100,6 +120,9 @@ pub struct ControlResponse {
     /// Whether the daemon knows `retire`; daemons that predate it don't.
     #[serde(default)]
     pub can_retire: bool,
+    /// Set when the daemon accepted `retire`: its socket is already gone.
+    #[serde(default)]
+    pub retiring: bool,
 }
 
 /// Sends one control request to a running daemon. Errors when none is listening.
@@ -280,17 +303,42 @@ mod tests {
     fn replies_from_older_daemons_cannot_retire() {
         let line = r#"{"version":"0.2.1","sessions":1,"message":"running"}"#;
         let response: ControlResponse = serde_json::from_str(line).unwrap();
-        assert!(!response.can_retire && response.pid.is_none());
+        assert!(!response.can_retire && !response.retiring && response.pid.is_none());
     }
 
     #[test]
-    fn only_a_strictly_newer_version_is_newer() {
-        assert!(is_newer("0.3.0", "0.2.1"));
-        assert!(is_newer("0.3.0", "0.3.0-rc.1"));
-        assert!(!is_newer("0.3.0", "0.3.0"));
-        assert!(!is_newer("0.2.1", "0.3.0"));
-        assert!(!is_newer("garbage", "0.1.0"));
-        assert!(!is_newer("0.3.0", "garbage"));
+    fn versions_compare_by_semver_and_unparseable_ones_are_unknown() {
+        assert_eq!(compare("0.3.0", "0.2.1"), Skew::PeerNewer);
+        assert_eq!(compare("0.3.0", "0.3.0-rc.1"), Skew::PeerNewer);
+        assert_eq!(compare("0.3.0", "0.3.0"), Skew::Same);
+        assert_eq!(compare("0.2.1", "0.3.0"), Skew::PeerOlder);
+        assert_eq!(compare("garbage", "0.1.0"), Skew::Unknown);
+        assert_eq!(compare("0.3.0", "garbage"), Skew::Unknown);
+        assert_eq!(compare("garbage", "garbage"), Skew::Same);
+    }
+
+    #[test]
+    fn session_pins_ride_the_hello_and_older_hellos_have_none() {
+        let hello = Hello::Session {
+            version: "0.3.0".to_string(),
+            hints: ProjectHints::default(),
+            reconnects: true,
+            pins: BTreeMap::from([
+                ("echo".to_string(), SessionPin::Off),
+                (
+                    "linear".to_string(),
+                    SessionPin::On {
+                        account: Some("work".to_string()),
+                    },
+                ),
+            ]),
+        };
+        let line = serde_json::to_string(&hello).unwrap();
+        let Hello::Session { pins, .. } = serde_json::from_str(&line).unwrap() else {
+            panic!("not a session hello");
+        };
+        assert_eq!(pins.len(), 2, "{line}");
+        assert_eq!(pins["echo"], SessionPin::Off);
     }
 
     #[test]

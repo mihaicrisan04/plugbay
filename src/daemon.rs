@@ -1,5 +1,6 @@
 //! The long-running process every shim talks to over a unix socket.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -15,12 +16,13 @@ use tokio::io::{
 use tokio::net::unix::OwnedReadHalf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use tokio::sync::{Notify, watch};
+use tokio::sync::{mpsc, oneshot};
+use tokio_util::task::TaskTracker;
 
-use crate::config::ServerIdentity;
+use crate::config::{ServerIdentity, SessionPin};
 use crate::paths::Paths;
 use crate::project::ProjectHints;
-use crate::protocol::{self, ControlRequest, ControlResponse, Hello, write_line};
+use crate::protocol::{self, ControlRequest, ControlResponse, Hello, Skew, write_line};
 use crate::session::{Session, Shared};
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -51,28 +53,37 @@ pub async fn run(paths: &Paths, idle_timeout: Duration) -> anyhow::Result<()> {
     let listener = bind_socket(paths)?;
     tracing::info!(socket = %paths.socket().display(), version = protocol::version(), "daemon listening");
 
-    let shared = Shared::new(paths.clone());
-    let activity = Arc::new(Activity::new());
-    let stop = Arc::new(Stop::new());
-    spawn_upstream_reaper(&shared);
+    let (stop, mut stop_requests) = Stop::new();
+    let daemon = Daemon {
+        shared: Shared::new(paths.clone()),
+        activity: Arc::new(Activity::new()),
+        stop,
+        control_answers: TaskTracker::new(),
+    };
+    spawn_upstream_reaper(&daemon.shared);
 
+    let mut waiting_for_socket_removal = Vec::new();
     let mut idle_check = tokio::time::interval(IDLE_CHECK_INTERVAL);
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
-                    tokio::spawn(handle_connection(stream, shared.clone(), activity.clone(), stop.clone()));
+                    let greeting = daemon.activity.greeting();
+                    tokio::spawn(handle_connection(stream, daemon.clone(), greeting));
                 }
                 Err(error) => tracing::warn!(%error, "accept failed"),
             },
             _ = idle_check.tick() => {
-                if activity.idle_for() >= Some(idle_timeout) {
+                if daemon.activity.idle_for() >= Some(idle_timeout) {
                     tracing::info!("no sessions for {}s, exiting", idle_timeout.as_secs());
                     break;
                 }
             }
-            _ = stop.requested() => break,
+            Some(asker) = stop_requests.recv() => {
+                waiting_for_socket_removal.push(asker);
+                break;
+            }
             _ = tokio::signal::ctrl_c() => break,
             _ = terminate.recv() => break,
         }
@@ -85,8 +96,16 @@ pub async fn run(paths: &Paths, idle_timeout: Duration) -> anyhow::Result<()> {
         tracing::debug!(%error, "could not remove the socket");
     }
     drop(lock);
-    stop.socket_removed();
-    if tokio::time::timeout(SHUTDOWN_TIMEOUT, shared.pool.shutdown())
+    stop_requests.close();
+    while let Ok(asker) = stop_requests.try_recv() {
+        waiting_for_socket_removal.push(asker);
+    }
+    for asker in waiting_for_socket_removal {
+        if asker.send(()).is_err() {
+            tracing::debug!("a stop request stopped waiting before the socket went");
+        }
+    }
+    if tokio::time::timeout(SHUTDOWN_TIMEOUT, daemon.shared.pool.shutdown())
         .await
         .is_err()
     {
@@ -95,23 +114,35 @@ pub async fn run(paths: &Paths, idle_timeout: Duration) -> anyhow::Result<()> {
             SHUTDOWN_TIMEOUT.as_secs()
         );
     }
-    stop.wait_for_answers().await;
+    daemon.control_answers.close();
+    if tokio::time::timeout(ANSWER_WAIT, daemon.control_answers.wait())
+        .await
+        .is_err()
+    {
+        tracing::debug!("exiting before every control answer was written");
+    }
     Ok(())
+}
+
+/// What every connection handler shares.
+#[derive(Clone)]
+struct Daemon {
+    shared: Arc<Shared>,
+    activity: Arc<Activity>,
+    stop: Stop,
+    /// Control answers still being written; the daemon waits for them before it exits.
+    control_answers: TaskTracker,
 }
 
 /// Serves one session over stdio inside the shim, for when no daemon can be started.
 pub async fn serve_in_process(paths: &Paths, hints: ProjectHints) -> anyhow::Result<()> {
     let shared = Shared::new(paths.clone());
     spawn_upstream_reaper(&shared);
-    serve_session(shared, hints, tokio::io::stdin(), tokio::io::stdout()).await
+    let pins = BTreeMap::new();
+    serve_session(shared, hints, pins, tokio::io::stdin(), tokio::io::stdout()).await
 }
 
-async fn handle_connection(
-    stream: UnixStream,
-    shared: Arc<Shared>,
-    activity: Arc<Activity>,
-    stop: Arc<Stop>,
-) {
+async fn handle_connection(stream: UnixStream, daemon: Daemon, greeting: Greeting) {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     let hello = match tokio::time::timeout(HELLO_TIMEOUT, read_hello(&mut reader)).await {
@@ -131,21 +162,31 @@ async fn handle_connection(
             version,
             hints,
             reconnects,
+            pins,
         } => {
             warn_on_version_mismatch(&version);
-            activity.session_started(reconnects);
-            if let Err(error) = serve_session(shared, hints, reader, write_half).await {
+            let admitted = daemon.activity.admit_session(reconnects);
+            drop(greeting);
+            if !admitted {
+                tracing::info!("refused a session: this daemon is exiting");
+                return;
+            }
+            let served = serve_session(daemon.shared, hints, pins, reader, write_half).await;
+            if let Err(error) = served {
                 tracing::warn!(error = format!("{error:#}"), "session ended with an error");
             }
-            activity.session_ended(reconnects);
+            daemon.activity.session_ended(reconnects);
         }
         Hello::Control { version, request } => {
             warn_on_version_mismatch(&version);
-            let _answering = stop.answering();
-            let response = handle_control(request, &version, &shared, &activity, &stop).await;
-            if let Err(error) = write_line(&mut write_half, &response).await {
-                tracing::debug!(error = format!("{error:#}"), "control client left early");
-            }
+            drop(greeting);
+            let answering = daemon.control_answers.clone();
+            answering.spawn(async move {
+                let response = handle_control(request, &version, &daemon).await;
+                if let Err(error) = write_line(&mut write_half, &response).await {
+                    tracing::debug!(error = format!("{error:#}"), "control client left early");
+                }
+            });
         }
     }
 }
@@ -153,6 +194,7 @@ async fn handle_connection(
 async fn serve_session<R, W>(
     shared: Arc<Shared>,
     hints: ProjectHints,
+    pins: BTreeMap<String, SessionPin>,
     from_client: R,
     to_client: W,
 ) -> anyhow::Result<()>
@@ -162,6 +204,7 @@ where
 {
     tracing::info!(?hints, "session connected");
     let session = Session::new(shared, hints);
+    session.restore_pins(pins);
     let (to_rmcp, relay) = tokio::io::simplex(RELAY_BUFFER_BYTES);
     let hangup_watch = tokio::spawn(relay_until_hangup(from_client, relay, session.clone()));
     let served = serve_until_closed(session.clone(), (to_rmcp, to_client)).await;
@@ -246,10 +289,15 @@ where
 async fn handle_control(
     request: ControlRequest,
     client_version: &str,
-    shared: &Arc<Shared>,
-    activity: &Activity,
-    stop: &Stop,
+    daemon: &Daemon,
 ) -> ControlResponse {
+    let Daemon {
+        shared,
+        activity,
+        stop,
+        ..
+    } = daemon;
+    let mut retiring = false;
     let message = match request {
         ControlRequest::Status => format!(
             "running, {} upstream connection(s)",
@@ -274,10 +322,17 @@ async fn handle_control(
         ControlRequest::ReconnectAll => reconnect(shared, None).await,
         ControlRequest::Stop => {
             tracing::info!("stop requested");
+            activity.stop_admitting();
             stop.request_and_wait().await;
             "stopping".to_string()
         }
-        ControlRequest::Retire => retire(client_version, activity, stop).await,
+        ControlRequest::Retire => match retire(client_version, activity, stop).await {
+            Ok(()) => {
+                retiring = true;
+                "retiring".to_string()
+            }
+            Err(refusal) => refusal,
+        },
     };
     ControlResponse {
         version: protocol::version().to_string(),
@@ -285,33 +340,36 @@ async fn handle_control(
         message,
         pid: Some(std::process::id()),
         can_retire: true,
+        retiring,
     }
 }
 
 /// Exits so a newer plugbay's daemon takes over, once no client would be left without one.
-async fn retire(client_version: &str, activity: &Activity, stop: &Stop) -> String {
-    let ours = protocol::version();
-    if !protocol::is_newer(client_version, ours) {
+/// Err is the refusal.
+async fn retire(client_version: &str, activity: &Activity, stop: &Stop) -> Result<(), String> {
+    if protocol::skew(client_version) != Skew::PeerNewer {
         tracing::warn!(
             client_version,
             "refused to retire for a plugbay that isn't newer"
         );
-        return format!("not retiring: {client_version} is not newer than {ours}");
+        return Err(format!(
+            "not retiring: {client_version} is not newer than {}",
+            protocol::version()
+        ));
     }
-    let stuck = activity.sessions_that_cannot_reconnect();
-    if stuck > 0 {
+    if let Err(stuck) = activity.stop_admitting_unless_stuck() {
         tracing::info!(
             client_version,
             stuck,
-            "not retiring: some sessions can't reconnect"
+            "not retiring: some connections can't reconnect"
         );
-        return format!(
-            "not retiring: {stuck} session(s) from an older plugbay or the CLI can't reconnect"
-        );
+        return Err(format!(
+            "not retiring: {stuck} connection(s) from an older plugbay or the CLI, or still greeting, can't reconnect"
+        ));
     }
     tracing::info!(client_version, "retiring for a newer plugbay");
     stop.request_and_wait().await;
-    protocol::RETIRING.to_string()
+    Ok(())
 }
 
 struct ServerAccount {
@@ -366,7 +424,7 @@ async fn read_hello(reader: &mut BufReader<OwnedReadHalf>) -> anyhow::Result<Hel
 }
 
 fn warn_on_version_mismatch(client_version: &str) {
-    if client_version != protocol::version() {
+    if protocol::skew(client_version) != Skew::Same {
         tracing::warn!(
             client_version,
             daemon_version = protocol::version(),
@@ -416,58 +474,26 @@ fn bind_socket(paths: &Paths) -> anyhow::Result<UnixListener> {
 }
 
 /// Asks the accept loop to end, and lets the asker wait until the socket is gone, so a client
-/// that hears the answer can never reach this daemon again. The daemon waits for that answer
-/// (any control answer) to be written before it exits.
+/// that hears the answer can never reach this daemon again.
+#[derive(Clone)]
 struct Stop {
-    requested: Notify,
-    socket_removed: watch::Sender<bool>,
-    answers_in_progress: watch::Sender<usize>,
-}
-
-/// Held while a control request is answered.
-struct Answering<'a>(&'a Stop);
-
-impl Drop for Answering<'_> {
-    fn drop(&mut self) {
-        self.0.answers_in_progress.send_modify(|count| *count -= 1);
-    }
+    requests: mpsc::UnboundedSender<oneshot::Sender<()>>,
 }
 
 impl Stop {
-    fn new() -> Self {
-        Self {
-            requested: Notify::new(),
-            socket_removed: watch::Sender::new(false),
-            answers_in_progress: watch::Sender::new(0),
-        }
-    }
-
-    fn answering(&self) -> Answering<'_> {
-        self.answers_in_progress.send_modify(|count| *count += 1);
-        Answering(self)
-    }
-
-    async fn wait_for_answers(&self) {
-        let mut answers = self.answers_in_progress.subscribe();
-        let wait = answers.wait_for(|count| *count == 0);
-        if tokio::time::timeout(ANSWER_WAIT, wait).await.is_err() {
-            tracing::debug!("exiting before every control answer was written");
-        }
-    }
-
-    async fn requested(&self) {
-        self.requested.notified().await;
-    }
-
-    fn socket_removed(&self) {
-        self.socket_removed.send_replace(true);
+    fn new() -> (Self, mpsc::UnboundedReceiver<oneshot::Sender<()>>) {
+        let (requests, received) = mpsc::unbounded_channel();
+        (Self { requests }, received)
     }
 
     async fn request_and_wait(&self) {
-        let mut removed = self.socket_removed.subscribe();
-        self.requested.notify_one();
-        let wait = removed.wait_for(|removed| *removed);
-        if tokio::time::timeout(SOCKET_REMOVAL_WAIT, wait)
+        let (removed, socket_gone) = oneshot::channel();
+        if self.requests.send(removed).is_err() {
+            tracing::debug!("the daemon is already exiting");
+            return;
+        }
+        // A dropped sender means the daemon got past removing the socket too.
+        if tokio::time::timeout(SOCKET_REMOVAL_WAIT, socket_gone)
             .await
             .is_err()
         {
@@ -476,7 +502,8 @@ impl Stop {
     }
 }
 
-/// Counts live sessions and remembers when the daemon last became idle.
+/// Counts live sessions and remembers when the daemon last became idle. Admitting a session and
+/// deciding to retire take the same lock, so no session slips onto a daemon that is leaving.
 struct Activity {
     state: Mutex<ActivityState>,
 }
@@ -485,7 +512,21 @@ struct ActivityState {
     active_sessions: usize,
     /// Sessions whose client can't find a new daemon on its own.
     stuck_sessions: usize,
+    /// Connections that haven't sent their hello yet (at most 5 s each); they may be stuck sessions.
+    greeting: usize,
+    /// False once the daemon decided to exit: later session hellos are refused.
+    admitting: bool,
     idle_since: Option<Instant>,
+}
+
+/// A connection that hasn't said hello yet, counted until it is dropped.
+struct Greeting(Arc<Activity>);
+
+impl Drop for Greeting {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock();
+        state.greeting = state.greeting.saturating_sub(1);
+    }
 }
 
 impl Activity {
@@ -494,18 +535,30 @@ impl Activity {
             state: Mutex::new(ActivityState {
                 active_sessions: 0,
                 stuck_sessions: 0,
+                greeting: 0,
+                admitting: true,
                 idle_since: Some(Instant::now()),
             }),
         }
     }
 
-    fn session_started(&self, reconnects: bool) {
+    fn greeting(self: &Arc<Self>) -> Greeting {
+        self.state.lock().greeting += 1;
+        Greeting(self.clone())
+    }
+
+    /// False when the daemon is exiting; the client then finds the next one.
+    fn admit_session(&self, reconnects: bool) -> bool {
         let mut state = self.state.lock();
+        if !state.admitting {
+            return false;
+        }
         state.active_sessions += 1;
         if !reconnects {
             state.stuck_sessions += 1;
         }
         state.idle_since = None;
+        true
     }
 
     fn session_ended(&self, reconnects: bool) {
@@ -519,15 +572,62 @@ impl Activity {
         }
     }
 
+    fn stop_admitting(&self) {
+        self.state.lock().admitting = false;
+    }
+
+    /// Stops admitting sessions unless a connection might be one that can't reconnect; Err
+    /// counts those.
+    fn stop_admitting_unless_stuck(&self) -> Result<(), usize> {
+        let mut state = self.state.lock();
+        let stuck = state.stuck_sessions + state.greeting;
+        if stuck > 0 {
+            return Err(stuck);
+        }
+        state.admitting = false;
+        Ok(())
+    }
+
     fn active_sessions(&self) -> usize {
         self.state.lock().active_sessions
     }
 
-    fn sessions_that_cannot_reconnect(&self) -> usize {
-        self.state.lock().stuck_sessions
-    }
-
     fn idle_for(&self) -> Option<Duration> {
         self.state.lock().idle_since.map(|since| since.elapsed())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_connection_still_greeting_keeps_the_daemon_from_retiring() {
+        let activity = Arc::new(Activity::new());
+        let greeting = activity.greeting();
+        assert_eq!(activity.stop_admitting_unless_stuck(), Err(1));
+        drop(greeting);
+        assert_eq!(activity.stop_admitting_unless_stuck(), Ok(()));
+    }
+
+    #[test]
+    fn a_retiring_daemon_admits_no_session() {
+        let activity = Arc::new(Activity::new());
+        assert!(activity.admit_session(true));
+        assert_eq!(activity.stop_admitting_unless_stuck(), Ok(()));
+        assert!(
+            !activity.admit_session(true),
+            "admitted after deciding to retire"
+        );
+        assert_eq!(activity.active_sessions(), 1);
+    }
+
+    #[test]
+    fn sessions_that_cannot_reconnect_keep_the_daemon_from_retiring() {
+        let activity = Arc::new(Activity::new());
+        assert!(activity.admit_session(false));
+        assert_eq!(activity.stop_admitting_unless_stuck(), Err(1));
+        activity.session_ended(false);
+        assert_eq!(activity.stop_admitting_unless_stuck(), Ok(()));
     }
 }

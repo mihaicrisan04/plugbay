@@ -7,7 +7,7 @@ use std::time::Duration;
 use crate::clients::{self, Client, NativeServer, SetupState, ShimCommand};
 use crate::config::{ResolvedConfig, ResolvedServer, ServerTransport};
 use crate::paths::Paths;
-use crate::protocol::{self, ControlRequest};
+use crate::protocol::{self, ControlRequest, Skew};
 use crate::report::{self, Audience, LoginState, Report, ServerReport, ServerState, TrustState};
 
 const DAEMON_TIMEOUT: Duration = Duration::from_secs(2);
@@ -111,7 +111,11 @@ pub async fn run(paths: &Paths, project: Option<PathBuf>) -> anyhow::Result<()> 
 
 fn check_binary() -> Check {
     match ShimCommand::current() {
-        Ok(shim) => Check::ok(format!("plugbay {} at {}", protocol::VERSION, shim.command)),
+        Ok(shim) => Check::ok(format!(
+            "plugbay {} at {}",
+            protocol::version(),
+            shim.command
+        )),
         Err(error) => Check::error(
             format!("cannot locate the plugbay binary: {error:#}"),
             "reinstall plugbay",
@@ -169,31 +173,32 @@ async fn check_daemon(paths: &Paths) -> Check {
         }
     };
 
-    let ours = protocol::VERSION;
     let problem = format!(
-        "daemon runs version {}, this binary is {ours}",
-        response.version
+        "daemon runs version {}, this binary is {}",
+        response.version,
+        protocol::version()
     );
-    if response.version == ours {
-        Check::ok(format!(
+    match protocol::skew(&response.version) {
+        Skew::Same => Check::ok(format!(
             "daemon {} running, {} session(s)",
             response.version, response.sessions
-        ))
-    } else if !protocol::is_newer(ours, &response.version) {
-        Check::warn(
+        )),
+        Skew::PeerNewer => Check::warn(
             problem,
             "an older plugbay may come first on PATH: check `which -a plugbay`",
-        )
-    } else if response.can_retire {
-        Check::warn(
+        ),
+        Skew::PeerOlder if response.can_retire => Check::warn(
             problem,
             "fixes itself: the next agent that connects moves every agent to the new daemon (`plugbay stop` does it now)",
-        )
-    } else {
-        Check::warn(
+        ),
+        Skew::PeerOlder => Check::warn(
             problem,
             "run `plugbay stop`; agents started before the upgrade then need a restart",
-        )
+        ),
+        Skew::Unknown => Check::warn(
+            problem,
+            "the versions can't be compared, so neither replaces the other: run `plugbay stop` to start this version's daemon",
+        ),
     }
 }
 

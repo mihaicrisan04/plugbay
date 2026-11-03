@@ -3,6 +3,7 @@
 
 mod live;
 mod upgrades;
+mod waiting;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,7 +20,9 @@ use rmcp::transport::TokioChildProcess;
 use rmcp::{ClientHandler, RoleClient, ServiceExt};
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
+
+use self::waiting::*;
 
 /// A client whose human answers every plugbay prompt with the same choice, e.g. `allow_once`.
 #[derive(Clone)]
@@ -76,17 +79,6 @@ impl ClientHandler for AnsweringClient {
             .with_content(serde_json::json!({ "decision": answer })))
     }
 
-    async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
-        self.changed.notify_one();
-    }
-}
-
-/// A client that records `tools/list_changed` notifications.
-struct ChangeWatcher {
-    changed: Arc<Notify>,
-}
-
-impl ClientHandler for ChangeWatcher {
     async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
         self.changed.notify_one();
     }
@@ -171,18 +163,12 @@ env = {{ ECHO_ACCOUNT = "client-b" }}
         ().serve(self.transport(project)).await.unwrap()
     }
 
-    async fn connect_watching(
-        &self,
-        project: &str,
-    ) -> (RunningService<RoleClient, ChangeWatcher>, Arc<Notify>) {
-        let changed = Arc::new(Notify::new());
-        let watcher = ChangeWatcher {
-            changed: changed.clone(),
-        };
-        (
-            watcher.serve(self.transport(project)).await.unwrap(),
-            changed,
-        )
+    async fn connect_watching(&self, project: &str) -> (WatchingClient, watch::Receiver<usize>) {
+        watch_changes(self.shim_command(project)).await
+    }
+
+    fn socket(&self) -> PathBuf {
+        self.plugbay_home.join("state/daemon.sock")
     }
 
     fn transport(&self, project: &str) -> TokioChildProcess {
@@ -298,32 +284,6 @@ fn local_echo_config(extra_args: &str) -> String {
         "[servers]\nlocal = {{ command = \"{}\", args = [{extra_args}] }}\n",
         echo_server_binary().display()
     )
-}
-
-/// Polls the tool list until `tool` shows up, failing with the daemon log after 10 s.
-async fn wait_for_tool<H: ClientHandler>(
-    sandbox: &Sandbox,
-    client: &RunningService<RoleClient, H>,
-    tool: &str,
-) {
-    wait_for_tool_within(sandbox, client, tool, Duration::from_secs(10)).await;
-}
-
-async fn wait_for_tool_within<H: ClientHandler>(
-    sandbox: &Sandbox,
-    client: &RunningService<RoleClient, H>,
-    tool: &str,
-    timeout: Duration,
-) {
-    let deadline = tokio::time::Instant::now() + timeout;
-    while !tool_names(client).await.contains(&tool.to_string()) {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "{tool} never appeared; daemon log:\n{}",
-            sandbox.daemon_log()
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
 }
 
 /// Builds the fake upstream once per test run: `cargo test --test end_to_end` alone doesn't
@@ -467,7 +427,7 @@ async fn status_tool_and_ls_explain_the_resolution() {
 #[tokio::test]
 async fn editing_config_updates_tools_live() {
     let sandbox = Sandbox::new();
-    let (client, changed) = sandbox.connect_watching("client-b").await;
+    let (client, mut changed) = sandbox.connect_watching("client-b").await;
     assert!(
         tool_names(&client)
             .await
@@ -478,9 +438,11 @@ async fn editing_config_updates_tools_live() {
         &sandbox.projects.join("client-b"),
         "[servers]\necho = false\n",
     );
-    tokio::time::timeout(Duration::from_secs(10), changed.notified())
-        .await
-        .expect("plugbay should send tools/list_changed after a config edit");
+    wait_for_change(
+        &mut changed,
+        "plugbay should send tools/list_changed after a config edit",
+    )
+    .await;
     assert_eq!(tool_names(&client).await, ["plugbay__status"]);
 
     client.cancel().await.unwrap();
@@ -688,7 +650,7 @@ async fn stopping_the_daemon_stops_its_upstreams() {
 #[tokio::test]
 async fn editing_a_tool_filter_notifies_the_client() {
     let sandbox = Sandbox::new();
-    let (client, changed) = sandbox.connect_watching("client-b").await;
+    let (client, mut changed) = sandbox.connect_watching("client-b").await;
     assert!(
         tool_names(&client)
             .await
@@ -699,9 +661,7 @@ async fn editing_a_tool_filter_notifies_the_client() {
         &sandbox.projects.join("client-b"),
         "[servers]\necho = { account = \"client-b\", exclude_tools = [\"delete_*\"] }\n",
     );
-    tokio::time::timeout(Duration::from_secs(10), changed.notified())
-        .await
-        .expect("a filter edit should send tools/list_changed");
+    wait_for_change(&mut changed, "a filter edit should send tools/list_changed").await;
     assert!(
         !tool_names(&client)
             .await
@@ -722,7 +682,7 @@ async fn losing_trust_turns_off_a_connected_stdio_server() {
         sandbox.projects.display()
     ));
 
-    let (client, changed) = sandbox.connect_watching("revoked").await;
+    let (client, mut changed) = sandbox.connect_watching("revoked").await;
     assert!(
         tool_names(&client)
             .await
@@ -734,9 +694,11 @@ async fn losing_trust_turns_off_a_connected_stdio_server() {
         global_without_trust,
     )
     .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), changed.notified())
-        .await
-        .expect("dropping trust should send tools/list_changed");
+    wait_for_change(
+        &mut changed,
+        "dropping trust should send tools/list_changed",
+    )
+    .await;
     assert_eq!(tool_names(&client).await, ["plugbay__status"]);
     client.cancel().await.unwrap();
 }
@@ -756,16 +718,18 @@ async fn fixing_a_broken_config_restores_the_session() {
         &sandbox.projects.join("client-b"),
         "[servers\necho = \"client-b\"\n",
     );
-    let (client, changed) = sandbox.connect_watching("client-b").await;
+    let (client, mut changed) = sandbox.connect_watching("client-b").await;
     assert_eq!(tool_names(&client).await, ["plugbay__status"]);
 
     write_project(
         &sandbox.projects.join("client-b"),
         "[servers]\necho = \"client-b\"\n",
     );
-    tokio::time::timeout(Duration::from_secs(10), changed.notified())
-        .await
-        .expect("fixing the file should send tools/list_changed");
+    wait_for_change(
+        &mut changed,
+        "fixing the file should send tools/list_changed",
+    )
+    .await;
     assert!(
         tool_names(&client)
             .await
@@ -825,7 +789,7 @@ async fn an_oversized_message_fails_that_call_without_taking_down_the_daemon() {
 async fn agent_enables_a_catalog_server_for_its_session_only() {
     let sandbox = Sandbox::new();
     write_project(&sandbox.projects.join("fresh"), "");
-    let (client, changed) = sandbox.connect_watching("fresh").await;
+    let (client, mut changed) = sandbox.connect_watching("fresh").await;
     assert_eq!(tool_names(&client).await, ["plugbay__status"]);
 
     let enabled = call_with(
@@ -835,9 +799,11 @@ async fn agent_enables_a_catalog_server_for_its_session_only() {
     )
     .await;
     assert!(enabled.contains("echo:client-a is on"), "{enabled}");
-    tokio::time::timeout(Duration::from_secs(10), changed.notified())
-        .await
-        .expect("enabling a server should send tools/list_changed");
+    wait_for_change(
+        &mut changed,
+        "enabling a server should send tools/list_changed",
+    )
+    .await;
     assert!(
         tool_names(&client)
             .await
@@ -1300,7 +1266,7 @@ async fn a_slow_upstream_does_not_hold_up_the_others() {
         "\n[servers.slow]\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"sleep 4; exec {}\"]\n",
         echo_server_binary().display()
     ));
-    let (client, changed) = sandbox.connect_watching("client-b").await;
+    let (client, mut changed) = sandbox.connect_watching("client-b").await;
 
     let tools = tool_names(&client).await;
     assert!(tools.contains(&"echo__whoami".to_string()), "{tools:?}");
@@ -1317,9 +1283,11 @@ async fn a_slow_upstream_does_not_hold_up_the_others() {
         "status and calls to connected servers must not wait for the slow one"
     );
 
-    tokio::time::timeout(Duration::from_secs(20), changed.notified())
-        .await
-        .expect("the slow server's arrival should send tools/list_changed");
+    wait_for_change(
+        &mut changed,
+        "the slow server's arrival should send tools/list_changed",
+    )
+    .await;
     wait_for_tool(&sandbox, &client, "slow__whoami").await;
     client.cancel().await.unwrap();
 }
@@ -1423,19 +1391,6 @@ async fn leave_during_initialize(padding: usize) {
     );
 }
 
-async fn wait_for_file(sandbox: &Sandbox, path: &Path) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while !path.exists() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "{} never appeared; daemon log:\n{}",
-            path.display(),
-            sandbox.daemon_log()
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
 /// A project server whose env waits on the fake `fnox` (3 s) and that creates `marker` if it
 /// ever starts.
 fn slow_secret_config(marker: &Path) -> String {
@@ -1444,26 +1399,6 @@ fn slow_secret_config(marker: &Path) -> String {
         marker = marker.display(),
         echo = echo_server_binary().display()
     )
-}
-
-async fn wait_for_status<H: ClientHandler>(
-    sandbox: &Sandbox,
-    client: &RunningService<RoleClient, H>,
-    needle: &str,
-) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let status = call_text(client, "plugbay__status").await;
-        if status.contains(needle) {
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "status never said {needle}: {status}\ndaemon log:\n{}",
-            sandbox.daemon_log()
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

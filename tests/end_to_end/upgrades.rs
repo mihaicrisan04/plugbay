@@ -6,41 +6,20 @@ use super::*;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::UnixStream;
-use tokio::sync::watch;
 
 const OLD_VERSION: &str = "0.0.1";
 const MOVE_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// A client that counts `tools/list_changed` notifications.
-struct CountingWatcher {
-    changes: watch::Sender<usize>,
-}
-
-impl ClientHandler for CountingWatcher {
-    async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
-        self.changes.send_modify(|count| *count += 1);
-    }
-}
-
-type CountingClient = RunningService<RoleClient, CountingWatcher>;
-
 impl Sandbox {
-    /// An agent session whose shim reports `version` (the real one when `None`).
-    async fn connect_counting(
+    /// An agent session whose shim reports `version`, as one started before an upgrade.
+    async fn connect_reporting(
         &self,
         project: &str,
-        version: Option<&str>,
-    ) -> (CountingClient, watch::Receiver<usize>) {
+        version: &str,
+    ) -> (WatchingClient, watch::Receiver<usize>) {
         let mut command = self.shim_command(project);
-        if let Some(version) = version {
-            command.env("PLUGBAY_TEST_VERSION", version);
-        }
-        let (changes, seen) = watch::channel(0);
-        let client = CountingWatcher { changes }
-            .serve(TokioChildProcess::new(command).unwrap())
-            .await
-            .unwrap();
-        (client, seen)
+        command.env("PLUGBAY_TEST_VERSION", version);
+        watch_changes(command).await
     }
 
     /// A daemon started by hand that reports `version`, as one left over from before an upgrade.
@@ -56,80 +35,61 @@ impl Sandbox {
 
     /// One raw control exchange, as a plugbay of `version` sends it.
     async fn control(&self, version: &str, request: &str) -> Value {
-        let mut stream = UnixStream::connect(self.plugbay_home.join("state/daemon.sock"))
-            .await
-            .unwrap();
-        let hello = json!({ "kind": "control", "version": version, "request": request });
-        stream
-            .write_all(format!("{hello}\n").as_bytes())
-            .await
-            .unwrap();
-        let mut line = String::new();
-        BufReader::new(stream).read_line(&mut line).await.unwrap();
-        serde_json::from_str(&line).unwrap()
+        let stream = UnixStream::connect(self.socket()).await.unwrap();
+        control_on(stream, version, request).await
     }
 
     async fn status(&self) -> Value {
         self.control(env!("CARGO_PKG_VERSION"), "status").await
     }
 
-    /// Polls the daemon's status until `ready` holds for it.
+    /// Polls the daemon's status until `ready` holds for it. A connection that never says hello
+    /// would hold off retiring, so each poll's connection carries the status request.
     async fn wait_for_daemon(&self, what: &str, ready: impl Fn(&Value) -> bool) -> Value {
-        let deadline = tokio::time::Instant::now() + MOVE_TIMEOUT;
-        loop {
-            let status =
-                match UnixStream::connect(self.plugbay_home.join("state/daemon.sock")).await {
-                    Ok(_) => self.status().await,
-                    Err(_) => Value::Null,
-                };
+        poll_until(self, MOVE_TIMEOUT, async || {
+            let status = match UnixStream::connect(self.socket()).await {
+                Ok(stream) => control_on(stream, env!("CARGO_PKG_VERSION"), "status").await,
+                Err(_) => Value::Null,
+            };
             if ready(&status) {
-                return status;
+                Ok(status)
+            } else {
+                Err(format!("never saw {what} (last status: {status})"))
             }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "never saw {what} (last status: {status}); daemon log:\n{}",
-                self.daemon_log()
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        })
+        .await
     }
 }
 
-async fn wait_for_list_change(
-    sandbox: &Sandbox,
-    changes: &mut watch::Receiver<usize>,
-    seen: usize,
-) {
-    let moved = tokio::time::timeout(MOVE_TIMEOUT, changes.wait_for(|count| *count > seen)).await;
-    assert!(
-        moved.is_ok(),
-        "the session never announced its new daemon; daemon log:\n{}",
-        sandbox.daemon_log()
-    );
+async fn control_on(mut stream: UnixStream, version: &str, request: &str) -> Value {
+    let hello = json!({ "kind": "control", "version": version, "request": request });
+    stream
+        .write_all(format!("{hello}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).await.unwrap();
+    serde_json::from_str(&line).unwrap()
 }
 
 async fn wait_for_exit(sandbox: &Sandbox, daemon: &mut std::process::Child) {
-    let deadline = tokio::time::Instant::now() + MOVE_TIMEOUT;
-    while daemon.try_wait().unwrap().is_none() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the old daemon never exited; daemon log:\n{}",
-            sandbox.daemon_log()
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    poll_until(sandbox, MOVE_TIMEOUT, async || match daemon.try_wait() {
+        Ok(Some(_)) => Ok(()),
+        _ => Err("the old daemon never exited".to_string()),
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn stopping_the_daemon_moves_open_sessions_to_a_new_one() {
     let sandbox = Sandbox::new();
-    let (client, mut changes) = sandbox.connect_counting("client-b", None).await;
+    let (client, mut changes) = sandbox.connect_watching("client-b").await;
     let before = call_text(&client, "echo__whoami").await;
     let old_pid = sandbox.status().await["pid"].clone();
 
-    let seen = *changes.borrow();
+    changes.borrow_and_update();
     sandbox.plugbay(&["stop"], "client-b");
-    wait_for_list_change(&sandbox, &mut changes, seen).await;
+    wait_for_change(&mut changes, "the session never announced its new daemon").await;
 
     assert!(
         tool_names(&client)
@@ -148,23 +108,24 @@ async fn stopping_the_daemon_moves_open_sessions_to_a_new_one() {
 #[tokio::test]
 async fn a_request_in_flight_when_the_daemon_dies_fails_and_the_next_succeeds() {
     let sandbox = Sandbox::new();
-    let (client, mut changes) = sandbox.connect_counting("client-b", None).await;
+    let (client, mut changes) = sandbox.connect_watching("client-b").await;
     call_text(&client, "echo__whoami").await;
     let pid = sandbox.status().await["pid"].to_string();
 
-    let seen = *changes.borrow();
+    changes.borrow_and_update();
+    let started = sandbox.plugbay_home.join("slow-call-started");
     let slow_call = tokio::spawn({
         let peer = client.peer().clone();
+        let arguments = json!({ "text": "slow", "delay_ms": 30_000, "started": started })
+            .as_object()
+            .cloned()
+            .unwrap();
         async move {
-            let arguments = json!({ "text": "slow", "delay_ms": 30_000 });
-            let Value::Object(arguments) = arguments else {
-                unreachable!()
-            };
             peer.call_tool(CallToolRequestParams::new("echo__echo").with_arguments(arguments))
                 .await
         }
     });
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_for_file(&sandbox, &started).await;
     let killed = std::process::Command::new("kill")
         .args(["-9", &pid])
         .status()
@@ -181,9 +142,28 @@ async fn a_request_in_flight_when_the_daemon_dies_fails_and_the_next_succeeds() 
     );
     assert!(error.contains("plugbay restarted"), "{error}");
 
-    wait_for_list_change(&sandbox, &mut changes, seen).await;
+    wait_for_change(&mut changes, "the session never announced its new daemon").await;
     let echoed = call_with(&client, "echo__echo", json!({ "text": "again" })).await;
     assert_eq!(echoed, "again");
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_moved_session_keeps_the_servers_its_agent_switched_off() {
+    let sandbox = Sandbox::new();
+    let (client, mut changes) = sandbox.connect_watching("client-b").await;
+    call_text(&client, "echo__whoami").await;
+    let disabled = call_with(&client, "plugbay__disable", json!({ "server": "echo" })).await;
+    assert!(disabled.contains("echo is off"), "{disabled}");
+    assert_eq!(tool_names(&client).await, ["plugbay__status"]);
+
+    changes.borrow_and_update();
+    sandbox.plugbay(&["stop"], "client-b");
+    wait_for_change(&mut changes, "the session never announced its new daemon").await;
+
+    assert_eq!(tool_names(&client).await, ["plugbay__status"]);
+    let status = call_text(&client, "plugbay__status").await;
+    assert!(status.contains("echo off"), "{status}");
     client.cancel().await.unwrap();
 }
 
@@ -194,22 +174,20 @@ async fn a_newer_shim_retires_an_older_daemon_and_every_session_moves() {
     sandbox
         .wait_for_daemon("the old daemon", |status| status["version"] == OLD_VERSION)
         .await;
-    let (old_client, mut changes) = sandbox
-        .connect_counting("client-b", Some(OLD_VERSION))
-        .await;
+    let (old_client, mut changes) = sandbox.connect_reporting("client-b", OLD_VERSION).await;
     assert!(
         call_text(&old_client, "echo__whoami")
             .await
             .starts_with("account=client-b ")
     );
 
-    let seen = *changes.borrow();
+    changes.borrow_and_update();
     let new_client = sandbox.connect("client-a").await;
     let whoami = call_text(&new_client, "echo__whoami").await;
     assert!(whoami.starts_with("account=client-a "), "{whoami}");
     wait_for_exit(&sandbox, &mut old_daemon).await;
 
-    wait_for_list_change(&sandbox, &mut changes, seen).await;
+    wait_for_change(&mut changes, "the old session never moved").await;
     let whoami = call_text(&old_client, "echo__whoami").await;
     assert!(whoami.starts_with("account=client-b "), "{whoami}");
     let status = sandbox.status().await;
@@ -225,9 +203,7 @@ async fn an_older_plugbay_never_retires_a_newer_daemon() {
     let client = sandbox.connect("client-b").await;
     let daemon = sandbox.status().await;
 
-    let (older_client, _changes) = sandbox
-        .connect_counting("client-a", Some(OLD_VERSION))
-        .await;
+    let (older_client, _changes) = sandbox.connect_reporting("client-a", OLD_VERSION).await;
     assert!(
         call_text(&older_client, "echo__whoami")
             .await
@@ -242,6 +218,7 @@ async fn an_older_plugbay_never_retires_a_newer_daemon() {
                 .starts_with("not retiring"),
             "{refused}"
         );
+        assert_eq!(refused["retiring"], false);
     }
     let status = sandbox.status().await;
     assert_eq!(status["pid"], daemon["pid"]);
@@ -258,9 +235,7 @@ async fn a_session_that_cannot_reconnect_keeps_the_daemon_from_retiring() {
     let daemon = sandbox.status().await;
 
     // What a shim from before daemon upgrades sends: no `reconnects`.
-    let mut old_shim = UnixStream::connect(sandbox.plugbay_home.join("state/daemon.sock"))
-        .await
-        .unwrap();
+    let mut old_shim = UnixStream::connect(sandbox.socket()).await.unwrap();
     let hello = json!({
         "kind": "session",
         "version": "0.2.1",
@@ -289,7 +264,7 @@ async fn a_session_that_cannot_reconnect_keeps_the_daemon_from_retiring() {
         .wait_for_daemon("the old shim leaving", |status| status["sessions"] == 1)
         .await;
     let retiring = sandbox.control("99.0.0", "retire").await;
-    assert_eq!(retiring["message"], "retiring", "{retiring}");
+    assert_eq!(retiring["retiring"], true, "{retiring}");
     client.cancel().await.unwrap();
 }
 
