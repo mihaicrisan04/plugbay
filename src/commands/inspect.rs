@@ -13,7 +13,7 @@ use crate::config::{
 use crate::identity::VerifiedAccounts;
 use crate::paths::Paths;
 use crate::project::ProjectLocation;
-use crate::report::{self, Audience, LoginState, Report};
+use crate::report::{self, LoginState, Report};
 use crate::{registry, secrets};
 
 /// `available`: list every server that could be pinned (built in and catalog) instead.
@@ -243,10 +243,7 @@ fn fail_on_problems(problem_count: usize) -> anyhow::Result<()> {
 fn format_server_summary(report: &Report) -> String {
     let mut rows = Vec::new();
     for server in &report.servers {
-        rows.push(vec![
-            server.server.display_name(),
-            server.status(Audience::Human),
-        ]);
+        rows.push(vec![server.server.display_name(), server.status()]);
     }
     let mut output = if rows.is_empty() {
         "  no servers\n".to_string()
@@ -301,7 +298,7 @@ fn format_ls(report: &Report, home: &Path) -> String {
                 transport_label(&server.transport).to_string(),
                 server.transport.target(),
                 tools_label(server),
-                server_report.status(Audience::Human),
+                server_report.status(),
             ]);
         }
         output.push_str(&render_rows(&rows));
@@ -636,27 +633,34 @@ mod tests {
 
     /// linear needs a login, posthog is ready and verified, tool needs trust.
     fn sample_report(config: &ResolvedConfig) -> Report<'_> {
-        let verified = VerifiedAccounts::default();
+        let accounts = VerifiedAccounts::test_with(&[(
+            "https://mcp-eu.posthog.com/mcp",
+            "client-a",
+            "Client A EU",
+        )]);
         let [linear, posthog, tool] = &config.servers[..] else {
             panic!("sample config has three servers");
         };
         let servers = vec![
-            ServerReport {
-                login: Some(LoginState::Missing),
-                ..ServerReport::new(linear, &verified)
-            },
-            ServerReport {
-                login: Some(LoginState::Token),
-                verified: Some("Client A EU".to_string()),
-                ..ServerReport::new(posthog, &verified)
-            },
-            ServerReport {
-                trust: TrustState::Untrusted,
-                login: Some(LoginState::NotNeeded),
-                ..ServerReport::new(tool, &verified)
-            },
+            ServerReport::new(
+                linear,
+                TrustState::NotNeeded,
+                LoginState::Missing,
+                &accounts,
+            ),
+            ServerReport::new(posthog, TrustState::Trusted, LoginState::Token, &accounts),
+            ServerReport::new(
+                tool,
+                TrustState::Untrusted,
+                LoginState::NotNeeded,
+                &accounts,
+            ),
         ];
-        Report { config, servers }
+        Report {
+            config,
+            servers,
+            accounts,
+        }
     }
 
     #[test]
@@ -672,6 +676,7 @@ mod tests {
         let report = Report {
             config: &config,
             servers: Vec::new(),
+            accounts: VerifiedAccounts::default(),
         };
         insta::assert_snapshot!(format_ls(&report, Path::new(HOME)));
     }

@@ -1525,7 +1525,7 @@ async fn a_failed_enable_does_not_undo_a_newer_one() {
     };
     let (bad, good) = tokio::join!(enable_bad, enable_good);
 
-    assert!(bad.contains("could not start"), "{bad}");
+    assert!(bad.contains("echo:bad — failed: "), "{bad}");
     assert!(good.contains("echo:client-a is on"), "{good}");
     let status = call_text(&client, "plugbay__status").await;
     assert!(status.contains("echo:client-a on"), "{status}");

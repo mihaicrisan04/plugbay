@@ -1,11 +1,11 @@
 //! Text for the agent: the server instructions sent at initialize and the `plugbay__status` report.
 
 use super::tools::{ENABLE_TOOL, STATUS_TOOL, TOOL_SEPARATOR};
-use super::{ActiveServer, Resolved, ServerStatus};
+use super::{ActiveServer, Resolved};
 use crate::config::{DEFAULT_ACCOUNT, ResolvedConfig, ResolvedServer};
 use crate::identity::{self, VerifiedAccounts};
 use crate::registry;
-use crate::report::{Audience, Connection, Report, ServerReport, ServerState, TrustState};
+use crate::report::{Audience, ServerState};
 
 pub(super) fn not_resolved_yet() -> String {
     format!("plugbay routes MCP servers for this project. Call {STATUS_TOOL} to see which.")
@@ -33,28 +33,22 @@ pub(super) fn instructions(
         }
     };
 
-    let report = session_report(config, servers, verified);
     let mut lines = vec![format!("{routes} Tools are named <server>__<tool>.")];
-    let working: Vec<String> = report
-        .servers
-        .iter()
-        .filter(|server| server.state() == ServerState::Ready)
-        .map(account_line)
-        .collect();
+    let mut working = Vec::new();
+    let mut unavailable = Vec::new();
+    for active in servers {
+        let server = &active.server;
+        match ServerState::from(&active.status).unavailable_note(server) {
+            None => working.push(account_line(server, verified_login(server, verified))),
+            Some(note) => unavailable.push(format!("{} ({note})", server_label(server))),
+        }
+    }
     if config.servers.is_empty() {
         lines.push("No servers are configured here.".to_string());
     } else if !working.is_empty() {
         lines.push("Servers and accounts in use (use the right one for this project):".to_string());
         lines.extend(working);
     }
-    let unavailable: Vec<String> = report
-        .servers
-        .iter()
-        .filter_map(|server| {
-            let note = server.unavailable_note()?;
-            Some(format!("{} ({note})", server_label(server.server)))
-        })
-        .collect();
     if !unavailable.is_empty() {
         lines.push(format!(
             "Not available right now: {}. Call {STATUS_TOOL} for details.",
@@ -71,41 +65,8 @@ pub(super) fn instructions(
     lines.join("\n")
 }
 
-/// The report as this session sees it: trust grants include `allow_once`, and connecting tells
-/// whether a login is missing, so the keychain is never read here.
-fn session_report<'a>(
-    config: &'a ResolvedConfig,
-    servers: &'a [ActiveServer],
-    verified: &VerifiedAccounts,
-) -> Report<'a> {
-    let servers = servers
-        .iter()
-        .map(|active| server_report(active, verified))
-        .collect();
-    Report { config, servers }
-}
-
-fn server_report<'a>(active: &'a ActiveServer, verified: &VerifiedAccounts) -> ServerReport<'a> {
-    let server = &active.server;
-    let mut report = ServerReport::new(server, verified);
-    if !server.requires_trust_from.is_empty() {
-        report.trust = TrustState::Trusted;
-    }
-    report.connection = match &active.status {
-        ServerStatus::Connecting { .. } => Some(Connection::Connecting),
-        ServerStatus::Connected(_) => Some(Connection::Connected),
-        ServerStatus::NeedsLogin { .. } => Some(Connection::NeedsLogin),
-        ServerStatus::Failed(error) => Some(Connection::Failed(error.clone())),
-        ServerStatus::Untrusted => {
-            report.trust = TrustState::Untrusted;
-            None
-        }
-        ServerStatus::WrongAccount(message) => {
-            report.wrong_account = Some(message.clone());
-            Some(Connection::Connected)
-        }
-    };
-    report
+fn verified_login<'a>(server: &ResolvedServer, verified: &'a VerifiedAccounts) -> Option<&'a str> {
+    verified.shown(&server.identity, &server.account)
 }
 
 /// A local command nobody gave accounts to has nothing worth naming.
@@ -122,8 +83,7 @@ fn server_label(server: &ResolvedServer) -> String {
     }
 }
 
-fn account_line(report: &ServerReport) -> String {
-    let server = report.server;
+fn account_line(server: &ResolvedServer, verified: Option<&str>) -> String {
     let title = registry::lookup(&server.name).map_or(server.name.as_str(), |entry| entry.title);
     let mut line = format!("- {title}");
     if has_account_worth_showing(server) {
@@ -138,7 +98,7 @@ fn account_line(report: &ServerReport) -> String {
     if !details.is_empty() {
         line.push_str(&format!(" ({})", details.join(", ")));
     }
-    if let Some(shown) = &report.verified {
+    if let Some(shown) = verified {
         line.push_str(&format!(" (verified: {shown})"));
     }
     if server.tool_prefix != server.name {
@@ -194,12 +154,17 @@ pub(super) fn status_text(
     if servers.is_empty() {
         lines.push("  (none)".to_string());
     }
-    for server in session_report(config, servers, verified).servers {
+    for active in servers {
+        let server = &active.server;
+        let status = ServerState::from(&active.status).status(
+            server,
+            verified_login(server, verified),
+            Audience::Agent,
+        );
         lines.push(format!(
-            "  {} ({}) — {}",
-            server.server.display_name(),
-            server.server.transport.target(),
-            server.status(Audience::Agent)
+            "  {} ({}) — {status}",
+            server.display_name(),
+            server.transport.target()
         ));
     }
     for disabled in &config.disabled {
@@ -221,7 +186,9 @@ mod tests {
 
     use super::*;
     use crate::config::{ServerIdentity, ServerTransport, ToolFilter};
+    use crate::identity::ExpectationFailure;
     use crate::project::ProjectLocation;
+    use crate::session::ServerStatus;
 
     const LINEAR: &str = "https://mcp.linear.app/mcp";
 
@@ -286,7 +253,7 @@ mod tests {
         let server = linear("initech", &[("team", "WP"), ("expect", "Initech")]);
         let verified = VerifiedAccounts::test_with(&[(LINEAR, "initech", "Initech")]);
         assert_eq!(
-            account_line(&ServerReport::new(&server, &verified)),
+            account_line(&server, verified_login(&server, &verified)),
             "- Linear → initech (team WP) (verified: Initech)"
         );
     }
@@ -294,25 +261,15 @@ mod tests {
     #[test]
     fn account_line_without_a_verified_login_is_unchanged() {
         let server = linear("personal", &[("expect", "mihaicrisan")]);
-        assert_eq!(
-            account_line(&ServerReport::new(&server, &VerifiedAccounts::default())),
-            "- Linear → personal"
-        );
+        assert_eq!(account_line(&server, None), "- Linear → personal");
     }
 
     #[test]
     fn local_command_with_only_the_default_account_shows_no_label() {
-        let verified = VerifiedAccounts::default();
         let unnamed = local_tool("default");
         let named = local_tool("work");
-        assert_eq!(
-            account_line(&ServerReport::new(&unnamed, &verified)),
-            "- paper"
-        );
-        assert_eq!(
-            account_line(&ServerReport::new(&named, &verified)),
-            "- paper → work"
-        );
+        assert_eq!(account_line(&unnamed, None), "- paper");
+        assert_eq!(account_line(&named, None), "- paper → work");
     }
 
     #[test]
@@ -360,9 +317,17 @@ mod tests {
         let resolved = resolved_with(&[&server], Some("/work/app"));
         let servers = [with_status(
             &server,
-            ServerStatus::WrongAccount("logged in as Initech".to_string()),
+            ServerStatus::ExpectFailed(ExpectationFailure::Mismatch {
+                shown: "Initech".to_string(),
+                expected: "mihaicrisan".to_string(),
+            }),
         )];
         let text = instructions(&resolved, &servers, &VerifiedAccounts::default());
-        assert!(text.contains("linear:personal (wrong account)"), "{text}");
+        assert!(
+            text.contains(
+                "linear:personal (wrong account: ask the human to run `plugbay logout linear:personal && plugbay login linear:personal` and pick mihaicrisan)"
+            ),
+            "{text}"
+        );
     }
 }

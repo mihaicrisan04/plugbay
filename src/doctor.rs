@@ -8,7 +8,7 @@ use crate::clients::{self, Client, NativeServer, SetupState, ShimCommand};
 use crate::config::{ResolvedConfig, ResolvedServer, ServerTransport};
 use crate::paths::Paths;
 use crate::protocol::{self, ControlRequest};
-use crate::report::{self, Audience, LoginState, Report, ServerReport, TrustState};
+use crate::report::{self, Audience, LoginState, Report, ServerReport, ServerState, TrustState};
 
 const DAEMON_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -211,7 +211,11 @@ async fn check_servers(paths: &Paths, config: &ResolvedConfig) -> Vec<Check> {
     for server in &report.servers {
         checks.extend(check_server_trust(server));
         checks.extend(check_server_credentials(server));
-        checks.extend(check_verified_account(server));
+        checks.extend(check_account_expectation(server));
+        checks.extend(check_verified_account(
+            server,
+            &report.same_login_as(server.server),
+        ));
     }
     checks.extend(check_op_cli(&config.servers));
     checks
@@ -231,7 +235,7 @@ fn check_server_trust(report: &ServerReport) -> Option<Check> {
 
 fn check_server_credentials(report: &ServerReport) -> Option<Check> {
     let name = describe(report.server);
-    let check = match report.login.as_ref()? {
+    let check = match &report.login {
         LoginState::NotNeeded => return None,
         LoginState::OAuth => Check::ok(format!("{name}: logged in")),
         LoginState::Token => Check::ok(format!("{name}: token stored")),
@@ -247,27 +251,40 @@ fn check_server_credentials(report: &ServerReport) -> Option<Check> {
     Some(check)
 }
 
-/// Who the login turned out to be, when the server was asked: wrong for `expect`, or the same
-/// account as another label of this server (fine if intended, a mix-up if not).
-fn check_verified_account(report: &ServerReport) -> Option<Check> {
-    let name = report.server.display_name();
-    let relogin = format!("run `plugbay logout {name}`, then `plugbay login {name}`");
-    if let Some(failure) = &report.wrong_account {
-        return Some(Check::error(
-            format!("{failure}; agents won't get it"),
-            format!("{relogin} and pick the expected workspace"),
-        ));
+/// A login that fails `expect`, or an `expect` that can't be checked: agents won't get the server.
+fn check_account_expectation(report: &ServerReport) -> Option<Check> {
+    let state = ServerState::from(report.expectation_failure.as_ref()?);
+    let problem = state.detail()?;
+    let next_step = state.next_step(report.server, Audience::Human)?;
+    Some(Check::error(
+        format!(
+            "{}: {problem}; agents won't get it",
+            report.server.display_name()
+        ),
+        next_step,
+    ))
+}
+
+/// Who a login that passes `expect` turned out to be, when the server was asked; a warning when
+/// another label of this server is the same account (fine if intended, a mix-up if not).
+fn check_verified_account(report: &ServerReport, same_login_as: &[String]) -> Option<Check> {
+    if report.expectation_failure.is_some() {
+        return None;
     }
+    let name = report.server.display_name();
     let shown = report.verified.as_ref()?;
-    if report.same_login_as.is_empty() {
+    if same_login_as.is_empty() {
         return Some(Check::ok(format!("{name}: verified as {shown}")));
     }
     Some(Check::warn(
         format!(
             "{name} sees the same account as {} ({shown}); if they are meant to be different accounts, one label is logged in to the wrong one",
-            report.same_login_as.join(", ")
+            same_login_as.join(", ")
         ),
-        format!("if so, {relogin} and pick the account this label is meant for"),
+        format!(
+            "if so, {} and pick the account this label is meant for",
+            report::relogin_next_step(report.server, Audience::Human)
+        ),
     ))
 }
 
@@ -496,6 +513,13 @@ mod tests {
 
     const LINEAR: &str = "https://mcp.linear.app/mcp";
 
+    fn oauth_report<'a>(
+        server: &'a ResolvedServer,
+        verified: &VerifiedAccounts,
+    ) -> ServerReport<'a> {
+        ServerReport::new(server, TrustState::NotNeeded, LoginState::OAuth, verified)
+    }
+
     #[test]
     fn two_labels_with_one_login_warn() {
         let verified = VerifiedAccounts::test_with(&[
@@ -503,7 +527,11 @@ mod tests {
             (LINEAR, "initech", "Initech"),
         ]);
         let server = resolved_http("linear", "https://mcp.linear.app/mcp");
-        let check = check_verified_account(&ServerReport::new(&server, &verified)).unwrap();
+        let check = check_verified_account(
+            &oauth_report(&server, &verified),
+            &report::same_login_labels(&server, &verified),
+        )
+        .unwrap();
         assert_eq!(check.status, Status::Warn);
         assert!(
             check.title.contains("same account as linear:initech"),
@@ -524,19 +552,34 @@ mod tests {
         server
             .account_metadata
             .insert(identity::EXPECT_KEY.to_string(), "Personal".to_string());
-        let report = ServerReport {
-            wrong_account: identity::expectation_failure(&server, &verified),
-            ..ServerReport::new(&server, &verified)
-        };
-        let check = check_verified_account(&report).unwrap();
+        let report = oauth_report(&server, &verified);
+        let check = check_account_expectation(&report).unwrap();
         assert_eq!(check.status, Status::Error);
+        assert_eq!(
+            check.title,
+            "linear:default: logged in as Initech, but this project expects Personal; agents won't get it"
+        );
+        assert!(check_verified_account(&report, &[]).is_none());
+    }
+
+    #[test]
+    fn unreadable_accounts_record_is_not_called_a_wrong_login() {
+        let mut server = resolved_http("linear", "https://mcp.linear.app/mcp");
+        server
+            .account_metadata
+            .insert(identity::EXPECT_KEY.to_string(), "Personal".to_string());
+        let check =
+            check_account_expectation(&oauth_report(&server, &VerifiedAccounts::test_unreadable()))
+                .unwrap();
+        assert!(check.title.contains("can't check for Personal"), "{check}");
+        assert!(check.hint.unwrap().contains("accounts.toml"));
     }
 
     #[test]
     fn unverified_login_adds_no_check() {
         let server = resolved_http("linear", "https://mcp.linear.app/mcp");
-        let report = ServerReport::new(&server, &VerifiedAccounts::default());
-        assert!(check_verified_account(&report).is_none());
+        let report = oauth_report(&server, &VerifiedAccounts::default());
+        assert!(check_verified_account(&report, &[]).is_none());
     }
 
     #[test]

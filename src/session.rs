@@ -23,11 +23,11 @@ use rmcp::{ErrorData as McpError, Peer, RoleServer, ServerHandler};
 use tokio::time::Instant;
 
 use crate::config::{self, ResolvedConfig, ResolvedServer, ServerIdentity, SessionPin};
-use crate::identity::{self, VerifiedAccounts};
+use crate::identity::{self, ExpectationFailure, VerifiedAccounts};
 use crate::index;
 use crate::paths::Paths;
 use crate::project::{self, ProjectHints, ProjectLocation};
-use crate::report::{self, Audience};
+use crate::report::ServerState;
 use crate::trust::Trust;
 use crate::upstream::{ConnectError, Lease, MayConnect, Upstream, UpstreamKey, UpstreamPool};
 
@@ -171,8 +171,21 @@ enum ServerStatus {
     },
     Untrusted,
     Failed(String),
-    /// Connected, but the verified login is not the account this project expects.
-    WrongAccount(String),
+    /// Connected, but the verified login fails the account's `expect` or can't be checked.
+    ExpectFailed(ExpectationFailure),
+}
+
+impl From<&ServerStatus> for ServerState {
+    fn from(status: &ServerStatus) -> Self {
+        match status {
+            ServerStatus::Connecting { .. } => Self::Connecting,
+            ServerStatus::Connected(_) => Self::Connected,
+            ServerStatus::NeedsLogin { .. } => Self::NeedsLogin,
+            ServerStatus::Untrusted => Self::NeedsTrust,
+            ServerStatus::Failed(error) => Self::Failed(error.clone()),
+            ServerStatus::ExpectFailed(failure) => Self::from(failure),
+        }
+    }
 }
 
 /// What a tool call turns into, decided under the state lock and carried out after it.
@@ -488,7 +501,7 @@ impl Session {
                     ServerStatus::Connecting { .. }
                     | ServerStatus::Untrusted
                     | ServerStatus::Failed(_)
-                    | ServerStatus::WrongAccount(_) => {}
+                    | ServerStatus::ExpectFailed(_) => {}
                 }
             }
         }
@@ -590,21 +603,6 @@ impl Session {
                 server: Box::new(active.server.clone()),
                 challenge: challenge.clone(),
             },
-            ServerStatus::NeedsLogin { .. } => Route::Refuse(format!(
-                "{display_name} needs login: {}",
-                report::login_next_step(&active.server, Audience::Agent)
-            )),
-            ServerStatus::Connecting { .. } => Route::Refuse(format!(
-                "{display_name} is still connecting; try again in a moment, or call {STATUS_TOOL}"
-            )),
-            ServerStatus::Untrusted => Route::Refuse(format!(
-                "{display_name} runs a local command or reads secrets from config that is not trusted yet; {}",
-                report::trust_next_step(Audience::Agent)
-            )),
-            ServerStatus::Failed(error) => {
-                Route::Refuse(format!("{display_name} is unavailable: {error}"))
-            }
-            ServerStatus::WrongAccount(message) => Route::Refuse(message.clone()),
             ServerStatus::Connected(_) if !active.server.tool_filter.allows(tool_name) => {
                 Route::Refuse(format!(
                     "`{tool_name}` is filtered out for {display_name} by plugbay config"
@@ -614,6 +612,7 @@ impl Session {
                 upstream: lease.upstream.clone(),
                 display_name,
             },
+            status => Route::Refuse(ServerState::from(status).explain_to_agent(&active.server)),
         }
     }
 
@@ -856,9 +855,9 @@ fn turn_off_wrong_accounts(servers: &mut [ActiveServer], verified: &VerifiedAcco
         if !matches!(active.status, ServerStatus::Connected(_)) {
             continue;
         }
-        if let Some(message) = identity::expectation_failure(&active.server, verified) {
-            tracing::warn!(server = %active.server.display_name(), "logged in as the wrong account");
-            active.status = ServerStatus::WrongAccount(message);
+        if let Some(failure) = identity::expectation_failure(&active.server, verified) {
+            tracing::warn!(server = %active.server.display_name(), ?failure, "account fails `expect`");
+            active.status = ServerStatus::ExpectFailed(failure);
         }
     }
 }
@@ -877,7 +876,7 @@ impl ActiveServer {
             ServerStatus::NeedsLogin { .. }
             | ServerStatus::Untrusted
             | ServerStatus::Failed(_)
-            | ServerStatus::WrongAccount(_) => false,
+            | ServerStatus::ExpectFailed(_) => false,
         }
     }
 
@@ -912,7 +911,7 @@ fn tool_shape(servers: &[ActiveServer]) -> Vec<(ResolvedServer, &'static str)> {
                 ServerStatus::Connecting { .. }
                 | ServerStatus::Untrusted
                 | ServerStatus::Failed(_)
-                | ServerStatus::WrongAccount(_) => "hidden",
+                | ServerStatus::ExpectFailed(_) => "hidden",
             };
             (active.server.clone(), status)
         })
