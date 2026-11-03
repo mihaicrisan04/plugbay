@@ -82,6 +82,12 @@ enum Command {
     Unuse(commands::PinOptions),
     /// Add a server definition to the catalog in the global config, pinned nowhere yet.
     Add(commands::AddOptions),
+    /// Search the official MCP Registry for servers to add: `plugbay search sentry`.
+    Search {
+        /// Words to look for in server names.
+        #[arg(required = true, value_name = "QUERY")]
+        query: Vec<String>,
+    },
     /// Remove a server definition from the catalog.
     Remove {
         /// Catalog entry to remove; `plugbay unuse` stops using a server in one directory.
@@ -157,6 +163,7 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<()> {
         Command::Use(options) => commands::use_servers(&paths, cd, options).await,
         Command::Unuse(options) => commands::unuse_servers(&paths, cd, options).await,
         Command::Add(options) => commands::add(&paths, options).await,
+        Command::Search { query } => commands::search(&query).await,
         Command::Remove { name } => commands::remove(&paths, &name).await,
         Command::Accounts => commands::accounts(&paths, cd).await,
         Command::Login { target, token } => {

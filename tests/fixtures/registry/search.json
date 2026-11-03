@@ -1,0 +1,152 @@
+{
+  "servers": [
+    {
+      "server": {
+        "name": "io.github.acme-dev/tracker-mcp",
+        "title": "Tracker (community)",
+        "description": "Unofficial tracker tools, run locally.",
+        "version": "0.4.1",
+        "packages": [
+          {
+            "registryType": "npm",
+            "identifier": "@acme-dev/tracker-mcp",
+            "version": "0.4.1",
+            "runtimeHint": "npx",
+            "transport": { "type": "stdio" },
+            "packageArguments": [
+              { "type": "positional", "value": "serve" },
+              { "type": "named", "name": "--workspace", "valueHint": "workspace", "isRequired": true },
+              { "type": "named", "name": "--verbose" }
+            ],
+            "environmentVariables": [
+              { "name": "TRACKER_API_KEY", "isSecret": true, "isRequired": true, "description": "API key" },
+              { "name": "TRACKER_REGION", "isRequired": true, "default": "eu" },
+              { "name": "TRACKER_DEBUG", "description": "Optional logging" }
+            ]
+          }
+        ]
+      },
+      "_meta": { "io.modelcontextprotocol.registry/official": { "status": "active", "isLatest": true } }
+    },
+    {
+      "server": {
+        "name": "app.linear/linear",
+        "title": "Linear",
+        "description": "Find and manage issues, projects, and documents in your Linear workspace.",
+        "version": "1.0.1",
+        "remotes": [{ "type": "streamable-http", "url": "https://mcp.linear.app/mcp" }]
+      },
+      "_meta": { "io.modelcontextprotocol.registry/official": { "status": "active", "isLatest": false } }
+    },
+    {
+      "server": {
+        "name": "app.linear/linear",
+        "title": "Linear",
+        "description": "Find and manage issues, projects, and documents in your Linear workspace.",
+        "version": "1.0.2",
+        "remotes": [
+          { "type": "streamable-http", "url": "https://mcp.linear.app/mcp" },
+          { "type": "streamable-http", "url": "https://mcp.linear.app/mcp/readonly" }
+        ]
+      },
+      "_meta": { "io.modelcontextprotocol.registry/official": { "status": "active", "isLatest": true } }
+    },
+    {
+      "server": {
+        "name": "com.acme/tracker",
+        "title": "Acme Tracker",
+        "description": "The official Acme Tracker server.",
+        "version": "2.0.0",
+        "remotes": [
+          {
+            "type": "streamable-http",
+            "url": "https://mcp.acme.example/mcp",
+            "headers": [
+              { "name": "Authorization", "value": "Bearer {api_key}", "isRequired": true, "isSecret": true },
+              { "name": "X-Acme-Tenant", "description": "Optional tenant" }
+            ]
+          },
+          { "type": "sse", "url": "https://mcp.acme.example/sse" }
+        ]
+      },
+      "_meta": { "io.modelcontextprotocol.registry/official": { "status": "active", "isLatest": true } }
+    },
+    {
+      "server": {
+        "name": "dev.oldco/legacy",
+        "description": "Still on the old transport.",
+        "version": "1.0.0",
+        "remotes": [{ "type": "sse", "url": "https://legacy.oldco.example/sse" }]
+      },
+      "_meta": { "io.modelcontextprotocol.registry/official": { "status": "active", "isLatest": true } }
+    },
+    {
+      "server": {
+        "name": "com.gone/removed",
+        "description": "Taken down.",
+        "version": "3.0.0",
+        "remotes": [{ "type": "streamable-http", "url": "https://gone.example/mcp" }]
+      },
+      "_meta": { "io.modelcontextprotocol.registry/official": { "status": "deleted", "isLatest": true } }
+    },
+    {
+      "server": {
+        "name": "dev.tricky/tracker",
+        "title": "Tricky‮ rekcart\u0007",
+        "description": "Line one\nline two​ with⁦ hidden⁩ marks.",
+        "version": "0.1.0",
+        "remotes": [{ "type": "streamable-http", "url": "http://tricky.example/mcp" }]
+      },
+      "_meta": { "io.modelcontextprotocol.registry/official": { "status": "active", "isLatest": true } }
+    },
+    {
+      "server": {
+        "name": "org.pyco/finder",
+        "description": "Finds things, from PyPI.",
+        "version": "1.2.0",
+        "packages": [
+          {
+            "registryType": "pypi",
+            "identifier": "pyco-finder",
+            "version": "1.2.0",
+            "transport": { "type": "stdio" }
+          },
+          {
+            "registryType": "oci",
+            "identifier": "ghcr.io/pyco/finder",
+            "version": "1.2.0",
+            "transport": { "type": "stdio" },
+            "environmentVariables": [{ "name": "FINDER_TOKEN", "isSecret": true, "isRequired": true }]
+          },
+          {
+            "registryType": "mcpb",
+            "identifier": "https://github.com/pyco/finder/releases/download/v1.2.0/finder.mcpb",
+            "transport": { "type": "stdio" }
+          }
+        ]
+      },
+      "_meta": { "io.modelcontextprotocol.registry/official": { "status": "active", "isLatest": true } }
+    },
+    {
+      "server": {
+        "name": "net.mixed/tracker",
+        "description": "One https remote, one plain http remote.",
+        "version": "1.0.0",
+        "remotes": [
+          { "type": "streamable-http", "url": "http://mcp.mixed.example/mcp" },
+          { "type": "streamable-http", "url": "https://mcp.mixed.example/mcp" }
+        ]
+      },
+      "_meta": { "io.modelcontextprotocol.registry/official": { "status": "active", "isLatest": true } }
+    },
+    {
+      "server": { "description": "No name at all." },
+      "_meta": { "io.modelcontextprotocol.registry/official": { "status": "active", "isLatest": true } }
+    },
+    {
+      "server": { "name": "not a registry name", "version": "1.0.0" },
+      "_meta": { "io.modelcontextprotocol.registry/official": { "status": "active", "isLatest": true } }
+    }
+  ],
+  "metadata": { "count": 11 }
+}

@@ -1,6 +1,8 @@
 //! Built-in short names for well-known remote MCP servers, like mise's tool registry.
 //! Only remote servers live here: a registry entry never runs code on the machine.
 
+pub mod official;
+
 use crate::config::ServerIdentity;
 
 pub struct RegistryEntry {
@@ -125,13 +127,16 @@ pub fn all() -> &'static [RegistryEntry] {
     ENTRIES
 }
 
+/// The built-in server at `identity`, whatever name config gives it.
+pub fn entry_for_identity(identity: &ServerIdentity) -> Option<&'static RegistryEntry> {
+    ENTRIES.iter().find(|entry| {
+        url::Url::parse(entry.url).is_ok_and(|url| ServerIdentity::for_url(&url) == *identity)
+    })
+}
+
 /// Matched by identity, not name: a config that points `linear` at another url gets no whoami.
 pub fn whoami_for(identity: &ServerIdentity) -> Option<&'static Whoami> {
-    ENTRIES.iter().find_map(|entry| {
-        let whoami = entry.whoami.as_ref()?;
-        let url = url::Url::parse(entry.url).ok()?;
-        (ServerIdentity::for_url(&url) == *identity).then_some(whoami)
-    })
+    entry_for_identity(identity)?.whoami.as_ref()
 }
 
 #[cfg(test)]

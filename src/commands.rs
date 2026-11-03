@@ -3,6 +3,7 @@
 mod access;
 mod inspect;
 mod pins;
+mod search;
 
 use std::path::PathBuf;
 
@@ -15,6 +16,7 @@ use crate::protocol::ControlRequest;
 pub use access::{TokenOptions, login, logout, trust};
 pub use inspect::{accounts, ls, ls_all, why};
 pub use pins::{AddOptions, PinOptions, add, remove, unuse_servers, use_servers};
+pub use search::search;
 
 /// Resolves the config the way an agent started in this directory would see it, and remembers
 /// the directory for commands that look everywhere.
