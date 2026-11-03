@@ -103,10 +103,13 @@ pub async fn restart(
     };
     match protocol::send_control(paths, ControlRequest::Reconnect { only }).await {
         Ok(response) => {
-            println!(
-                "{}; {} connected agent session(s) reconnect on their own",
-                response.message, response.sessions
-            );
+            match response.sessions {
+                0 => println!("{}", response.message),
+                sessions => println!(
+                    "{}; {sessions} connected agent session(s) reconnect on their own",
+                    response.message
+                ),
+            }
             Ok(())
         }
         Err(error) if daemon_is_not_running(&error) => {
