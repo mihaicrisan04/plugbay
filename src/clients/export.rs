@@ -2,22 +2,26 @@
 //! `.vscode/mcp.json`, for teammates without plugbay. No secret leaves as a value: secret refs,
 //! stored token logins and values that may be secrets become placeholders each teammate fills in.
 
+mod classify;
 mod destination;
 mod placeholders;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use anyhow::{Context, bail};
+use anyhow::{Context, anyhow, bail};
 use serde_json::Value;
 
+use self::classify::{ValuePlan, configured_values, skip_reason, value_plan};
 use self::destination::{Destination, MergeReport};
 use self::placeholders::{
     Placeholder, Placeholders, SecretSource, environment_variable_name, header_placeholder_name,
 };
 use super::{Client, NativeTransport, claude, read_optional, write_atomically};
 use crate::commands;
-use crate::config::{self, DEFAULT_ACCOUNT, ResolvedConfig, ResolvedServer, ServerTransport};
+use crate::config::{
+    ConfigProblem, DEFAULT_ACCOUNT, ResolvedConfig, ResolvedServer, ServerTransport,
+};
 use crate::credentials::{self, StoredLogin};
 use crate::paths::{Paths, display_path};
 use crate::secrets::{self, SecretRef};
@@ -63,23 +67,14 @@ struct Export {
     report: MergeReport,
 }
 
-/// How one env or header value leaves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ValuePlan {
-    /// As written: nothing in it looks secret.
-    Copy,
-    /// Each secret ref swapped for a placeholder, the text around them kept.
-    SwapRefs,
-    /// One placeholder for the whole value: the text itself may be a secret.
-    Replace,
-}
-
 pub async fn export(
     paths: &Paths,
     cd: Option<PathBuf>,
     options: ExportOptions,
 ) -> anyhow::Result<()> {
-    let config = commands::resolve_here(paths, cd).await?;
+    let config = commands::resolve_here(paths, cd)
+        .await
+        .map_err(value_free_error)?;
     let logins = stored_logins(&config).await;
 
     if !options.write {
@@ -119,6 +114,17 @@ pub async fn export(
     export.report.print(&display_path(&file, &paths.home));
     export.print_notes();
     Ok(())
+}
+
+/// Only the outermost context (`parsing <file>`) of a config error: its causes may quote the line
+/// that failed to parse, value and all.
+fn value_free_error(error: anyhow::Error) -> anyhow::Error {
+    let place = if error.chain().count() > 1 {
+        error.to_string()
+    } else {
+        "the config here doesn't load".to_string()
+    };
+    anyhow!("{place}; run `plugbay ls` to see why (export never prints config text)")
 }
 
 /// What `plugbay login` stored for each remote server, keyed by entry name. A token's value never
@@ -201,7 +207,7 @@ impl Export {
     ) -> Self {
         let mut notes = Vec::new();
         for problem in &config.problems {
-            notes.push(format!("not exported: {}", problem.message));
+            notes.push(problem_note(problem));
         }
         let mut report = MergeReport::default();
         let mut written = Vec::new();
@@ -405,6 +411,23 @@ impl Export {
     }
 }
 
+/// A problem's message may quote a value (an invalid url, a glob), so only names and where to look
+/// leave.
+fn problem_note(problem: &ConfigProblem) -> String {
+    match problem.servers.as_slice() {
+        [] => "a config file here has a problem; run `plugbay ls` to see it".to_string(),
+        [server] => {
+            format!(
+                "not exported: {server} has a config problem; run `plugbay why {server}` to see it"
+            )
+        }
+        [first, ..] => format!(
+            "not exported: {} have a config problem; run `plugbay why {first}` to see it",
+            problem.servers.join(", ")
+        ),
+    }
+}
+
 fn print_placeholders(placeholders: &[&Placeholder]) {
     let width = placeholders
         .iter()
@@ -421,100 +444,12 @@ fn print_placeholders(placeholders: &[&Placeholder]) {
     }
 }
 
-/// Why `server` can't be exported safely, if it can't. Never quotes a value: it may be a secret.
-fn skip_reason(server: &ResolvedServer, format: ExportFormat) -> Option<String> {
-    match &server.transport {
-        ServerTransport::Http { url, .. } if config::url_may_hold_secret(url) => {
-            return Some(format!(
-                "its url may hold a key ({}); add it to the file by hand",
-                config::display_url(url)
-            ));
-        }
-        ServerTransport::Stdio { args, .. } if secrets::has_secret_in_args(args) => {
-            return Some(
-                "its args seem to hold a secret; move it to `env` with a secret ref".to_string(),
-            );
-        }
-        ServerTransport::Stdio { args, .. }
-            if args
-                .iter()
-                .any(|argument| secrets::has_secret_url(argument)) =>
-        {
-            return Some(
-                "its args hold a url that may carry a credential; move it to `env` with a secret ref"
-                    .to_string(),
-            );
-        }
-        _ => {}
-    }
-
-    let (kind, values) = configured_values(&server.transport);
-    for (field, value) in values {
-        let Ok(references) = secrets::parse_refs(value) else {
-            return Some(format!(
-                "`{kind}.{field}` has a malformed secret ref; fix the `${{...}}` in the config"
-            ));
-        };
-        if value_plan(field, value) != ValuePlan::SwapRefs {
-            continue;
-        }
-        for reference in references {
-            if let SecretRef::Env(variable) = reference
-                && !format.can_expand(&variable)
-            {
-                return Some(format!(
-                    "`{kind}.{field}` reads `${{env:{variable}}}`, which {} can't expand; rename the variable to letters, digits and `_`",
-                    format.client_name()
-                ));
-            }
-        }
-    }
-    None
-}
-
-/// The values that may hold secret refs: a remote server's headers or a local one's env.
-fn configured_values(transport: &ServerTransport) -> (&'static str, &BTreeMap<String, String>) {
-    match transport {
-        ServerTransport::Http { headers, .. } => ("headers", headers),
-        ServerTransport::Stdio { env, .. } => ("env", env),
-    }
-}
-
-/// In a secret-named field only a `Bearer ` scheme may sit next to a ref (`key-${env:SUFFIX}`
-/// would leak half the key), and nowhere may a literal URL carry a credential.
-fn value_plan(field: &str, value: &str) -> ValuePlan {
-    let secret_field = secrets::is_secret_field(field);
-    if !secrets::contains_secret_ref(value) {
-        let may_be_secret = secret_field || secrets::has_secret_url(value);
-        return if value.is_empty() || !may_be_secret {
-            ValuePlan::Copy
-        } else {
-            ValuePlan::Replace
-        };
-    }
-    let (_, after_scheme) = secrets::split_bearer_scheme(value);
-    let Ok(literal) = text_around_refs(after_scheme) else {
-        return ValuePlan::Replace;
-    };
-    let literal_next_to_secret = secret_field && !literal.trim().is_empty();
-    if literal_next_to_secret || secrets::has_secret_url(&literal) {
-        ValuePlan::Replace
-    } else {
-        ValuePlan::SwapRefs
-    }
-}
-
-/// `value` with each ref swapped for a space, so the text on either side never reads as one word.
-fn text_around_refs(value: &str) -> anyhow::Result<String> {
-    secrets::replace_refs(value, |_| " ".to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::config::{ConfigProblem, ToolFilter};
+    use crate::config::ToolFilter;
 
     fn with_env(mut server: ResolvedServer, values: &[(&str, &str)]) -> ResolvedServer {
         if let ServerTransport::Stdio { env, .. } = &mut server.transport {
@@ -735,21 +670,6 @@ mod tests {
     }
 
     #[test]
-    fn credential_urls_in_args_skip_the_server() {
-        let server = ResolvedServer::test_stdio(
-            "tool",
-            DEFAULT_ACCOUNT,
-            "npx",
-            &["--url", "https://fake-user:fake-pass@mcp.example.com/mcp"],
-        );
-        let export = build(vec![server], ExportFormat::Claude);
-        assert!(export.entries.is_empty());
-        let notes = export.notes.join("\n");
-        assert!(notes.contains("may carry a credential"), "{notes}");
-        assert!(!notes.contains("fake-pass"), "{notes}");
-    }
-
-    #[test]
     fn credential_urls_in_env_values_become_placeholders() {
         let server = stdio(
             "db",
@@ -791,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn several_refs_in_one_value_are_numbered() {
+    fn refs_inside_a_url_make_the_whole_value_one_placeholder() {
         let server = stdio(
             "db",
             &[(
@@ -802,8 +722,82 @@ mod tests {
         let export = build(vec![server], ExportFormat::Claude);
         assert_eq!(
             printed(&export)["mcpServers"]["db"]["env"]["DB_URL"],
-            "postgres://${DB_USER}:${DB_URL}@${DB_URL_2}/app"
+            "${DB_URL}"
         );
+    }
+
+    /// Everything `export` prints for `servers`, stdout and stderr, in both formats.
+    fn every_output(servers: Vec<ResolvedServer>) -> String {
+        let mut output = String::new();
+        for format in [ExportFormat::Claude, ExportFormat::Vscode] {
+            let export = build(servers.clone(), format);
+            output.push_str(&printed_text(&export));
+            output.push_str(&export.notes.join("\n"));
+            for placeholder in export.placeholders.iter() {
+                output.push_str(&placeholder.name);
+                output.push_str(&placeholder.source.describe());
+            }
+        }
+        output
+    }
+
+    #[test]
+    fn credentials_around_refs_in_urls_never_leave() {
+        let env_server = stdio(
+            "db",
+            &[
+                (
+                    "DATABASE_URL",
+                    "https://${env:USER}:fake-url-password@host/app",
+                ),
+                ("RAW_URL", "postgres://fake-user:fake password@host/app"),
+            ],
+        );
+        let header_server = with_headers(
+            linear(),
+            &[(
+                "x-target",
+                "https://fake-user:fake-url-password${env:SUFFIX}@host/app",
+            )],
+        );
+        let output = every_output(vec![env_server, header_server]);
+        assert!(!output.contains("fake-"), "{output}");
+        assert!(output.contains("${DATABASE_URL}"), "{output}");
+    }
+
+    #[test]
+    fn token_shaped_literals_under_innocent_names_never_leave() {
+        let server = stdio(
+            "tool",
+            &[
+                ("X", "ghp_FAKE123456789012345678901234567890123456"),
+                ("Y", "sk-FAKE123456789012345678901234"),
+                ("Z", crate::secrets::FAKE_JWT),
+                ("A", "0123456789abcdef0123456789abcdef0123456789abcdef"),
+                ("LOG_LEVEL", "debug"),
+            ],
+        );
+        let output = every_output(vec![server.clone()]);
+        for token in ["FAKE1234", "fakeSignature", "0123456789abcdef"] {
+            assert!(!output.contains(token), "{output}");
+        }
+        let env = &printed(&build(vec![server], ExportFormat::Claude))["mcpServers"]["tool"]["env"];
+        assert_eq!(env["X"], "${X}");
+        assert_eq!(env["LOG_LEVEL"], "debug");
+    }
+
+    #[test]
+    fn config_errors_keep_only_their_outermost_context() {
+        let error = anyhow!("expected newline, found `trailing`: API_KEY = \"fake-private-token\"")
+            .context("parsing /srv/project/plugbay.toml");
+        let shown = format!("{:#}", value_free_error(error));
+        assert!(!shown.contains("fake-"), "{shown}");
+        assert!(
+            shown.contains("parsing /srv/project/plugbay.toml"),
+            "{shown}"
+        );
+        let bare = format!("{:#}", value_free_error(anyhow!("fake-private-token")));
+        assert!(!bare.contains("fake-"), "{bare}");
     }
 
     #[test]
@@ -878,35 +872,6 @@ mod tests {
     }
 
     #[test]
-    fn url_that_may_hold_a_key_is_skipped() {
-        let server = ResolvedServer::test_http(
-            "keyed",
-            DEFAULT_ACCOUNT,
-            "https://mcp.example.com/mcp?api_key=test-token",
-        );
-        let export = build(vec![server], ExportFormat::Claude);
-        assert!(export.entries.is_empty());
-        assert!(
-            !export.notes[0].contains("test-token"),
-            "{:?}",
-            export.notes
-        );
-    }
-
-    #[test]
-    fn secret_in_args_is_skipped() {
-        let server =
-            ResolvedServer::test_stdio("tool", DEFAULT_ACCOUNT, "npx", &["--api-key=test-token"]);
-        let export = build(vec![server], ExportFormat::Claude);
-        assert!(export.entries.is_empty());
-        assert!(
-            export.notes[0].starts_with("skipped tool"),
-            "{:?}",
-            export.notes
-        );
-    }
-
-    #[test]
     fn a_skipped_server_leaves_no_placeholders_behind() {
         let server = stdio(
             "broken",
@@ -918,11 +883,15 @@ mod tests {
     }
 
     #[test]
-    fn config_problems_are_noted() {
+    fn config_problems_are_noted_without_their_message() {
         let mut config = ResolvedConfig::test_with(Vec::new(), Vec::new());
         config.problems.push(ConfigProblem {
-            servers: vec!["linear".to_string()],
-            message: "linear is bound to two accounts".to_string(),
+            servers: vec!["demo".to_string()],
+            message: "`demo` has an invalid url `https://fake-user:fake-url-password@`".to_string(),
+        });
+        config.problems.push(ConfigProblem {
+            servers: Vec::new(),
+            message: "`trusted_paths` is only read from the global config".to_string(),
         });
         let export = Export::build(
             &config,
@@ -932,7 +901,10 @@ mod tests {
         );
         assert_eq!(
             export.notes,
-            ["not exported: linear is bound to two accounts"]
+            [
+                "not exported: demo has a config problem; run `plugbay why demo` to see it",
+                "a config file here has a problem; run `plugbay ls` to see it",
+            ]
         );
     }
 

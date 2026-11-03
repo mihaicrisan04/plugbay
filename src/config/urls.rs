@@ -48,7 +48,8 @@ fn mask_query_value(pair: &str) -> String {
     }
 }
 
-/// Long runs of letters and digits look like keys; words, versions and short ids don't.
+/// Long runs of letters and digits look like keys, as do well-known token prefixes (`sk-...`);
+/// words, versions and short ids don't.
 fn mask_if_token(segment: &str) -> &str {
     let token_characters = segment
         .chars()
@@ -57,7 +58,8 @@ fn mask_if_token(segment: &str) -> &str {
     let has_letter = segment
         .chars()
         .any(|character| character.is_ascii_alphabetic());
-    if segment.len() >= 20 && token_characters && has_digit && has_letter {
+    let long_mixed_run = segment.len() >= 20 && token_characters && has_digit && has_letter;
+    if long_mixed_run || crate::secrets::looks_like_token(segment) {
         MASK
     } else {
         segment
@@ -102,6 +104,10 @@ mod tests {
             (
                 "https://actions.example.com/mcp/sk-ak-0123456789abcdefghij/sse#frag",
                 "https://actions.example.com/mcp/***/sse#***",
+            ),
+            (
+                "https://example.test/mcp/sk-fake-secret",
+                "https://example.test/mcp/***",
             ),
             (
                 "http://[::1]:3000/servers/linear-workspace/mcp",

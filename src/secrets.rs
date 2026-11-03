@@ -164,10 +164,15 @@ pub fn has_secret_in_args(args: &[String]) -> bool {
 /// token-looking path segment, i.e. what [`crate::config::display_url`] masks.
 pub fn has_secret_url(text: &str) -> bool {
     for candidate in url_candidates(text) {
-        let may_hold_secret = match Url::parse(candidate) {
+        let after_scheme = &text[candidate.after_scheme..];
+        if has_userinfo(after_scheme) {
+            return true;
+        }
+        let may_hold_secret = match Url::parse(candidate.text) {
             Ok(url) => crate::config::url_may_hold_secret(&url),
-            // `https://token@` has no host, so it doesn't parse; its userinfo still counts.
-            Err(_) => authority(candidate).contains('@'),
+            // `https://token@` has no host and `https://user:pass word@host` stops at the space:
+            // neither parses, and any `@` after them may end a credential.
+            Err(_) => after_scheme.contains('@'),
         };
         if may_hold_secret {
             return true;
@@ -176,8 +181,25 @@ pub fn has_secret_url(text: &str) -> bool {
     false
 }
 
-/// Every `scheme://...` run in `text`, up to the next whitespace or quote.
-fn url_candidates(text: &str) -> Vec<&str> {
+/// True when a `${...}` ref sits inside a `scheme://...` URL in `value`: the text around it may be
+/// half a credential (`https://${env:USER}:password@host`). Fails on malformed refs.
+pub fn has_ref_in_url(value: &str) -> anyhow::Result<bool> {
+    const MARKER: &str = "\u{1}";
+    let marked = replace_refs(value, |_| MARKER.to_string())?;
+    let found = url_candidates(&marked)
+        .iter()
+        .any(|candidate| candidate.text.contains(MARKER));
+    Ok(found)
+}
+
+/// One `scheme://...` run in a text, up to the next whitespace or quote.
+struct UrlCandidate<'a> {
+    text: &'a str,
+    /// Where the text after `://` starts in the searched text.
+    after_scheme: usize,
+}
+
+fn url_candidates(text: &str) -> Vec<UrlCandidate<'_>> {
     let is_scheme_character =
         |character: char| character.is_ascii_alphanumeric() || "+-.".contains(character);
     let mut candidates = Vec::new();
@@ -192,20 +214,98 @@ fn url_candidates(text: &str) -> Vec<&str> {
             .map_or(text.len(), |index| separator + index);
         let scheme = &text[scheme_start..separator];
         if scheme.starts_with(|character: char| character.is_ascii_alphabetic()) {
-            candidates.push(&text[scheme_start..end]);
+            candidates.push(UrlCandidate {
+                text: &text[scheme_start..end],
+                after_scheme: separator + "://".len(),
+            });
         }
         searched = separator + "://".len();
     }
     candidates
 }
 
-/// The `user:pass@host:port` part of `scheme://user:pass@host:port/path`.
-fn authority(url: &str) -> &str {
-    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
-    let end = after_scheme
+/// `user:pass@` right after `scheme://`. Read up to the `@` rather than the first space or quote,
+/// which a password may hold; only the path, query or fragment ends the authority.
+fn has_userinfo(after_scheme: &str) -> bool {
+    let authority_end = after_scheme
         .find(['/', '?', '#'])
         .unwrap_or(after_scheme.len());
-    &after_scheme[..end]
+    after_scheme[..authority_end]
+        .find('@')
+        .is_some_and(|at| at > 0)
+}
+
+/// Well-known token prefixes: GitHub, GitLab, OpenAI and Anthropic (`sk-`), Slack, npm, AWS keys.
+const TOKEN_PREFIXES: [&str; 16] = [
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
+    "github_pat_",
+    "glpat-",
+    "sk-",
+    "xoxb-",
+    "xoxp-",
+    "xoxa-",
+    "xoxr-",
+    "xoxs-",
+    "xapp-",
+    "npm_",
+    "AKIA",
+];
+
+/// How much must follow a token prefix, so a word like `sk-learn` stays a word.
+const MIN_TOKEN_BODY: usize = 8;
+
+/// A run of base64 or hex this long, with letters and digits, reads as a key (UUIDs included).
+const MIN_OPAQUE_RUN: usize = 32;
+
+/// True when `text` holds a literal shaped like a credential, whatever field it sits in: a
+/// well-known token prefix (`ghp_`, `sk-`, `xoxb-`...), a JWT, or a long run of base64 or hex.
+/// A heuristic for `export`, deliberately eager: a false positive only costs a placeholder.
+pub fn has_token_literal(text: &str) -> bool {
+    if words(text, "_-.").any(looks_like_token) {
+        return true;
+    }
+    text.split_whitespace()
+        .filter(|word| !is_path_url_or_digest(word))
+        .flat_map(|word| words(word, "+/=_-"))
+        .any(is_opaque_run)
+}
+
+/// A single word that starts with a well-known token prefix or is a JWT (`eyJ...`, three dotted parts).
+pub fn looks_like_token(word: &str) -> bool {
+    let has_token_prefix = TOKEN_PREFIXES.iter().any(|prefix| {
+        word.strip_prefix(prefix)
+            .is_some_and(|body| body.len() >= MIN_TOKEN_BODY)
+    });
+    let parts: Vec<&str> = word.split('.').collect();
+    let is_jwt =
+        parts.len() == 3 && word.starts_with("eyJ") && parts.iter().all(|part| !part.is_empty());
+    has_token_prefix || is_jwt
+}
+
+/// Runs of ASCII letters, digits and `extra` characters in `text`.
+fn words<'a>(text: &'a str, extra: &'a str) -> impl Iterator<Item = &'a str> {
+    text.split(move |character: char| {
+        !character.is_ascii_alphanumeric() && !extra.contains(character)
+    })
+    .filter(|word| !word.is_empty())
+}
+
+/// Paths and urls are long runs too, and an image digest (`sha256:...`) is public.
+fn is_path_url_or_digest(word: &str) -> bool {
+    word.contains("://")
+        || word.starts_with(['/', '~', '.'])
+        || word.contains("sha256:")
+        || word.contains("sha512:")
+}
+
+fn is_opaque_run(run: &str) -> bool {
+    run.len() >= MIN_OPAQUE_RUN
+        && run.chars().any(|character| character.is_ascii_digit())
+        && run.chars().any(|character| character.is_ascii_alphabetic())
 }
 
 /// A log-safe stand-in for a resolved secret value. Keeps a leading auth scheme
@@ -435,6 +535,15 @@ pub(crate) mod keychain {
     }
 }
 
+/// A fake JWT for tests, split so secret scanners don't flag the source.
+#[cfg(test)]
+pub const FAKE_JWT: &str = concat!(
+    "ey",
+    "JhbGciOiJIUzI1NiJ9.",
+    "ey",
+    "JzdWIiOiJmYWtlIn0.fakeSignature"
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,13 +556,71 @@ mod tests {
         ));
         assert!(has_secret_url("https://mcp.example.com/mcp?api_key=fake"));
         assert!(has_secret_url("https://fake-token@"));
+        assert!(has_secret_url("postgres://fake-user: @db/app"));
+    }
+
+    #[test]
+    fn userinfo_with_spaces_quotes_or_slashes_still_counts() {
+        assert!(has_secret_url(
+            "postgres://fake-user:fake password@host/app"
+        ));
+        assert!(has_secret_url("https://fake-user:\"fake pass\"@host"));
+        assert!(has_secret_url("postgres://fake-user:fake/pass@host/app"));
+        assert!(has_secret_url("https://fake-user:fake pass/word@host/app"));
+    }
+
+    #[test]
+    fn refs_inside_urls_are_found() {
+        assert!(has_ref_in_url("https://${env:USER}:fake-url-password@host/app").unwrap());
+        assert!(has_ref_in_url("https://fake-user:fake${env:SUFFIX}@host/app").unwrap());
+        assert!(has_ref_in_url("https://mcp.example.com/${env:PATH_PART}").unwrap());
+        assert!(!has_ref_in_url("Bearer ${env:TOKEN}").unwrap());
+        assert!(!has_ref_in_url("${env:URL}").unwrap());
+        assert!(has_ref_in_url("https://host/${nope:x}").is_err());
+    }
+
+    #[test]
+    fn token_shaped_literals_are_detected() {
+        let tokens = [
+            "ghp_FAKE123456789012345678901234567890123456",
+            "github_pat_FAKE1234567890",
+            "sk-FAKE123456789012345678901234",
+            "sk-ant-fake-test-token",
+            "xoxb-fake-test-token",
+            "Bearer xoxp-fake-test-token",
+            "token=ghp_FAKE1234567890",
+            FAKE_JWT,
+            "0123456789abcdef0123456789abcdef",
+            "ZmFrZXNlY3JldA==ZmFrZXNlY3JldA==ZmFrZXNlY3JldA==",
+            "123e4567-e89b-12d3-a456-426614174000",
+        ];
+        for token in tokens {
+            assert!(has_token_literal(token), "{token}");
+        }
+    }
+
+    #[test]
+    fn ordinary_values_are_not_tokens() {
+        let values = [
+            "debug",
+            "sk-learn",
+            "risk-assessment",
+            "us-east-1",
+            "https://api.example.com/v1/organizations/1234567/projects",
+            "/Users/fake/dev/projects/plugbay-workspace-2026/config",
+            "ghcr.io/acme/tool@sha256:0123456789abcdef0123456789abcdef0123456789abcdef",
+            "version 1.2.3",
+            "",
+        ];
+        for value in values {
+            assert!(!has_token_literal(value), "{value}");
+        }
     }
 
     #[test]
     fn plain_urls_and_text_are_not_secrets() {
         assert!(!has_secret_url("https://mcp.example.com/mcp"));
         assert!(!has_secret_url("postgres://db.internal:5432/app"));
-        assert!(!has_secret_url("postgres://fake-user: @db/app"));
         assert!(!has_secret_url("debug"));
     }
 
