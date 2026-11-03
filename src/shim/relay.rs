@@ -15,6 +15,7 @@ use tokio::net::UnixStream;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 use super::conversation::{self, Conversation, Handshake, ListChanges, Route};
 use super::{
@@ -66,14 +67,13 @@ async fn relay<S>(
 ) where
     S: AsyncRead + AsyncWrite + Send + 'static,
 {
-    let (to_client, client_writer) = ToClient::spawn(agent_out);
     let client_budget = Arc::new(Semaphore::new(BUFFERED_BYTES_PER_DIRECTION));
-    let (from_client, client_reader) =
-        spawn_line_reader(agent_in, client_budget, PartialLine::Keep);
+    let client_reader = spawn_line_reader(agent_in, client_budget, PartialLine::Keep);
+    let (to_client, client_writer) = ToClient::spawn(agent_out, client_reader.ended.clone());
     let mut relay = Relay {
         connect,
         conversation: Conversation::default(),
-        from_client,
+        from_client: client_reader.lines,
         daemon: DaemonLink::new(daemon, to_client.budget.clone()),
         to_client,
         recent_moves: VecDeque::new(),
@@ -83,7 +83,7 @@ async fn relay<S>(
     relay.daemon.hang_up().await;
     // Let the errors for lost requests reach the agent before the shim exits.
     drop(relay);
-    client_reader.abort();
+    client_reader.task.abort();
     if tokio::time::timeout(CLIENT_FLUSH_WAIT, client_writer)
         .await
         .is_err()
@@ -151,9 +151,10 @@ where
     }
 
     /// Finds or starts a daemon and brings it to where the lost one was. False when the agent
-    /// left meanwhile or no daemon came up in time, which ends the shim.
+    /// left meanwhile or the move did not finish in time, which ends the shim.
     async fn move_to_new_daemon(&mut self) -> bool {
         tracing::info!("lost the daemon connection; moving the session to a new daemon");
+        let deadline = Instant::now() + RECONNECT_DEADLINE;
         if self.moved_too_often() {
             tracing::error!(
                 "the daemon closed this session {MAX_MOVES_PER_WINDOW} times within {}s; ending it",
@@ -169,7 +170,7 @@ where
             );
         }
         for line in lost {
-            if !self.to_client.send_new(line).await {
+            if !self.to_client.send_new(line, deadline).await {
                 return false;
             }
         }
@@ -199,7 +200,8 @@ where
         };
         let mut queued = Queued::default();
         let reconnected = queue_client_until(
-            tokio::time::timeout(RECONNECT_DEADLINE, reconnecting),
+            tokio::time::timeout_at(deadline, reconnecting),
+            deadline,
             &mut self.from_client,
             &mut self.conversation,
             &self.to_client,
@@ -215,7 +217,7 @@ where
                 );
                 false
             }
-            Some(Ok(connected)) => self.resume(connected, queued).await,
+            Some(Ok(connected)) => self.resume(connected, queued, deadline).await,
         }
     }
 
@@ -230,7 +232,7 @@ where
         self.recent_moves.len() > MAX_MOVES_PER_WINDOW
     }
 
-    async fn resume(&mut self, connected: Connected<S>, queued: Queued) -> bool {
+    async fn resume(&mut self, connected: Connected<S>, queued: Queued, deadline: Instant) -> bool {
         let Connected {
             link,
             early_lines,
@@ -243,7 +245,7 @@ where
             }
         }
         for line in list_changes.notifications() {
-            if !self.to_client.send_new(line).await {
+            if !self.to_client.send_new(line, deadline).await {
                 return false;
             }
         }
@@ -260,9 +262,11 @@ where
     }
 }
 
-/// Runs `connecting` while queueing what the agent sends. `None` when the agent left.
+/// Runs `connecting` while queueing what the agent sends. `None` when the agent left, or an error
+/// for it found no room on stdout before `deadline`.
 async fn queue_client_until<T>(
     connecting: impl Future<Output = T>,
+    deadline: Instant,
     from_client: &mut mpsc::Receiver<Line>,
     conversation: &mut Conversation,
     to_client: &ToClient,
@@ -277,7 +281,7 @@ async fn queue_client_until<T>(
                     tracing::info!("the agent hung up while plugbay was reconnecting");
                     return None;
                 };
-                if !queued.push(line, conversation, to_client).await {
+                if !queued.push(line, conversation, to_client, deadline).await {
                     return None;
                 }
             }
@@ -360,15 +364,19 @@ struct Queued {
 
 impl Queued {
     /// Queues `line`, or when the queue is full answers it with an error (requests) or drops it.
-    /// False when the agent is gone.
+    /// False when the agent is gone or the error found no room before `deadline`.
     async fn push(
         &mut self,
         line: Line,
         conversation: &mut Conversation,
         to_client: &ToClient,
+        deadline: Instant,
     ) -> bool {
         if self.bytes + line.bytes.len() > MAX_QUEUED_BYTES {
-            let Some(id) = conversation::request_id(&line.bytes) else {
+            let request_id = conversation::request_id(&line.bytes);
+            // Frees its budget while the error waits, so the agent's reader can still see EOF.
+            drop(line);
+            let Some(id) = request_id else {
                 tracing::warn!(
                     "dropped a message from the agent: too much queued while reconnecting"
                 );
@@ -376,7 +384,7 @@ impl Queued {
             };
             tracing::warn!("refused a request from the agent: too much queued while reconnecting");
             return to_client
-                .send_new(conversation::retry_error(id, QUEUE_FULL_MESSAGE))
+                .send_new(conversation::retry_error(id, QUEUE_FULL_MESSAGE), deadline)
                 .await;
         }
         let route = conversation.client_sent(&line.bytes);
@@ -400,11 +408,11 @@ where
 {
     fn new(stream: S, budget: Arc<Semaphore>) -> Self {
         let (read_half, writer) = tokio::io::split(stream);
-        let (lines, reader) = spawn_line_reader(read_half, budget, PartialLine::Drop);
+        let reader = spawn_line_reader(read_half, budget, PartialLine::Drop);
         Self {
-            lines,
+            lines: reader.lines,
             writer,
-            reader,
+            reader: reader.task,
         }
     }
 
@@ -441,10 +449,16 @@ impl<S> Drop for DaemonLink<S> {
 struct ToClient {
     lines: mpsc::UnboundedSender<Line>,
     budget: Arc<Semaphore>,
+    /// Cancelled once the agent's stdin ends; waiting for the budget stops then, dropping what the
+    /// agent never read.
+    agent_left: CancellationToken,
 }
 
 impl ToClient {
-    fn spawn(mut writer: impl AsyncWrite + Unpin + Send + 'static) -> (Self, JoinHandle<()>) {
+    fn spawn(
+        mut writer: impl AsyncWrite + Unpin + Send + 'static,
+        agent_left: CancellationToken,
+    ) -> (Self, JoinHandle<()>) {
         let (sender, mut lines) = mpsc::unbounded_channel::<Line>();
         let task = tokio::spawn(async move {
             while let Some(line) = lines.recv().await {
@@ -461,6 +475,7 @@ impl ToClient {
         let to_client = Self {
             lines: sender,
             budget: Arc::new(Semaphore::new(BUFFERED_BYTES_PER_DIRECTION)),
+            agent_left,
         };
         (to_client, task)
     }
@@ -470,9 +485,22 @@ impl ToClient {
         self.lines.send(line).is_ok()
     }
 
-    /// Sends a message of the shim's own, within the same budget.
-    async fn send_new(&self, bytes: Vec<u8>) -> bool {
-        let Some(budget) = acquire(&self.budget, bytes.len()).await else {
+    /// Sends a message of the shim's own, within the same budget, after what is already queued.
+    /// False when the agent left or there was no room by `deadline`: either ends the shim.
+    async fn send_new(&self, bytes: Vec<u8>, deadline: Instant) -> bool {
+        let budget = tokio::select! {
+            biased;
+            budget = acquire(&self.budget, bytes.len()) => budget,
+            () = self.agent_left.cancelled() => {
+                tracing::info!("the agent left without reading what plugbay still had for it");
+                None
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                tracing::error!("the agent stopped reading what plugbay sends; ending the session");
+                None
+            }
+        };
+        let Some(budget) = budget else {
             return false;
         };
         self.forward(Line {
@@ -495,31 +523,44 @@ enum PartialLine {
     Drop,
 }
 
-fn spawn_line_reader<R>(
-    reader: R,
-    budget: Arc<Semaphore>,
-    partial: PartialLine,
-) -> (mpsc::Receiver<Line>, JoinHandle<()>)
+struct LineReader {
+    lines: mpsc::Receiver<Line>,
+    /// Cancelled once the reader stops reading (EOF, an error, a line over the cap, an abort),
+    /// even while lines it read before still wait in `lines`.
+    ended: CancellationToken,
+    task: JoinHandle<()>,
+}
+
+fn spawn_line_reader<R>(reader: R, budget: Arc<Semaphore>, partial: PartialLine) -> LineReader
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
     let (lines, received) = mpsc::channel(LINE_BUFFER);
-    let task = tokio::spawn(async move {
-        let mut reader = BufReader::new(reader);
-        while let Some(bytes) = read_line(&mut reader, partial).await {
-            let Some(budget) = acquire(&budget, bytes.len()).await else {
-                break;
-            };
-            let line = Line {
-                bytes,
-                _budget: budget,
-            };
-            if lines.send(line).await.is_err() {
-                break;
+    let ended = CancellationToken::new();
+    let task = tokio::spawn({
+        let ended = ended.clone();
+        async move {
+            let _cancel_when_done = ended.drop_guard();
+            let mut reader = BufReader::new(reader);
+            while let Some(bytes) = read_line(&mut reader, partial).await {
+                let Some(budget) = acquire(&budget, bytes.len()).await else {
+                    break;
+                };
+                let line = Line {
+                    bytes,
+                    _budget: budget,
+                };
+                if lines.send(line).await.is_err() {
+                    break;
+                }
             }
         }
     });
-    (received, task)
+    LineReader {
+        lines: received,
+        ended,
+        task,
+    }
 }
 
 /// The next line, or `None` at the end: EOF, a read error, a line over [`MAX_LINE_BYTES`], or for
@@ -601,6 +642,10 @@ mod tests {
                     .unwrap();
             assert!(read > 0, "the other side hung up");
             serde_json::from_str(&line).unwrap()
+        }
+
+        async fn send_raw(&mut self, line: &[u8]) {
+            self.stream.get_mut().write_all(line).await.unwrap();
         }
 
         async fn hang_up(&mut self) {
@@ -863,11 +908,107 @@ mod tests {
         .await;
     }
 
+    /// A notification line of exactly `bytes` bytes.
+    fn notification_of(bytes: usize) -> Vec<u8> {
+        let line = |data: &str| {
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"notifications/message","params":{{"level":"info","data":"{data}"}}}}"#
+            ) + "\n"
+        };
+        let padding = bytes - line("").len();
+        line(&"x".repeat(padding)).into_bytes()
+    }
+
+    /// Sends the agent, which never reads, all its stdout budget can hold but `free` bytes.
+    async fn fill_stdout_budget(daemon: &mut Peer, free: usize) {
+        let total = BUFFERED_BYTES_PER_DIRECTION - free;
+        for size in [total / 2, total - total / 2] {
+            daemon.send_raw(&notification_of(size)).await;
+        }
+        settle().await;
+    }
+
+    /// Runs `test`, which leaves the relay waiting for room on a full stdout, then closes the
+    /// agent's stdin and checks the relay ends soon after. The agent keeps stdout open and never
+    /// reads it, and the daemon `test` returns stays connected, so neither frees the budget.
+    async fn ends_soon_after_the_agent_hangs_up(
+        test: impl AsyncFnOnce(&mut Peer, Peer, &mut Daemons) -> Option<Peer>,
+    ) {
+        let kept = std::sync::Mutex::new(Vec::new());
+        let hung_up = std::sync::OnceLock::new();
+        with_relay(
+            async |mut agent: Peer, daemon: Peer, mut daemons: Daemons| {
+                let connected = test(&mut agent, daemon, &mut daemons).await;
+                settle().await;
+                agent.hang_up().await;
+                hung_up.set(Instant::now()).unwrap();
+                kept.lock().unwrap().push((agent, daemons, connected));
+            },
+        )
+        .await;
+        let ended_after = hung_up.get().unwrap().elapsed();
+        assert!(
+            ended_after < Duration::from_secs(5),
+            "the relay ended {ended_after:?} after the agent hung up"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_agent_that_stops_reading_and_leaves_during_a_move_ends_the_shim() {
+        ends_soon_after_the_agent_hangs_up(async |agent: &mut Peer, mut daemon, _| {
+            agent.send(request(1, "tools/list")).await;
+            assert_eq!(daemon.receive().await["id"], 1);
+            fill_stdout_budget(&mut daemon, 0).await;
+            drop(daemon);
+            None
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_agent_that_stops_reading_and_leaves_with_a_full_queue_ends_the_shim() {
+        ends_soon_after_the_agent_hangs_up(async |agent: &mut Peer, mut daemon, daemons| {
+            fill_stdout_budget(&mut daemon, 0).await;
+            drop(daemon);
+            daemons.hellos.recv().await.unwrap();
+            let padded = |id: u32| {
+                let padding = "x".repeat(MAX_QUEUED_BYTES / 2 + 1);
+                json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": padding } })
+            };
+            agent.send(padded(1)).await;
+            agent.send(padded(2)).await;
+            None
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_agent_that_stops_reading_and_leaves_before_list_changed_ends_the_shim() {
+        ends_soon_after_the_agent_hangs_up(async |agent: &mut Peer, mut daemon, daemons| {
+            agent.send(initialize()).await;
+            assert_eq!(daemon.receive().await["method"], "initialize");
+            daemon.send(initialize_result(&json!(0))).await;
+            assert_eq!(agent.receive().await["id"], 0);
+            let filler = notification_of(1000);
+            fill_stdout_budget(&mut daemon, filler.len()).await;
+            drop(daemon);
+
+            let (mut daemon, _) = daemons.next().await;
+            let replayed = daemon.receive().await;
+            // The reply takes the room the filler waits for, and gives it back once swallowed.
+            let mut reply_then_filler = format!("{}\n", initialize_result(&replayed["id"]));
+            reply_then_filler.push_str(std::str::from_utf8(&filler).unwrap());
+            daemon.send_raw(reply_then_filler.as_bytes()).await;
+            Some(daemon)
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn a_line_over_the_cap_ends_its_reader() {
         let (mut writer, reader) = tokio::io::duplex(PIPE_BYTES);
         let budget = Arc::new(Semaphore::new(BUFFERED_BYTES_PER_DIRECTION));
-        let (mut lines, _task) = spawn_line_reader(reader, budget, PartialLine::Keep);
+        let mut lines = spawn_line_reader(reader, budget, PartialLine::Keep).lines;
         let flood = tokio::spawn(async move {
             let chunk = vec![b'x'; PIPE_BYTES];
             // Fails once the reader gave up.
@@ -884,7 +1025,7 @@ mod tests {
     async fn a_reader_waits_until_the_bytes_before_it_are_written() {
         let (mut writer, reader) = tokio::io::duplex(PIPE_BYTES);
         let budget = Arc::new(Semaphore::new(10));
-        let (mut lines, _task) = spawn_line_reader(reader, budget, PartialLine::Keep);
+        let mut lines = spawn_line_reader(reader, budget, PartialLine::Keep).lines;
         writer.write_all(b"first\nsecond\n").await.unwrap();
 
         let first = lines.recv().await.unwrap();
