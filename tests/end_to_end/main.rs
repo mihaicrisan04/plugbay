@@ -299,7 +299,16 @@ async fn wait_for_tool<H: ClientHandler>(
     client: &RunningService<RoleClient, H>,
     tool: &str,
 ) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    wait_for_tool_within(sandbox, client, tool, Duration::from_secs(10)).await;
+}
+
+async fn wait_for_tool_within<H: ClientHandler>(
+    sandbox: &Sandbox,
+    client: &RunningService<RoleClient, H>,
+    tool: &str,
+    timeout: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + timeout;
     while !tool_names(client).await.contains(&tool.to_string()) {
         assert!(
             tokio::time::Instant::now() < deadline,

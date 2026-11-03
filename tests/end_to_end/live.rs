@@ -234,6 +234,11 @@ async fn restart_answers_promptly_while_an_upstream_is_still_connecting() {
 
     let whoami = call_text(&client, "echo__whoami").await;
     assert!(whoami.starts_with("account=client-b "), "{whoami}");
+
+    // The reconnect finishes after the answer: the slow server comes back for the same agent.
+    wait_for_tool_within(&sandbox, &client, "slow__whoami", Duration::from_secs(25)).await;
+    let slow_whoami = call_text(&client, "slow__whoami").await;
+    assert!(slow_whoami.starts_with("account="), "{slow_whoami}");
     client.cancel().await.unwrap();
 }
 

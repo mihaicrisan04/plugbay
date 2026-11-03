@@ -288,13 +288,19 @@ async fn reconnect(shared: &Arc<Shared>, only: Option<ServerAccount>) -> String 
         let shared = shared.clone();
         async move {
             crate::vault::forget_cached();
-            let closed = match only {
+            let closed = match &only {
                 Some(ServerAccount { identity, account }) => {
-                    shared.pool.close_account(&identity, &account).await
+                    shared.pool.close_account(identity, account).await
                 }
                 None => shared.pool.close_all().await,
             };
-            shared.reload_all().await;
+            shared
+                .reload_after_retiring(|key| {
+                    only.as_ref().is_none_or(|only| {
+                        key.identity == only.identity && key.account == only.account
+                    })
+                })
+                .await;
             tracing::info!(closed, "closed upstream connections and reloaded");
             closed
         }
