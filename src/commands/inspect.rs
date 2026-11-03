@@ -11,7 +11,7 @@ use crate::config::{
     self, ConfigScope, ResolvedConfig, ResolvedServer, ServerTransport, SessionPin,
 };
 use crate::identity::VerifiedAccounts;
-use crate::paths::Paths;
+use crate::paths::{Paths, display_path};
 use crate::project::ProjectLocation;
 use crate::report::{self, LoginState, Report};
 use crate::{registry, secrets};
@@ -496,14 +496,6 @@ fn keyed_value(name: &str, value: Option<&String>) -> String {
         return secrets::redact(value);
     }
     value.clone()
-}
-
-pub(super) fn display_path(path: &Path, home: &Path) -> String {
-    match path.strip_prefix(home) {
-        Ok(relative) if relative.as_os_str().is_empty() => "~".to_string(),
-        Ok(relative) => format!("~/{}", relative.display()),
-        Err(_) => path.display().to_string(),
-    }
 }
 
 /// Left-aligned columns separated by two spaces, indented by two.

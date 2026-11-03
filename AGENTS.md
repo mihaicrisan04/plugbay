@@ -41,7 +41,7 @@ Status: v0.2.1, public at github.com/mihaicrisan04/plugbay, work on `main`. Road
 - `src/main.rs` CLI · `shim.rs` (`connect`) → `daemon.rs` (socket, control, idle exit) → `session.rs` (one agent: refresh, upstream connects, routing, config watch) + `session/{enable,login,prompt,render,tools}.rs` (session pins, login stubs, trust/account prompts, instructions and status, built-in tools) → `upstream.rs` (shared upstream pool) + `upstream/stdio.rs` (process groups, message cap)
 - `config.rs` + `config/{file,merge,build,urls}.rs` + `registry.rs` (built-in servers; `registry/official.rs`: the official MCP Registry client) + `project.rs`: resolution (catalog = global entries with `enabled = false`) · `index.rs`: every config directory seen, for commands that work from anywhere
 - `secrets.rs`, `credentials.rs`, `oauth.rs`, `trust.rs`, `identity.rs`: security and verified accounts
-- `commands/`: `access.rs` (login/logout/trust), `inspect.rs` (ls/accounts/why), `pins.rs` (use/unuse/add/remove), `search.rs` (search, `add --from`) · `clients.rs` + `clients/{claude,codex,import,migrate}.rs`: native client configs, `setup`, `migrate` · `doctor.rs`
+- `commands/`: `access.rs` (login/logout/trust), `inspect.rs` (ls/accounts/why), `pins.rs` (use/unuse/add/remove), `search.rs` (search, `add --from`) · `clients.rs` + `clients/{claude,codex,import,migrate,export}.rs`: native client configs, `setup`, `migrate`, `export` · `doctor.rs`
 
 ## Skills
 

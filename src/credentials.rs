@@ -139,11 +139,14 @@ impl std::fmt::Debug for StaticToken {
 }
 
 /// What `plugbay login` stored for one server identity + account.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoredLogin {
     None,
     OAuth,
-    Token,
+    /// A static token, sent in this lowercase header.
+    Token {
+        header: String,
+    },
 }
 
 pub async fn save_token(
@@ -173,8 +176,10 @@ pub async fn load_token(
 
 /// A stored token wins over an OAuth login, matching the order upstream connections use them in.
 pub async fn stored_login(identity: &ServerIdentity, account: &str) -> anyhow::Result<StoredLogin> {
-    if load_token(identity, account).await?.is_some() {
-        return Ok(StoredLogin::Token);
+    if let Some(token) = load_token(identity, account).await? {
+        return Ok(StoredLogin::Token {
+            header: token.header,
+        });
     }
     if has_stored_credentials(identity, account).await? {
         return Ok(StoredLogin::OAuth);

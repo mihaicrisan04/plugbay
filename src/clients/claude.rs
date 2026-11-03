@@ -14,6 +14,9 @@ use super::{
     read_optional,
 };
 
+/// The project-scope file, next to the code and committed with it.
+pub(super) const PROJECT_FILE: &str = ".mcp.json";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClaudeScope {
     /// Top-level `mcpServers` in `~/.claude.json`: every project.
@@ -106,7 +109,7 @@ pub(crate) fn read_project_servers(
     if let Some(config) = read_config(&config_file(home))? {
         servers.extend(local_servers(config.projects, project_dir));
     }
-    if let Some(config) = read_config(&project_dir.join(".mcp.json"))? {
+    if let Some(config) = read_config(&project_dir.join(PROJECT_FILE))? {
         servers.extend(native_servers(config.mcp_servers, ClaudeScope::Project));
     }
     Ok(servers)
@@ -124,7 +127,7 @@ pub(crate) fn read_projects(home: &Path) -> anyhow::Result<Vec<ClaudeProjectStat
             continue;
         }
         let mut servers = native_servers(project.mcp_servers, ClaudeScope::Local);
-        if let Some(mcp_json) = read_config(&directory.join(".mcp.json"))? {
+        if let Some(mcp_json) = read_config(&directory.join(PROJECT_FILE))? {
             servers.extend(native_servers(mcp_json.mcp_servers, ClaudeScope::Project));
         }
         projects.push(ClaudeProjectState {
@@ -226,11 +229,13 @@ pub(crate) fn add_json_command(
 }
 
 fn add_command(shim: &ShimCommand) -> Vec<String> {
-    let entry = serde_json::json!({
-        "type": "stdio",
-        "command": shim.command,
-        "args": ShimCommand::args(),
-    });
+    let entry = NativeTransport::Stdio {
+        command: shim.command.clone(),
+        args: ShimCommand::args(),
+        env: BTreeMap::new(),
+        cwd: None,
+    }
+    .to_json();
     let mut command: Vec<String> = ["mcp", "add-json", "--scope", "user", PLUGBAY_ENTRY]
         .map(String::from)
         .to_vec();
@@ -358,7 +363,7 @@ fn env_ref_to_plugbay(value: &str) -> String {
     converted
 }
 
-fn is_env_variable_name(name: &str) -> bool {
+pub(super) fn is_env_variable_name(name: &str) -> bool {
     let mut characters = name.chars();
     let Some(first) = characters.next() else {
         return false;
@@ -481,7 +486,7 @@ mod tests {
                 "--scope".to_string(),
                 "user".to_string(),
                 "plugbay".to_string(),
-                r#"{"args":["connect"],"command":"/opt/plugbay","type":"stdio"}"#.to_string(),
+                r#"{"type":"stdio","command":"/opt/plugbay","args":["connect"]}"#.to_string(),
             ]]
         );
     }

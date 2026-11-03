@@ -2,6 +2,7 @@
 
 mod claude;
 mod codex;
+mod export;
 mod import;
 mod migrate;
 
@@ -17,6 +18,7 @@ use crate::config::ServerIdentity;
 use crate::paths::{self, Paths};
 
 pub(crate) use claude::ClaudeScope;
+pub use export::{ExportOptions, export};
 pub use import::{ImportOptions, import};
 pub use migrate::{MigrateOptions, migrate};
 
@@ -206,6 +208,42 @@ impl NativeServer {
                 codex::config_file(home).display()
             ),
         }
+    }
+}
+
+impl NativeTransport {
+    /// The entry as Claude Code's `.mcp.json` (and VS Code's `mcp.json`) spell it: the inverse of
+    /// reading one. Empty lists and maps are left out.
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut entry = serde_json::Map::new();
+        match self {
+            NativeTransport::Stdio {
+                command,
+                args,
+                env,
+                cwd,
+            } => {
+                entry.insert("type".to_string(), "stdio".into());
+                entry.insert("command".to_string(), command.as_str().into());
+                if !args.is_empty() {
+                    entry.insert("args".to_string(), args.as_slice().into());
+                }
+                if !env.is_empty() {
+                    entry.insert("env".to_string(), serde_json::json!(env));
+                }
+                if let Some(cwd) = cwd {
+                    entry.insert("cwd".to_string(), cwd.as_str().into());
+                }
+            }
+            NativeTransport::Http { url, headers } => {
+                entry.insert("type".to_string(), "http".into());
+                entry.insert("url".to_string(), url.as_str().into());
+                if !headers.is_empty() {
+                    entry.insert("headers".to_string(), serde_json::json!(headers));
+                }
+            }
+        }
+        serde_json::Value::Object(entry)
     }
 }
 

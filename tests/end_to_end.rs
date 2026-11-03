@@ -1549,3 +1549,88 @@ fn completions_register_under_the_alias_they_were_run_as() {
     let script = String::from_utf8(output.stdout).unwrap();
     assert!(script.starts_with("#compdef pb\n"), "{script}");
 }
+
+#[tokio::test]
+async fn export_writes_placeholders_and_merges_into_existing_files() {
+    let sandbox = Sandbox::new();
+    sandbox.append_to_global_config(
+        r#"
+[servers.tracker]
+url = "https://mcp.tracker.example/mcp"
+enabled = false
+
+[servers.tool]
+command = "npx"
+args = ["-y", "tool"]
+env = { TOOL_API_KEY = "${keychain:plugbay/tool-key}", LOG_LEVEL = "debug" }
+enabled = false
+"#,
+    );
+    let team = sandbox.projects.join("team");
+    write_project(
+        &team,
+        "[servers]\necho = \"client-b\"\ntracker = true\ntool = true\n",
+    );
+    let login = std::process::Command::new(env!("CARGO_BIN_EXE_plugbay"))
+        .args(["login", "tracker", "--from-env", "TRACKER_TEST_TOKEN"])
+        .current_dir(&team)
+        .env("PLUGBAY_HOME", &sandbox.plugbay_home)
+        .env(
+            "PLUGBAY_INSECURE_TEST_VAULT",
+            sandbox.plugbay_home.join("vault.json"),
+        )
+        .env("TRACKER_TEST_TOKEN", "test-token")
+        .output()
+        .unwrap();
+    assert!(login.status.success(), "{}", text(&login.stderr));
+
+    let printed = plugbay_output(&sandbox, &["export", "--format", "claude"], "team");
+    assert!(printed.status.success(), "{}", text(&printed.stderr));
+    let stdout = text(&printed.stdout);
+    let stderr = text(&printed.stderr);
+    assert!(!stdout.contains("test-token") && !stderr.contains("test-token"));
+    let exported: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        exported["mcpServers"]["tracker"]["headers"]["authorization"],
+        "Bearer ${TRACKER_TOKEN}"
+    );
+    assert_eq!(
+        exported["mcpServers"]["tool"]["env"]["TOOL_API_KEY"],
+        "${TOOL_API_KEY}"
+    );
+    assert!(stderr.contains("account `client-b`"), "{stderr}");
+    assert!(stderr.contains("TRACKER_TOKEN"), "{stderr}");
+    assert!(!team.join(".mcp.json").exists());
+
+    let mcp_json = team.join(".mcp.json");
+    std::fs::write(
+        &mcp_json,
+        r#"{ "mcpServers": { "echo": { "command": "theirs" } }, "custom": 1 }"#,
+    )
+    .unwrap();
+    let written = sandbox.plugbay(&["export", "--format", "claude", "--write"], "team");
+    assert!(written.contains("added tool, tracker"), "{written}");
+    assert!(written.contains("kept the existing echo"), "{written}");
+    let merged: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mcp_json).unwrap()).unwrap();
+    assert_eq!(merged["mcpServers"]["echo"]["command"], "theirs");
+    assert_eq!(merged["custom"], 1);
+
+    sandbox.plugbay(
+        &["export", "--format", "claude", "--write", "--force"],
+        "team",
+    );
+    let forced: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&mcp_json).unwrap()).unwrap();
+    assert_eq!(forced["mcpServers"]["echo"]["type"], "stdio");
+
+    sandbox.plugbay(&["export", "--format", "vscode", "--write"], "team");
+    let vscode: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(team.join(".vscode/mcp.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        vscode["servers"]["tool"]["env"]["TOOL_API_KEY"],
+        "${input:tool-api-key}"
+    );
+    assert_eq!(vscode["inputs"].as_array().unwrap().len(), 2);
+}
