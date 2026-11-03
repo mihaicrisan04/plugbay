@@ -57,7 +57,7 @@ pub async fn login(
 
 /// `target` as this directory resolves it; otherwise the one match among every directory
 /// plugbay has seen; otherwise the catalog or the registry.
-async fn find_server(
+pub(super) async fn find_server(
     paths: &Paths,
     cd: Option<PathBuf>,
     target: &str,

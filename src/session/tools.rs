@@ -7,9 +7,9 @@ use serde::Deserialize;
 
 use crate::config::ResolvedServer;
 
-pub(super) const TOOL_SEPARATOR: &str = "__";
+pub const TOOL_SEPARATOR: &str = "__";
 const MAX_TOOL_NAME_LENGTH: usize = 64;
-pub(super) const STATUS_TOOL: &str = "plugbay__status";
+pub const STATUS_TOOL: &str = "plugbay__status";
 pub(super) const ENABLE_TOOL: &str = "plugbay__enable";
 pub(super) const DISABLE_TOOL: &str = "plugbay__disable";
 

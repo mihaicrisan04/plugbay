@@ -209,6 +209,10 @@ The full reference is [docs/config-schema.md](docs/config-schema.md).
 | `export --format claude\|vscode` | Print this directory's servers as `.mcp.json` or `.vscode/mcp.json` for teammates without plugbay; secrets become placeholders (`--write` merges into the file, `--force` replaces entries of the same name) |
 | `setup` | Register plugbay in Claude Code and Codex (`--client`, `--dry-run`) |
 | `doctor` | Check the installation, daemon, config and client setup |
+| `tools [server]` | The tools an agent started here gets, and why any server is off (untrusted, needs login, still connecting) |
+| `call <server>__<tool> [json]` | Call a tool as an agent here would: `plugbay call linear__list_teams '{}'` (`-` reads the JSON from stdin) |
+| `restart [server[:account]]` | Reconnect upstream servers (all, or one account) while agents stay connected |
+| `logs` | The end of the daemon log (`-n 200` lines, `-f` to follow) |
 | `stop` | Stop the daemon; agents start a fresh one on their next connection |
 | `completion <shell>` | Shell completions for bash, zsh, fish, elvish, powershell |
 

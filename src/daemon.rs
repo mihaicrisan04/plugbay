@@ -20,7 +20,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use crate::config::ServerIdentity;
 use crate::paths::Paths;
 use crate::project::ProjectHints;
-use crate::protocol::{self, ControlRequest, ControlResponse, Hello, write_line};
+use crate::protocol::{self, ControlRequest, ControlResponse, Hello, ServerAccount, write_line};
 use crate::session::{Session, Shared};
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -253,12 +253,17 @@ async fn handle_control(
             shared.reload_all().await;
             "reloaded".to_string()
         }
-        ControlRequest::CredentialsChanged { identity, account } => {
+        ControlRequest::Reconnect { only } => {
             crate::vault::forget_cached();
-            let closed = shared
-                .pool
-                .close_account(&ServerIdentity(identity), &account)
-                .await;
+            let closed = match only {
+                Some(ServerAccount { identity, account }) => {
+                    shared
+                        .pool
+                        .close_account(&ServerIdentity(identity), &account)
+                        .await
+                }
+                None => shared.pool.close_all().await,
+            };
             shared.reload_all().await;
             format!("closed {closed} connection(s) and reloaded")
         }

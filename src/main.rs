@@ -63,6 +63,32 @@ enum Command {
     },
     /// Ask a running daemon to exit (agents start a new one on their next connection).
     Stop,
+    /// Reconnect upstream servers (all, or one server account) without disconnecting agents.
+    Restart {
+        /// `server` or `server:account`, e.g. `linear:initech`; found like `plugbay login` finds it.
+        target: Option<String>,
+    },
+    /// Print the end of the daemon log.
+    Logs {
+        /// Keep printing lines as they are written.
+        #[arg(short, long)]
+        follow: bool,
+        /// How many lines to show from the end.
+        #[arg(short = 'n', long, default_value_t = 50)]
+        lines: usize,
+    },
+    /// List the tools an agent started here gets, exactly as it sees them.
+    Tools {
+        /// Only this server's tools, e.g. `linear`.
+        server: Option<String>,
+    },
+    /// Call a tool the way an agent here would: `plugbay call echo__echo '{"text": "hi"}'`.
+    Call {
+        /// `<server>__<tool>`, as `plugbay tools` lists it.
+        tool: String,
+        /// Arguments as a JSON object, or `-` to read them from stdin. Defaults to `{}`.
+        arguments: Option<String>,
+    },
     /// List the servers resolved for a directory.
     Ls {
         /// Every directory with a plugbay config that plugbay has seen, not just this one.
@@ -161,6 +187,12 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<()> {
             daemon::run(&paths, Duration::from_secs(idle_timeout)).await
         }
         Command::Stop => commands::stop(&paths).await,
+        Command::Restart { target } => commands::restart(&paths, cd, target.as_deref()).await,
+        Command::Logs { follow, lines } => commands::logs(&paths, follow, lines).await,
+        Command::Tools { server } => commands::tools(&paths, cd, server.as_deref()).await,
+        Command::Call { tool, arguments } => {
+            commands::call(&paths, cd, &tool, arguments.as_deref()).await
+        }
         Command::Ls { all: true, .. } => commands::ls_all(&paths, cd).await,
         Command::Ls { available, .. } => commands::ls(&paths, cd, available).await,
         Command::Why { server } => commands::why(&paths, &server, cd).await,

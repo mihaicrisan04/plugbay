@@ -2,6 +2,8 @@
 
 mod access;
 mod inspect;
+mod live;
+mod logs;
 mod pins;
 mod search;
 
@@ -11,10 +13,12 @@ use crate::config::{self, ResolvedConfig};
 use crate::index;
 use crate::paths::Paths;
 use crate::project::{self, ProjectHints, ProjectLocation};
-use crate::protocol::ControlRequest;
+use crate::protocol::{ControlRequest, ServerAccount};
 
 pub use access::{TokenOptions, login, logout, trust};
 pub use inspect::{accounts, ls, ls_all, why};
+pub use live::{call, restart, tools};
+pub use logs::logs;
 pub use pins::{AddOptions, PinOptions, add, remove, unuse_servers, use_servers};
 pub use search::search;
 
@@ -66,12 +70,18 @@ pub async fn stop(paths: &Paths) -> anyhow::Result<()> {
 /// Tells a running daemon that `server`'s credentials changed, so it drops connections made with
 /// the old ones. Silent when none is running.
 pub async fn notify_credentials_changed(paths: &Paths, server: &config::ResolvedServer) {
-    let request = ControlRequest::CredentialsChanged {
-        identity: server.identity.0.clone(),
-        account: server.account.clone(),
+    let request = ControlRequest::Reconnect {
+        only: Some(server_account(server)),
     };
     if let Err(error) = crate::protocol::send_control(paths, request).await {
         tracing::debug!(%error, "no daemon to tell about new credentials");
+    }
+}
+
+fn server_account(server: &config::ResolvedServer) -> ServerAccount {
+    ServerAccount {
+        identity: server.identity.0.clone(),
+        account: server.account.clone(),
     }
 }
 

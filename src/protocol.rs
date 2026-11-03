@@ -37,13 +37,20 @@ pub enum ControlRequest {
     Reload,
     /// Drop every `allow_once` grant, then reload (after `plugbay trust --revoke`).
     ForgetSessionTrust,
-    /// Close connections made with a server account's old credentials, then reload
-    /// (after `login` or `logout`), so the new ones apply right away.
-    CredentialsChanged {
-        identity: String,
-        account: String,
+    /// Close pooled upstream connections, those of one server account or all of them, then
+    /// reload every session so it reconnects: after `login` / `logout` (the new credentials
+    /// apply right away) and for `plugbay restart`. Agents stay connected throughout.
+    Reconnect {
+        only: Option<ServerAccount>,
     },
     Stop,
+}
+
+/// One server account, keyed by the server's identity like its credentials.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerAccount {
+    pub identity: String,
+    pub account: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

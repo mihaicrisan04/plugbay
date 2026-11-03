@@ -23,7 +23,7 @@ pub async fn run(paths: &Paths, project: Option<PathBuf>) -> anyhow::Result<()> 
         cwd: std::env::current_dir().ok(),
     };
 
-    let stream = match connect_or_start_daemon(paths).await {
+    let mut stream = match connect_or_start_daemon(paths).await {
         Ok(stream) => stream,
         Err(error) => {
             tracing::warn!(
@@ -34,9 +34,30 @@ pub async fn run(paths: &Paths, project: Option<PathBuf>) -> anyhow::Result<()> 
         }
     };
 
-    forward(stream, hints).await;
+    match greet_as_session(&mut stream, hints).await {
+        Ok(()) => forward(stream).await,
+        Err(error) => tracing::error!(error = format!("{error:#}"), "could not greet the daemon"),
+    }
     // stdin is read on a blocking thread that can't be cancelled; exit instead of waiting for it.
     std::process::exit(0)
+}
+
+/// A daemon connection that carries MCP for a session at `hints`, exactly like an agent's
+/// (used by `plugbay tools` and `call`). Starts the daemon if none is running.
+pub async fn open_session(paths: &Paths, hints: ProjectHints) -> anyhow::Result<UnixStream> {
+    let mut stream = connect_or_start_daemon(paths).await?;
+    greet_as_session(&mut stream, hints).await?;
+    Ok(stream)
+}
+
+async fn greet_as_session(stream: &mut UnixStream, hints: ProjectHints) -> anyhow::Result<()> {
+    let hello = Hello::Session {
+        version: protocol::VERSION.to_string(),
+        hints,
+    };
+    protocol::write_line(stream, &hello)
+        .await
+        .context("greeting the daemon")
 }
 
 async fn connect_or_start_daemon(paths: &Paths) -> anyhow::Result<UnixStream> {
@@ -87,16 +108,7 @@ fn start_daemon(paths: &Paths) -> anyhow::Result<()> {
 }
 
 /// Copies the agent's stdio to the daemon and back until either side closes.
-async fn forward(mut stream: UnixStream, hints: ProjectHints) {
-    let hello = Hello::Session {
-        version: protocol::VERSION.to_string(),
-        hints,
-    };
-    if let Err(error) = protocol::write_line(&mut stream, &hello).await {
-        tracing::error!(error = format!("{error:#}"), "could not greet the daemon");
-        return;
-    }
-
+async fn forward(stream: UnixStream) {
     let (mut from_daemon, mut to_daemon) = stream.into_split();
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();

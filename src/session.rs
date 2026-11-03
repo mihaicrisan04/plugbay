@@ -31,10 +31,12 @@ use crate::report::ServerState;
 use crate::trust::Trust;
 use crate::upstream::{ConnectError, Lease, MayConnect, Upstream, UpstreamKey, UpstreamPool};
 
+pub use self::tools::{STATUS_TOOL, TOOL_SEPARATOR};
+
 use self::prompt::TrustPromptKey;
 use self::tools::{
-    DISABLE_TOOL, ENABLE_TOOL, STATUS_TOOL, TOOL_SEPARATOR, disable_tool, enable_tool,
-    error_result, exposed_tools, login_tool, status_tool, text_result,
+    DISABLE_TOOL, ENABLE_TOOL, disable_tool, enable_tool, error_result, exposed_tools, login_tool,
+    status_tool, text_result,
 };
 
 const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -45,7 +47,7 @@ const READY_DEADLINE: Duration = Duration::from_secs(8);
 
 /// [`READY_DEADLINE`], or less via `PLUGBAY_READY_DEADLINE_MS` (for tests, which would otherwise
 /// sit through it). It can only shorten the wait.
-fn ready_deadline() -> Duration {
+pub fn ready_deadline() -> Duration {
     static DEADLINE: OnceLock<Duration> = OnceLock::new();
     *DEADLINE.get_or_init(|| {
         let configured = std::env::var("PLUGBAY_READY_DEADLINE_MS")
