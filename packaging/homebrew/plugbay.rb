@@ -35,7 +35,11 @@ class Plugbay < Formula
 
   def install
     bin.install "plugbay"
-    generate_completions_from_executable(bin/"plugbay", "completion")
+    bin.install_symlink "plugbay" => "plug"
+    bin.install_symlink "plugbay" => "pb"
+    %w[plugbay plug pb].each do |name|
+      generate_completions_from_executable(bin/name, "completion", base_name: name)
+    end
     doc.install "README.md", "LICENSE"
   end
 

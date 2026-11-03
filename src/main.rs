@@ -19,7 +19,7 @@ mod trust;
 mod upstream;
 mod vault;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::{CommandFactory, Parser, Subcommand};
@@ -124,7 +124,7 @@ enum Command {
     Import(clients::ImportOptions),
     /// Check the installation, daemon, config and client setup.
     Doctor,
-    /// Print shell completions: `plugbay completion zsh > ~/.zfunc/_plugbay`.
+    /// Print shell completions for the name this was run as: `pb completion zsh > ~/.zfunc/_pb`.
     Completion { shell: clap_complete::Shell },
 }
 
@@ -172,10 +172,23 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<()> {
             clap_complete::generate(
                 shell,
                 &mut Cli::command(),
-                "plugbay",
+                invoked_name(),
                 &mut std::io::stdout(),
             );
             Ok(())
         }
     }
+}
+
+/// The name this binary was run as (`plugbay`, or the `plug` / `pb` links), so completions
+/// register under the command the user actually types.
+fn invoked_name() -> String {
+    std::env::args_os()
+        .next()
+        .and_then(|program| {
+            Path::new(&program)
+                .file_stem()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "plugbay".to_owned())
 }

@@ -94,6 +94,8 @@ Or with Cargo (Rust 1.89+):
 cargo install --locked --git https://github.com/mihaicrisan04/plugbay
 ```
 
+Homebrew also links the shorter `plug` and `pb`, which work exactly like `plugbay`. Installed another way? `ln -s plugbay pb` next to the binary does the same.
+
 Prebuilt binaries for macOS and Linux (arm64, x86_64) are on the [releases page](https://github.com/mihaicrisan04/plugbay/releases). To build from source: `git clone`, then `cargo build --release`.
 
 ## Quick start
