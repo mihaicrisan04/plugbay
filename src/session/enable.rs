@@ -10,6 +10,7 @@ use super::tools::{
 use super::{ActiveServer, ServerStatus, Session};
 use crate::config::{self, ResolvedConfig, SessionPin};
 use crate::registry;
+use crate::report::{self, Audience};
 
 impl Session {
     /// Switches a catalog or registry server on for this session only, keeping the pin only if it works.
@@ -172,12 +173,13 @@ impl Session {
                      {prefix}{TOOL_SEPARATOR}* appear once it is up."
                 )),
                 ServerStatus::NeedsLogin { .. } => lines.push(format!(
-                    "{display_name} is on but needs a login: call {prefix}{TOOL_SEPARATOR}login, \
-                     or ask the human to run `plugbay login {display_name}`."
+                    "{display_name} is on but needs login: {}.",
+                    report::login_next_step(&active.server, Audience::Agent)
                 )),
                 ServerStatus::Untrusted => {
                     return Err(format!(
-                        "{display_name} runs a command or reads secrets from config that is not trusted yet; ask the human to run `plugbay trust`"
+                        "{display_name} runs a command or reads secrets from config that is not trusted yet; {}",
+                        report::trust_next_step(Audience::Agent)
                     ));
                 }
                 ServerStatus::Failed(error) => {

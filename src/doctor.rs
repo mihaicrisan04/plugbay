@@ -6,11 +6,9 @@ use std::time::Duration;
 
 use crate::clients::{self, Client, NativeServer, SetupState, ShimCommand};
 use crate::config::{ResolvedConfig, ResolvedServer, ServerTransport};
-use crate::credentials::{self, StoredLogin};
-use crate::identity::{self, VerifiedAccounts};
 use crate::paths::Paths;
 use crate::protocol::{self, ControlRequest};
-use crate::trust::Trust;
+use crate::report::{self, Audience, LoginState, Report, ServerReport, TrustState};
 
 const DAEMON_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -208,56 +206,42 @@ fn check_resolved_config(config: &ResolvedConfig) -> Vec<Check> {
 }
 
 async fn check_servers(paths: &Paths, config: &ResolvedConfig) -> Vec<Check> {
-    let trust = Trust::new(paths);
-    let verified = VerifiedAccounts::load(paths).await;
+    let report = Report::build(paths, config).await;
     let mut checks = Vec::new();
-    for server in &config.servers {
-        checks.extend(check_server_trust(&trust, server, config));
-        checks.extend(check_server_credentials(server).await);
-        checks.extend(check_verified_account(server, &verified));
+    for server in &report.servers {
+        checks.extend(check_server_trust(server));
+        checks.extend(check_server_credentials(server));
+        checks.extend(check_verified_account(server));
     }
     checks.extend(check_op_cli(&config.servers));
     checks
 }
 
-fn check_server_trust(
-    trust: &Trust,
-    server: &ResolvedServer,
-    config: &ResolvedConfig,
-) -> Option<Check> {
-    if server.requires_trust_from.is_empty() {
-        return None;
-    }
-    let name = describe(server);
-    if trust.is_server_trusted(server, config) {
-        Some(Check::ok(format!("{name}: trusted")))
-    } else {
-        Some(Check::warn(
+fn check_server_trust(report: &ServerReport) -> Option<Check> {
+    let name = describe(report.server);
+    match report.trust {
+        TrustState::NotNeeded => None,
+        TrustState::Trusted => Some(Check::ok(format!("{name}: trusted"))),
+        TrustState::Untrusted => Some(Check::warn(
             format!("{name}: not trusted, agents won't get it"),
-            "review the config, then run `plugbay trust`",
-        ))
+            report::trust_next_step(Audience::Human),
+        )),
     }
 }
 
-async fn check_server_credentials(server: &ResolvedServer) -> Option<Check> {
-    if !server.uses_stored_login() {
-        return None;
-    }
-
-    let name = describe(server);
-    let check = match credentials::stored_login(&server.identity, &server.account).await {
-        Ok(StoredLogin::OAuth) => Check::ok(format!("{name}: logged in")),
-        Ok(StoredLogin::Token) => Check::ok(format!("{name}: token stored")),
-        Ok(StoredLogin::None) => Check::warn(
+fn check_server_credentials(report: &ServerReport) -> Option<Check> {
+    let name = describe(report.server);
+    let check = match report.login.as_ref()? {
+        LoginState::NotNeeded => return None,
+        LoginState::OAuth => Check::ok(format!("{name}: logged in")),
+        LoginState::Token => Check::ok(format!("{name}: token stored")),
+        LoginState::Missing => Check::warn(
             format!("{name}: no stored login or token (fine if the server needs none)"),
-            format!(
-                "plugbay login {} (add --token for an API token)",
-                server.display_name()
-            ),
+            report::login_next_step(report.server, Audience::Human),
         ),
-        Err(error) => Check::warn(
-            format!("{name}: cannot read the keychain: {error:#}"),
-            "unlock the keychain, then run `plugbay doctor` again",
+        LoginState::Unknown(error) => Check::warn(
+            format!("{name}: cannot read the keychain: {error}"),
+            report::KEYCHAIN_NEXT_STEP,
         ),
     };
     Some(check)
@@ -265,29 +249,23 @@ async fn check_server_credentials(server: &ResolvedServer) -> Option<Check> {
 
 /// Who the login turned out to be, when the server was asked: wrong for `expect`, or the same
 /// account as another label of this server (fine if intended, a mix-up if not).
-fn check_verified_account(server: &ResolvedServer, verified: &VerifiedAccounts) -> Option<Check> {
-    let name = server.display_name();
+fn check_verified_account(report: &ServerReport) -> Option<Check> {
+    let name = report.server.display_name();
     let relogin = format!("run `plugbay logout {name}`, then `plugbay login {name}`");
-    if let Some(failure) = identity::expectation_failure(server, verified) {
+    if let Some(failure) = &report.wrong_account {
         return Some(Check::error(
             format!("{failure}; agents won't get it"),
             format!("{relogin} and pick the expected workspace"),
         ));
     }
-    let shown = verified.shown(&server.identity, &server.account)?;
-
-    let same_login = verified.same_login_as(&server.identity, &server.account);
-    if same_login.is_empty() {
+    let shown = report.verified.as_ref()?;
+    if report.same_login_as.is_empty() {
         return Some(Check::ok(format!("{name}: verified as {shown}")));
     }
-    let others: Vec<String> = same_login
-        .iter()
-        .map(|account| format!("{}:{account}", server.name))
-        .collect();
     Some(Check::warn(
         format!(
             "{name} sees the same account as {} ({shown}); if they are meant to be different accounts, one label is logged in to the wrong one",
-            others.join(", ")
+            report.same_login_as.join(", ")
         ),
         format!("if so, {relogin} and pick the account this label is meant for"),
     ))
@@ -428,6 +406,7 @@ mod tests {
     use super::*;
     use crate::clients::{ClaudeScope, NativeSource, NativeTransport};
     use crate::config::{ServerIdentity, ToolFilter};
+    use crate::identity::{self, VerifiedAccounts};
 
     fn resolved_http(name: &str, url: &str) -> ResolvedServer {
         let url: url::Url = url.parse().unwrap();
@@ -524,7 +503,7 @@ mod tests {
             (LINEAR, "initech", "Initech"),
         ]);
         let server = resolved_http("linear", "https://mcp.linear.app/mcp");
-        let check = check_verified_account(&server, &verified).unwrap();
+        let check = check_verified_account(&ServerReport::new(&server, &verified)).unwrap();
         assert_eq!(check.status, Status::Warn);
         assert!(
             check.title.contains("same account as linear:initech"),
@@ -545,14 +524,19 @@ mod tests {
         server
             .account_metadata
             .insert(identity::EXPECT_KEY.to_string(), "Personal".to_string());
-        let check = check_verified_account(&server, &verified).unwrap();
+        let report = ServerReport {
+            wrong_account: identity::expectation_failure(&server, &verified),
+            ..ServerReport::new(&server, &verified)
+        };
+        let check = check_verified_account(&report).unwrap();
         assert_eq!(check.status, Status::Error);
     }
 
     #[test]
     fn unverified_login_adds_no_check() {
         let server = resolved_http("linear", "https://mcp.linear.app/mcp");
-        assert!(check_verified_account(&server, &VerifiedAccounts::default()).is_none());
+        let report = ServerReport::new(&server, &VerifiedAccounts::default());
+        assert!(check_verified_account(&report).is_none());
     }
 
     #[test]

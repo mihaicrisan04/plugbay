@@ -27,6 +27,7 @@ use crate::identity::{self, VerifiedAccounts};
 use crate::index;
 use crate::paths::Paths;
 use crate::project::{self, ProjectHints, ProjectLocation};
+use crate::report::{self, Audience};
 use crate::trust::Trust;
 use crate::upstream::{ConnectError, Lease, MayConnect, Upstream, UpstreamKey, UpstreamPool};
 
@@ -590,13 +591,15 @@ impl Session {
                 challenge: challenge.clone(),
             },
             ServerStatus::NeedsLogin { .. } => Route::Refuse(format!(
-                "{display_name} needs a login: call `{prefix}__login`, or ask the human to run `plugbay login {display_name}` (with `--token` if it takes an API token)"
+                "{display_name} needs login: {}",
+                report::login_next_step(&active.server, Audience::Agent)
             )),
             ServerStatus::Connecting { .. } => Route::Refuse(format!(
                 "{display_name} is still connecting; try again in a moment, or call {STATUS_TOOL}"
             )),
             ServerStatus::Untrusted => Route::Refuse(format!(
-                "{display_name} runs a local command or reads secrets from config that is not trusted yet; ask the human to run `plugbay trust` in the project directory"
+                "{display_name} runs a local command or reads secrets from config that is not trusted yet; {}",
+                report::trust_next_step(Audience::Agent)
             )),
             ServerStatus::Failed(error) => {
                 Route::Refuse(format!("{display_name} is unavailable: {error}"))

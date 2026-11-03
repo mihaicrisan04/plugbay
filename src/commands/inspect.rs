@@ -10,11 +10,10 @@ use crate::commands::{resolve_everywhere, resolve_here};
 use crate::config::{
     self, ConfigScope, ResolvedConfig, ResolvedServer, ServerTransport, SessionPin,
 };
-use crate::credentials::{self, StoredLogin};
-use crate::identity::{self, VerifiedAccounts};
+use crate::identity::VerifiedAccounts;
 use crate::paths::Paths;
 use crate::project::ProjectLocation;
-use crate::trust::Trust;
+use crate::report::{self, Audience, LoginState, Report};
 use crate::{registry, secrets};
 
 /// `available`: list every server that could be pinned (built in and catalog) instead.
@@ -25,8 +24,8 @@ pub async fn ls(paths: &Paths, project: Option<PathBuf>, available: bool) -> any
         print!("{}", format_available(&config, &catalog, &paths.home));
         return Ok(());
     }
-    let statuses = server_statuses(paths, &config).await;
-    print!("{}", format_ls(&config, &statuses, &paths.home));
+    let report = Report::build(paths, &config).await;
+    print!("{}", format_ls(&report, &paths.home));
     fail_on_problems(config.problems.len())
 }
 
@@ -112,9 +111,9 @@ pub async fn ls_all(paths: &Paths, cd: Option<PathBuf>) -> anyhow::Result<()> {
             Some(directory) => display_path(directory, &paths.home),
             None => "everywhere (global config)".to_string(),
         };
-        let statuses = server_statuses(paths, config).await;
+        let report = Report::build(paths, config).await;
         output.push_str(&format!("{heading}\n"));
-        output.push_str(&format_server_summary(config, &statuses));
+        output.push_str(&format_server_summary(&report));
         output.push('\n');
     }
     if configs.len() == 1 {
@@ -164,7 +163,7 @@ pub async fn accounts(paths: &Paths, cd: Option<PathBuf>) -> anyhow::Result<()> 
         rows.push(vec![
             usage.server.name.clone(),
             usage.server.account.clone(),
-            login_label(login_status(&usage.server).await).to_string(),
+            login_label(&report::login_state(&usage.server).await).to_string(),
             verified_label(&usage.server, &verified),
             usage.used_in(&paths.home),
         ]);
@@ -204,23 +203,19 @@ fn verified_label(server: &ResolvedServer, verified: &VerifiedAccounts) -> Strin
     let Some(shown) = verified.shown(&server.identity, &server.account) else {
         return "—".to_string();
     };
-    let same_login = verified.same_login_as(&server.identity, &server.account);
+    let same_login = report::same_login_labels(server, verified);
     if same_login.is_empty() {
         return shown.to_string();
     }
-    let labels: Vec<String> = same_login
-        .iter()
-        .map(|account| format!("{}:{account}", server.name))
-        .collect();
-    format!("{shown} (same login as {})", labels.join(", "))
+    format!("{shown} (same login as {})", same_login.join(", "))
 }
 
-fn login_label(status: LoginStatus) -> &'static str {
-    match status {
-        LoginStatus::NotNeeded => "not needed",
-        LoginStatus::LoggedIn => "logged in",
-        LoginStatus::LoggedOut => "missing",
-        LoginStatus::Unknown => "unknown",
+fn login_label(login: &LoginState) -> &'static str {
+    match login {
+        LoginState::NotNeeded => "not needed",
+        LoginState::OAuth | LoginState::Token => "logged in",
+        LoginState::Missing => "missing",
+        LoginState::Unknown(_) => "unknown",
     }
 }
 
@@ -244,78 +239,28 @@ fn fail_on_problems(problem_count: usize) -> anyhow::Result<()> {
     }
 }
 
-/// What `ls` checks beyond the config itself; one per `ResolvedConfig::servers` entry.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ServerStatus {
-    needs_trust: bool,
-    login: LoginStatus,
-    /// Who the server said the login is, when plugbay asked it.
-    verified: Option<String>,
-    /// Set when the verified login doesn't match the account's `expect`.
-    wrong_account: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LoginStatus {
-    /// Stdio servers and remote servers with static auth headers.
-    NotNeeded,
-    LoggedIn,
-    LoggedOut,
-    /// The keychain could not be read.
-    Unknown,
-}
-
-async fn server_statuses(paths: &Paths, config: &ResolvedConfig) -> Vec<ServerStatus> {
-    let trust = Trust::new(paths);
-    let verified = VerifiedAccounts::load(paths).await;
-    let mut statuses = Vec::new();
-    for server in &config.servers {
-        let needs_trust =
-            !server.requires_trust_from.is_empty() && !trust.is_server_trusted(server, config);
-        statuses.push(ServerStatus {
-            needs_trust,
-            login: login_status(server).await,
-            verified: verified
-                .shown(&server.identity, &server.account)
-                .map(str::to_string),
-            wrong_account: identity::expectation_failure(server, &verified),
-        });
-    }
-    statuses
-}
-
-async fn login_status(server: &ResolvedServer) -> LoginStatus {
-    if !server.uses_stored_login() {
-        return LoginStatus::NotNeeded;
-    }
-    match credentials::stored_login(&server.identity, &server.account).await {
-        Ok(StoredLogin::OAuth | StoredLogin::Token) => LoginStatus::LoggedIn,
-        Ok(StoredLogin::None) => LoginStatus::LoggedOut,
-        Err(error) => {
-            tracing::warn!(%error, server = %server.display_name(), "could not read stored credentials");
-            LoginStatus::Unknown
-        }
-    }
-}
-
 /// `ls --all`'s compact form: name and status per server, then problems.
-fn format_server_summary(config: &ResolvedConfig, statuses: &[ServerStatus]) -> String {
+fn format_server_summary(report: &Report) -> String {
     let mut rows = Vec::new();
-    for (server, status) in config.servers.iter().zip(statuses) {
-        rows.push(vec![server.display_name(), status_label(server, status)]);
+    for server in &report.servers {
+        rows.push(vec![
+            server.server.display_name(),
+            server.status(Audience::Human),
+        ]);
     }
     let mut output = if rows.is_empty() {
         "  no servers\n".to_string()
     } else {
         render_rows(&rows)
     };
-    for problem in &config.problems {
+    for problem in &report.config.problems {
         output.push_str(&format!("  problem: {}\n", problem.message));
     }
     output
 }
 
-fn format_ls(config: &ResolvedConfig, statuses: &[ServerStatus], home: &Path) -> String {
+fn format_ls(report: &Report, home: &Path) -> String {
+    let config = report.config;
     let mut output = String::new();
     output.push_str(&format_location(config, home));
 
@@ -349,13 +294,14 @@ fn format_ls(config: &ResolvedConfig, statuses: &[ServerStatus], home: &Path) ->
             "TOOLS".to_string(),
             "STATUS".to_string(),
         ]];
-        for (server, status) in config.servers.iter().zip(statuses) {
+        for server_report in &report.servers {
+            let server = server_report.server;
             rows.push(vec![
                 server.display_name(),
                 transport_label(&server.transport).to_string(),
                 server.transport.target(),
                 tools_label(server),
-                status_label(server, status),
+                server_report.status(Audience::Human),
             ]);
         }
         output.push_str(&render_rows(&rows));
@@ -427,31 +373,6 @@ fn tools_label(server: &ResolvedServer) -> String {
         format!("{}__*", server.tool_prefix)
     } else {
         format!("{}__* (filtered)", server.tool_prefix)
-    }
-}
-
-fn status_label(server: &ResolvedServer, status: &ServerStatus) -> String {
-    let mut notes = Vec::new();
-    if status.needs_trust {
-        notes.push("needs trust: run `plugbay trust`".to_string());
-    }
-    match status.login {
-        LoginStatus::LoggedOut => notes.push(format!(
-            "needs login: run `plugbay login {}` (add `--token` for an API token)",
-            server.display_name()
-        )),
-        LoginStatus::Unknown => notes.push("login status unknown".to_string()),
-        LoginStatus::NotNeeded | LoginStatus::LoggedIn => {}
-    }
-    if let Some(wrong_account) = &status.wrong_account {
-        notes.push(format!("off: {wrong_account}"));
-    }
-    if !notes.is_empty() {
-        return notes.join("; ");
-    }
-    match &status.verified {
-        Some(shown) => format!("ready · {shown}"),
-        None => "ready".to_string(),
     }
 }
 
@@ -619,6 +540,7 @@ mod tests {
     use super::*;
     use crate::config::{ConfigFile, ConfigProblem, DisabledServer, REGISTRY_SOURCE, ToolFilter};
     use crate::project::ProjectLocation;
+    use crate::report::{ServerReport, TrustState};
 
     const HOME: &str = "/home/me";
     const GLOBAL_FILE: &str = "/home/me/.config/plugbay/config.toml";
@@ -712,39 +634,46 @@ mod tests {
         config
     }
 
-    fn sample_statuses() -> Vec<ServerStatus> {
-        vec![
-            ServerStatus {
-                needs_trust: false,
-                login: LoginStatus::LoggedOut,
-                verified: None,
-                wrong_account: None,
+    /// linear needs a login, posthog is ready and verified, tool needs trust.
+    fn sample_report(config: &ResolvedConfig) -> Report<'_> {
+        let verified = VerifiedAccounts::default();
+        let [linear, posthog, tool] = &config.servers[..] else {
+            panic!("sample config has three servers");
+        };
+        let servers = vec![
+            ServerReport {
+                login: Some(LoginState::Missing),
+                ..ServerReport::new(linear, &verified)
             },
-            ServerStatus {
-                needs_trust: false,
-                login: LoginStatus::NotNeeded,
+            ServerReport {
+                login: Some(LoginState::Token),
                 verified: Some("Client A EU".to_string()),
-                wrong_account: None,
+                ..ServerReport::new(posthog, &verified)
             },
-            ServerStatus {
-                needs_trust: true,
-                login: LoginStatus::NotNeeded,
-                verified: None,
-                wrong_account: None,
+            ServerReport {
+                trust: TrustState::Untrusted,
+                login: Some(LoginState::NotNeeded),
+                ..ServerReport::new(tool, &verified)
             },
-        ]
+        ];
+        Report { config, servers }
     }
 
     #[test]
     fn ls_shows_servers_files_disabled_and_problems() {
-        let output = format_ls(&sample_config(), &sample_statuses(), Path::new(HOME));
+        let config = sample_config();
+        let output = format_ls(&sample_report(&config), Path::new(HOME));
         insta::assert_snapshot!(output);
     }
 
     #[test]
     fn ls_without_project_says_only_global_applies() {
         let config = ResolvedConfig::test_with(Vec::new(), Vec::new());
-        insta::assert_snapshot!(format_ls(&config, &[], Path::new(HOME)));
+        let report = Report {
+            config: &config,
+            servers: Vec::new(),
+        };
+        insta::assert_snapshot!(format_ls(&report, Path::new(HOME)));
     }
 
     #[test]
@@ -816,20 +745,6 @@ mod tests {
     #[test]
     fn why_fails_for_unknown_server() {
         assert!(format_why(&sample_config(), "nothing", Path::new(HOME)).is_err());
-    }
-
-    #[test]
-    fn wrong_account_turns_the_status_off() {
-        let status = ServerStatus {
-            needs_trust: false,
-            login: LoginStatus::LoggedIn,
-            verified: Some("Initech".to_string()),
-            wrong_account: Some("linear:default is logged in as Initech".to_string()),
-        };
-        assert_eq!(
-            status_label(&linear(), &status),
-            "off: linear:default is logged in as Initech"
-        );
     }
 
     #[test]

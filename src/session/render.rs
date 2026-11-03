@@ -5,6 +5,7 @@ use super::{ActiveServer, Resolved, ServerStatus};
 use crate::config::{DEFAULT_ACCOUNT, ResolvedConfig, ResolvedServer};
 use crate::identity::{self, VerifiedAccounts};
 use crate::registry;
+use crate::report::{Audience, Connection, Report, ServerReport, ServerState, TrustState};
 
 pub(super) fn not_resolved_yet() -> String {
     format!("plugbay routes MCP servers for this project. Call {STATUS_TOOL} to see which.")
@@ -32,11 +33,13 @@ pub(super) fn instructions(
         }
     };
 
+    let report = session_report(config, servers, verified);
     let mut lines = vec![format!("{routes} Tools are named <server>__<tool>.")];
-    let working: Vec<String> = servers
+    let working: Vec<String> = report
+        .servers
         .iter()
-        .filter(|active| matches!(active.status, ServerStatus::Connected(_)))
-        .map(|active| account_line(&active.server, verified))
+        .filter(|server| server.state() == ServerState::Ready)
+        .map(account_line)
         .collect();
     if config.servers.is_empty() {
         lines.push("No servers are configured here.".to_string());
@@ -44,7 +47,14 @@ pub(super) fn instructions(
         lines.push("Servers and accounts in use (use the right one for this project):".to_string());
         lines.extend(working);
     }
-    let unavailable: Vec<String> = servers.iter().filter_map(unavailable_note).collect();
+    let unavailable: Vec<String> = report
+        .servers
+        .iter()
+        .filter_map(|server| {
+            let note = server.unavailable_note()?;
+            Some(format!("{} ({note})", server_label(server.server)))
+        })
+        .collect();
     if !unavailable.is_empty() {
         lines.push(format!(
             "Not available right now: {}. Call {STATUS_TOOL} for details.",
@@ -61,6 +71,43 @@ pub(super) fn instructions(
     lines.join("\n")
 }
 
+/// The report as this session sees it: trust grants include `allow_once`, and connecting tells
+/// whether a login is missing, so the keychain is never read here.
+fn session_report<'a>(
+    config: &'a ResolvedConfig,
+    servers: &'a [ActiveServer],
+    verified: &VerifiedAccounts,
+) -> Report<'a> {
+    let servers = servers
+        .iter()
+        .map(|active| server_report(active, verified))
+        .collect();
+    Report { config, servers }
+}
+
+fn server_report<'a>(active: &'a ActiveServer, verified: &VerifiedAccounts) -> ServerReport<'a> {
+    let server = &active.server;
+    let mut report = ServerReport::new(server, verified);
+    if !server.requires_trust_from.is_empty() {
+        report.trust = TrustState::Trusted;
+    }
+    report.connection = match &active.status {
+        ServerStatus::Connecting { .. } => Some(Connection::Connecting),
+        ServerStatus::Connected(_) => Some(Connection::Connected),
+        ServerStatus::NeedsLogin { .. } => Some(Connection::NeedsLogin),
+        ServerStatus::Failed(error) => Some(Connection::Failed(error.clone())),
+        ServerStatus::Untrusted => {
+            report.trust = TrustState::Untrusted;
+            None
+        }
+        ServerStatus::WrongAccount(message) => {
+            report.wrong_account = Some(message.clone());
+            Some(Connection::Connected)
+        }
+    };
+    report
+}
+
 /// A local command nobody gave accounts to has nothing worth naming.
 fn has_account_worth_showing(server: &ResolvedServer) -> bool {
     !(server.is_stdio() && server.account == DEFAULT_ACCOUNT)
@@ -75,7 +122,8 @@ fn server_label(server: &ResolvedServer) -> String {
     }
 }
 
-fn account_line(server: &ResolvedServer, verified: &VerifiedAccounts) -> String {
+fn account_line(report: &ServerReport) -> String {
+    let server = report.server;
     let title = registry::lookup(&server.name).map_or(server.name.as_str(), |entry| entry.title);
     let mut line = format!("- {title}");
     if has_account_worth_showing(server) {
@@ -90,7 +138,7 @@ fn account_line(server: &ResolvedServer, verified: &VerifiedAccounts) -> String 
     if !details.is_empty() {
         line.push_str(&format!(" ({})", details.join(", ")));
     }
-    if let Some(shown) = verified.shown(&server.identity, &server.account) {
+    if let Some(shown) = &report.verified {
         line.push_str(&format!(" (verified: {shown})"));
     }
     if server.tool_prefix != server.name {
@@ -100,27 +148,6 @@ fn account_line(server: &ResolvedServer, verified: &VerifiedAccounts) -> String 
         ));
     }
     line
-}
-
-/// One short clause per configured server that exposes none of its own tools.
-fn unavailable_note(active: &ActiveServer) -> Option<String> {
-    let label = server_label(&active.server);
-    let reason = match &active.status {
-        ServerStatus::Connected(_) => return None,
-        ServerStatus::Connecting { .. } => {
-            "still connecting, its tools appear when it is up".to_string()
-        }
-        ServerStatus::NeedsLogin { .. } => format!(
-            "needs a login, call {}{TOOL_SEPARATOR}login",
-            active.server.tool_prefix
-        ),
-        ServerStatus::Untrusted => {
-            "its config is not trusted yet, ask the human to run `plugbay trust`".to_string()
-        }
-        ServerStatus::Failed(_) => "failed to start".to_string(),
-        ServerStatus::WrongAccount(_) => "logged in as the wrong account".to_string(),
-    };
-    Some(format!("{label} ({reason})"))
 }
 
 fn problem_summary(config: &ResolvedConfig) -> String {
@@ -167,12 +194,12 @@ pub(super) fn status_text(
     if servers.is_empty() {
         lines.push("  (none)".to_string());
     }
-    for active in servers {
+    for server in session_report(config, servers, verified).servers {
         lines.push(format!(
             "  {} ({}) — {}",
-            active.server.display_name(),
-            active.server.transport.target(),
-            server_status(active, verified)
+            server.server.display_name(),
+            server.server.transport.target(),
+            server.status(Audience::Agent)
         ));
     }
     for disabled in &config.disabled {
@@ -186,30 +213,6 @@ pub(super) fn status_text(
         lines.push(format!("problem: {}", problem.message));
     }
     lines.join("\n")
-}
-
-fn server_status(active: &ActiveServer, verified: &VerifiedAccounts) -> String {
-    let server = &active.server;
-    match &active.status {
-        ServerStatus::Connected(_) => match verified.shown(&server.identity, &server.account) {
-            Some(shown) => format!("connected (verified: {shown})"),
-            None => "connected".to_string(),
-        },
-        ServerStatus::Connecting { .. } => "connecting: its tools appear once it is up (clients \
-             that ignore tools/list_changed, like Codex, see them next session)"
-            .to_string(),
-        ServerStatus::NeedsLogin { .. } => format!(
-            "needs login: call {}__login or run `plugbay login {}` (add `--token` for an API token)",
-            server.tool_prefix,
-            server.display_name()
-        ),
-        ServerStatus::Untrusted => {
-            "off: runs a command or reads secrets from config that is not trusted, run `plugbay trust`"
-                .to_string()
-        }
-        ServerStatus::Failed(error) => format!("failed: {error}"),
-        ServerStatus::WrongAccount(message) => format!("off: {message}"),
-    }
 }
 
 #[cfg(test)]
@@ -283,7 +286,7 @@ mod tests {
         let server = linear("initech", &[("team", "WP"), ("expect", "Initech")]);
         let verified = VerifiedAccounts::test_with(&[(LINEAR, "initech", "Initech")]);
         assert_eq!(
-            account_line(&server, &verified),
+            account_line(&ServerReport::new(&server, &verified)),
             "- Linear → initech (team WP) (verified: Initech)"
         );
     }
@@ -292,7 +295,7 @@ mod tests {
     fn account_line_without_a_verified_login_is_unchanged() {
         let server = linear("personal", &[("expect", "mihaicrisan")]);
         assert_eq!(
-            account_line(&server, &VerifiedAccounts::default()),
+            account_line(&ServerReport::new(&server, &VerifiedAccounts::default())),
             "- Linear → personal"
         );
     }
@@ -300,9 +303,14 @@ mod tests {
     #[test]
     fn local_command_with_only_the_default_account_shows_no_label() {
         let verified = VerifiedAccounts::default();
-        assert_eq!(account_line(&local_tool("default"), &verified), "- paper");
+        let unnamed = local_tool("default");
+        let named = local_tool("work");
         assert_eq!(
-            account_line(&local_tool("work"), &verified),
+            account_line(&ServerReport::new(&unnamed, &verified)),
+            "- paper"
+        );
+        assert_eq!(
+            account_line(&ServerReport::new(&named, &verified)),
             "- paper → work"
         );
     }
@@ -327,7 +335,7 @@ mod tests {
         assert!(!text.contains("in use"), "{text}");
         assert!(
             text.contains(
-                "Not available right now: sentry:acme (failed to start); paper (its config is not trusted yet"
+                "Not available right now: sentry:acme (failed); paper (needs trust: ask the human to review the config and run `plugbay trust` in the project directory)"
             ),
             "{text}"
         );
@@ -355,9 +363,6 @@ mod tests {
             ServerStatus::WrongAccount("logged in as Initech".to_string()),
         )];
         let text = instructions(&resolved, &servers, &VerifiedAccounts::default());
-        assert!(
-            text.contains("linear:personal (logged in as the wrong account)"),
-            "{text}"
-        );
+        assert!(text.contains("linear:personal (wrong account)"), "{text}");
     }
 }

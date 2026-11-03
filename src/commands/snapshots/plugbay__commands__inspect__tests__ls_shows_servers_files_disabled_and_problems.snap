@@ -15,8 +15,8 @@ Config files (merge order)
 Servers
   SERVER            TRANSPORT  TARGET                                   TOOLS                  STATUS
   linear:default    http       https://mcp.linear.app/mcp               linear__*              needs login: run `plugbay login linear:default` (add `--token` for an API token)
-  posthog:client-a  http       https://mcp-eu.posthog.com/mcp           posthog__* (filtered)  ready · Client A EU
-  tool:default      stdio      /home/me/bin/tool serve --name "my app"  tool__*                needs trust: run `plugbay trust`
+  posthog:client-a  http       https://mcp-eu.posthog.com/mcp           posthog__* (filtered)  ready (verified: Client A EU)
+  tool:default      stdio      /home/me/bin/tool serve --name "my app"  tool__*                needs trust: review the config, then run `plugbay trust`
 
 Disabled
   notion  by ~/work/client-a/plugbay.toml
