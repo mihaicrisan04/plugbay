@@ -112,6 +112,7 @@ Starting fresh:
 ```sh
 plugbay setup                                  # register plugbay in Claude Code and Codex
 plugbay ls --available                         # the built-in servers and your catalog
+plugbay search huggingface                     # anything else: look in the official MCP Registry
 cd ~/work/acme && plugbay use sentry:acme posthog:acme
 plugbay login                                  # log in to every account that still needs it
 ```
@@ -156,7 +157,10 @@ posthog = { exclude_tools = ["delete_*"] }
 ```sh
 plugbay add wiki --url https://mcp.wiki.example.com/mcp
 plugbay add playwright -- npx -y @playwright/mcp
+plugbay add tracker --from com.acme/tracker    # a remote server from the MCP Registry
 ```
+
+`--from` (or just `plugbay add com.acme/tracker`) only ever writes a registry server's https remote; `--remote <url>` picks one when it lists several. A server that ships only as a package (npm, PyPI, OCI) is never added for you: plugbay prints the `plugbay add <name> -- <command>` to review and run, with `${keychain:...}` refs for the secrets it needs.
 
 `add` refuses plain `http://` to anything but localhost, a name that would silently replace a built-in server (unless `--force`), and `--env` values that look like secrets: pass a reference such as `--env 'API_KEY=${keychain:playwright/API_KEY}'` instead.
 
@@ -197,7 +201,8 @@ The full reference is [docs/config-schema.md](docs/config-schema.md).
 | `accounts` | Every account in use: logged in or not, verified as whom, used where |
 | `login [server[:account]]` | OAuth login, or `--token` / `--from-env VAR` for an API token. No argument: every missing login |
 | `logout <server[:account]>` | Forget a stored login or token |
-| `add <name> --url <url>` | Add a remote server to the catalog (`-- <command...>` for a stdio server) |
+| `search <query>` | Find servers in the official MCP Registry, and which are built in already |
+| `add <name> --url <url>` | Add a remote server to the catalog (`-- <command...>` for a stdio server, `--from <registry-name>` from the MCP Registry) |
 | `remove <name>` | Remove a server from the catalog (`unuse` stops using one here) |
 | `trust` | Trust the executable parts of this directory's config (`--revoke` to undo) |
 | `migrate` | Move servers out of Claude Code and Codex (`--apply`, `--undo`) |

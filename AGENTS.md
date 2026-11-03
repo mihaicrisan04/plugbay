@@ -23,7 +23,7 @@ Status: v0.2.1, public at github.com/mihaicrisan04/plugbay, work on `main`. Road
 ## Stack
 
 - Rust, tokio, `rmcp` 3.x (official SDK; the one Codex uses; full OAuth client incl. CIMD/DCR/refresh), `keyring` for the keychain, possibly `fnox-core` for secret refs
-- Single binary: `plugbay connect` (shim), `plugbay daemon`, plus user commands (`ls`, `accounts`, `use`, `add`, `login`, `trust`, `migrate`, `doctor`, `setup`; all take `-C <dir>`)
+- Single binary: `plugbay connect` (shim), `plugbay daemon`, plus user commands (`ls`, `accounts`, `use`, `add`, `search`, `login`, `trust`, `migrate`, `doctor`, `setup`; all take `-C <dir>`)
 - Verify loop: `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, `cargo test` (end-to-end tests in `tests/` drive the real binary against `examples/echo_server.rs`)
 - Debug: `plugbay daemon --log-level debug` runs the daemon in the foreground; otherwise it logs to `~/.local/state/plugbay/daemon.log`. `PLUGBAY_HOME=/tmp/x` isolates config + state (tests use it). Agents can call the `plugbay__status` tool
 
@@ -39,9 +39,9 @@ Status: v0.2.1, public at github.com/mihaicrisan04/plugbay, work on `main`. Road
 ## Code map
 
 - `src/main.rs` CLI · `shim.rs` (`connect`) → `daemon.rs` (socket, control, idle exit) → `session.rs` (one agent: refresh, upstream connects, routing, config watch) + `session/{enable,login,prompt,render,tools}.rs` (session pins, login stubs, trust/account prompts, instructions and status, built-in tools) → `upstream.rs` (shared upstream pool) + `upstream/stdio.rs` (process groups, message cap)
-- `config.rs` + `config/{file,merge,build}.rs` + `registry.rs` + `project.rs`: resolution (catalog = global entries with `enabled = false`) · `index.rs`: every config directory seen, for commands that work from anywhere
+- `config.rs` + `config/{file,merge,build}.rs` + `registry.rs` (built-in servers; `registry/official.rs`: the official MCP Registry client) + `project.rs`: resolution (catalog = global entries with `enabled = false`) · `index.rs`: every config directory seen, for commands that work from anywhere
 - `secrets.rs`, `credentials.rs`, `oauth.rs`, `trust.rs`, `identity.rs`: security and verified accounts
-- `commands/`: `access.rs` (login/logout/trust), `inspect.rs` (ls/accounts/why), `pins.rs` (use/unuse/add/remove) · `clients.rs` + `clients/{claude,codex,import,migrate}.rs`: native client configs, `setup`, `migrate` · `doctor.rs`
+- `commands/`: `access.rs` (login/logout/trust), `inspect.rs` (ls/accounts/why), `pins.rs` (use/unuse/add/remove), `search.rs` (search, `add --from`) · `clients.rs` + `clients/{claude,codex,import,migrate}.rs`: native client configs, `setup`, `migrate` · `doctor.rs`
 
 ## Skills
 

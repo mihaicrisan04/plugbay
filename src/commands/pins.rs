@@ -7,7 +7,7 @@ use anyhow::{Context, bail};
 use toml_edit::{DocumentMut, Item, Table, TableLike, Value};
 
 use crate::commands::inspect::display_path;
-use crate::commands::{location_here, notify_daemon_reload, resolve_everywhere};
+use crate::commands::{location_here, notify_daemon_reload, resolve_everywhere, search};
 use crate::config::{self, LOCAL_FILE, PROJECT_FILE, ResolvedConfig};
 use crate::index;
 use crate::paths::Paths;
@@ -29,11 +29,19 @@ pub struct PinOptions {
 
 #[derive(clap::Args, Debug)]
 pub struct AddOptions {
-    /// Name to pin it by, e.g. `huggingface` or `playwright`.
+    /// Name to pin it by, e.g. `huggingface` or `playwright`. An MCP Registry name such as
+    /// `com.acme/tracker` is looked up as with `--from`, under a short name (`tracker`).
     name: String,
     /// Streamable HTTP endpoint of a remote server: `--url https://huggingface.co/mcp`.
     #[arg(long, conflicts_with = "command")]
     url: Option<String>,
+    /// Add a remote server from the official MCP Registry: `--from com.acme/tracker`.
+    /// `plugbay search` finds names; packages are printed as a command to review, never added.
+    #[arg(long, value_name = "REGISTRY_NAME", conflicts_with_all = ["url", "command"])]
+    from: Option<String>,
+    /// Which remote of a registry server to add, when it lists several.
+    #[arg(long, value_name = "URL", conflicts_with_all = ["url", "command"])]
+    remote: Option<String>,
     /// Environment for a stdio server, `NAME=value`. Secrets must be refs like
     /// `${keychain:service/account}` or `${op://vault/item/field}`, never the value itself.
     #[arg(long = "env", value_name = "NAME=VALUE", requires = "command")]
@@ -180,10 +188,28 @@ pub async fn unuse_servers(
     Ok(())
 }
 
-pub async fn add(paths: &Paths, options: AddOptions) -> anyhow::Result<()> {
+pub async fn add(paths: &Paths, mut options: AddOptions) -> anyhow::Result<()> {
+    take_registry_name(&mut options)?;
     if !config::is_valid_name(&options.name) {
         bail!("server names use lowercase letters, digits and `-` only");
     }
+    let from_registry = match &options.from {
+        Some(registry_name) => {
+            let remote = search::remote_from_registry(
+                &options.name,
+                registry_name,
+                options.remote.as_deref(),
+                options.force,
+            )
+            .await?;
+            options.url = Some(remote.url.clone());
+            Some(remote)
+        }
+        None if options.remote.is_some() => {
+            bail!("`--remote` picks one of a registry server's remotes; use it with `--from`")
+        }
+        None => None,
+    };
     check_add_options(&options, &paths.global_config())?;
     let file = paths.global_config();
     let original = read_or_empty(&file)?;
@@ -209,11 +235,38 @@ pub async fn add(paths: &Paths, options: AddOptions) -> anyhow::Result<()> {
         restore(&file, &original)?;
         bail!("nothing written: {problem}");
     }
+    let source = match &options.from {
+        Some(registry_name) => format!(" from the MCP Registry ({registry_name})"),
+        None => String::new(),
+    };
     println!(
-        "Added {name} to the catalog in {file}. Pin it with `plugbay use {name}` (or `{name}:<account>`).",
+        "Added {name}{source} to the catalog in {file}. Pin it with `plugbay use {name}` (or `{name}:<account>`).",
         name = options.name,
         file = file.display()
     );
+    let token_steps = from_registry
+        .as_ref()
+        .and_then(|remote| search::token_steps(&options.name, remote));
+    if let Some(steps) = token_steps {
+        println!("{steps}");
+    }
+    Ok(())
+}
+
+/// `plugbay add com.acme/tracker` means `plugbay add tracker --from com.acme/tracker`.
+fn take_registry_name(options: &mut AddOptions) -> anyhow::Result<()> {
+    let is_bare_name =
+        options.from.is_none() && options.url.is_none() && options.command.is_empty();
+    if !is_bare_name || !options.name.contains('/') {
+        return Ok(());
+    }
+    let Some(name) = search::name_from_registry_name(&options.name) else {
+        bail!(
+            "pick a name for it: `plugbay add <name> --from {}`",
+            options.name
+        );
+    };
+    options.from = Some(std::mem::replace(&mut options.name, name));
     Ok(())
 }
 
@@ -518,7 +571,7 @@ fn unknown_server(config: &ResolvedConfig, name: &str) -> String {
     format!(
         "plugbay doesn't know how to reach {name}: {did_you_mean}add it first with \
          `plugbay add {name} --url <url>` or `plugbay add {name} -- <command>` \
-         (`plugbay ls --available` lists what it knows)"
+         (`plugbay ls --available` lists what it knows, `plugbay search {name}` looks in the MCP Registry)"
     )
 }
 
@@ -672,6 +725,8 @@ mod tests {
                 Vec::new()
             },
             force: false,
+            from: None,
+            remote: None,
         }
     }
 
@@ -702,6 +757,8 @@ mod tests {
             env: Vec::new(),
             command: Vec::new(),
             force: false,
+            from: None,
+            remote: None,
         };
         let result = edited("", |document| {
             let definition = definition_table(&options).unwrap();
@@ -768,6 +825,8 @@ mod tests {
             env: Vec::new(),
             command: Vec::new(),
             force: false,
+            from: None,
+            remote: None,
         };
         assert_eq!(
             definition_table(&remote).unwrap().to_string(),
@@ -784,6 +843,8 @@ mod tests {
                 "msteams-mcp".to_string(),
             ],
             force: false,
+            from: None,
+            remote: None,
         };
         assert_eq!(
             definition_table(&stdio).unwrap().to_string(),

@@ -1,0 +1,10 @@
+---
+source: src/commands/search.rs
+expression: error
+---
+nothing written: io.github.acme-dev/tracker-mcp runs as a local package, and plugbay never runs code from a registry entry on its own. Check the package, then add it yourself:
+
+  plugbay add tracker --env 'TRACKER_API_KEY=${keychain:tracker/TRACKER_API_KEY}' --env TRACKER_REGION=eu -- npx -y @acme-dev/tracker-mcp@0.4.1 serve --workspace '<workspace>'
+    (optional env: TRACKER_DEBUG)
+
+Replace each `<...>` first. Store each secret before using it, e.g. on macOS `security add-generic-password -s tracker -a <NAME> -w`, or point the ref at `${op://vault/item/field}` or `${env:NAME}` instead.

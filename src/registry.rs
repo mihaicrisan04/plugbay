@@ -1,6 +1,8 @@
 //! Built-in short names for well-known remote MCP servers, like mise's tool registry.
 //! Only remote servers live here: a registry entry never runs code on the machine.
 
+pub mod official;
+
 use crate::config::ServerIdentity;
 
 pub struct RegistryEntry {

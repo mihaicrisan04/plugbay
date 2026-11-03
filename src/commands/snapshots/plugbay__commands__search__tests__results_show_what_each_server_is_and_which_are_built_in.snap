@@ -1,0 +1,29 @@
+---
+source: src/commands/search.rs
+expression: "format_results(\"tracker\", &fixture_search(\"tracker\"))"
+---
+com.acme/tracker  Acme Tracker
+    The official Acme Tracker server.
+    remote: https://mcp.acme.example/mcp (needs a token)
+
+dev.tricky/tracker  Tricky rekcart
+    Line one line two with hidden marks.
+    remote, but its url `http://tricky.example/mcp` is not https
+
+app.linear/linear  Linear  (built in: `plugbay use linear`)
+    Find and manage issues, projects, and documents in your Linear workspace.
+    remote: https://mcp.linear.app/mcp, https://mcp.linear.app/mcp/readonly
+
+dev.oldco/legacy
+    Still on the old transport.
+    remote over SSE only, which plugbay doesn't support
+
+org.pyco/finder
+    Finds things, from PyPI.
+    runs locally: pypi pyco-finder, oci ghcr.io/pyco/finder, mcpb https://github.com/pyco/finder/releases/download/v1.2.0/finder.mcpb
+
+io.github.acme-dev/tracker-mcp  Tracker (community)
+    Unofficial tracker tools, run locally.
+    runs locally: npm @acme-dev/tracker-mcp
+
+Add one to your catalog with `plugbay add <name> --from <registry-name>`.
