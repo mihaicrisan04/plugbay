@@ -100,3 +100,12 @@ fn xdg_dir(variable: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
 }
+
+/// `path` with the home directory shown as `~`.
+pub fn display_path(path: &Path, home: &Path) -> String {
+    match path.strip_prefix(home) {
+        Ok(relative) if relative.as_os_str().is_empty() => "~".to_string(),
+        Ok(relative) => format!("~/{}", relative.display()),
+        Err(_) => path.display().to_string(),
+    }
+}

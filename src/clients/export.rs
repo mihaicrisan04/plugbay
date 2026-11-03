@@ -1,23 +1,29 @@
 //! `plugbay export`: the servers an agent here gets, as Claude Code's `.mcp.json` or VS Code's
-//! `.vscode/mcp.json`, for teammates without plugbay. No secret leaves as a value: secret refs and
-//! stored token logins become the format's placeholders, which each teammate fills in.
+//! `.vscode/mcp.json`, for teammates without plugbay. No secret leaves as a value: secret refs,
+//! stored token logins and values that may be secrets become placeholders each teammate fills in.
+
+mod destination;
+mod placeholders;
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, bail};
-use serde_json::{Map, Value, json};
-use url::Url;
+use serde_json::Value;
 
-use super::import::{has_secret_in_args, is_secret_field, split_bearer_scheme};
-use super::{read_optional, write_atomically};
-use crate::commands::{self, display_path};
+use self::destination::{Destination, MergeReport};
+use self::placeholders::{
+    Placeholder, Placeholders, SecretSource, environment_variable_name, header_placeholder_name,
+};
+use super::{Client, NativeTransport, claude, read_optional, write_atomically};
+use crate::commands;
 use crate::config::{self, DEFAULT_ACCOUNT, ResolvedConfig, ResolvedServer, ServerTransport};
-use crate::credentials;
-use crate::paths::Paths;
+use crate::credentials::{self, StoredLogin};
+use crate::paths::{Paths, display_path};
 use crate::secrets::{self, SecretRef};
 
 const AUTHORIZATION: &str = "authorization";
+const NO_LOGIN: StoredLogin = StoredLogin::None;
 
 #[derive(clap::Args, Debug)]
 pub struct ExportOptions {
@@ -38,17 +44,6 @@ pub enum ExportFormat {
     Vscode,
 }
 
-/// What a remote server signs in with here from `plugbay login`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum StoredAuth {
-    None,
-    OAuth,
-    /// A static token, sent in this lowercase header.
-    Token {
-        header: String,
-    },
-}
-
 /// One server entry, ready for the file.
 #[derive(Debug)]
 struct ExportedEntry {
@@ -56,35 +51,27 @@ struct ExportedEntry {
     entry: Value,
 }
 
-/// A value the teammate provides in place of a secret plugbay resolves here.
-#[derive(Debug, Clone)]
-struct Placeholder {
-    /// `SCREAMING_SNAKE`: the environment variable for Claude Code; VS Code inputs use it kebab-cased.
-    name: String,
-    /// Where plugbay finds the value here (`keychain:plugbay/x`, a stored token), so one secret
-    /// used twice gets one placeholder. Refs are pointers, never values, so this is safe to print.
-    source: String,
-    /// Came from `${env:...}`: the teammate's own environment variable in every format.
-    from_environment: bool,
-    servers: Vec<String>,
-}
-
 /// One directory's servers in the target format, before any file is touched.
 #[derive(Debug)]
 struct Export {
     format: ExportFormat,
+    /// Only the entries to write: kept ones are in `report` alone.
     entries: Vec<ExportedEntry>,
-    placeholders: Vec<Placeholder>,
+    placeholders: Placeholders,
     /// What doesn't carry over, for stderr.
     notes: Vec<String>,
+    report: MergeReport,
 }
 
-/// What a merge did with each exported entry.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct MergeReport {
-    added: Vec<String>,
-    replaced: Vec<String>,
-    kept: Vec<String>,
+/// How one env or header value leaves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValuePlan {
+    /// As written: nothing in it looks secret.
+    Copy,
+    /// Each secret ref swapped for a placeholder, the text around them kept.
+    SwapRefs,
+    /// One placeholder for the whole value: the text itself may be a secret.
+    Replace,
 }
 
 pub async fn export(
@@ -94,11 +81,10 @@ pub async fn export(
 ) -> anyhow::Result<()> {
     let config = commands::resolve_here(paths, cd).await?;
     let logins = stored_logins(&config).await;
-    let export = Export::build(&config, &logins, options.format);
 
     if !options.write {
-        let (contents, _) = export.merge(None, false)?;
-        print!("{contents}");
+        let export = Export::build(&config, &logins, options.format, &Destination::default());
+        print!("{}", export.merge(Destination::default())?);
         export.print_notes();
         return Ok(());
     }
@@ -111,40 +97,41 @@ pub async fn export(
     else {
         bail!("no project here to write into; run it in a project directory or pass `-C <dir>`");
     };
-    if export.entries.is_empty() {
+    let file = directory.join(options.format.file_name());
+    let existing = read_optional(&file)?;
+    let destination = Destination::parse(existing.as_deref(), options.format, options.force)
+        .with_context(|| format!("merging into {}", file.display()))?;
+    let export = Export::build(&config, &logins, options.format, &destination);
+    if export.report.is_empty() {
         println!("Nothing to write: no servers resolve here.");
         export.print_notes();
         return Ok(());
     }
 
-    let file = directory.join(options.format.file_name());
-    let existing = read_optional(&file)?;
-    let (contents, report) = export
-        .merge(existing.as_deref(), options.force)
-        .with_context(|| format!("merging into {}", file.display()))?;
-    if report.changes_file() {
+    if export.report.changes_file() {
+        let contents = export.merge(destination)?;
         if let Some(parent) = file.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
         write_atomically(&file, &contents)?;
     }
-    report.print(&display_path(&file, &paths.home));
+    export.report.print(&display_path(&file, &paths.home));
     export.print_notes();
     Ok(())
 }
 
-/// How each remote server signs in with what `plugbay login` stored, keyed by entry name. Only
-/// the kind of login and a token's header are kept; the token itself is dropped right away.
-async fn stored_logins(config: &ResolvedConfig) -> BTreeMap<String, StoredAuth> {
+/// What `plugbay login` stored for each remote server, keyed by entry name. A token's value never
+/// gets here: `stored_login` keeps only its header.
+async fn stored_logins(config: &ResolvedConfig) -> BTreeMap<String, StoredLogin> {
     let mut logins = BTreeMap::new();
     for server in &config.servers {
         if !server.uses_stored_login() {
             continue;
         }
-        match stored_auth(server).await {
-            Ok(auth) => {
-                logins.insert(server.tool_prefix.clone(), auth);
+        match credentials::stored_login(&server.identity, &server.account).await {
+            Ok(login) => {
+                logins.insert(server.tool_prefix.clone(), login);
             }
             Err(error) => tracing::warn!(
                 server = %server.display_name(),
@@ -156,23 +143,11 @@ async fn stored_logins(config: &ResolvedConfig) -> BTreeMap<String, StoredAuth> 
     logins
 }
 
-async fn stored_auth(server: &ResolvedServer) -> anyhow::Result<StoredAuth> {
-    if let Some(token) = credentials::load_token(&server.identity, &server.account).await? {
-        return Ok(StoredAuth::Token {
-            header: token.header.clone(),
-        });
-    }
-    if credentials::has_stored_credentials(&server.identity, &server.account).await? {
-        return Ok(StoredAuth::OAuth);
-    }
-    Ok(StoredAuth::None)
-}
-
 impl ExportFormat {
     /// Where the file goes, relative to the project directory.
     fn file_name(self) -> &'static str {
         match self {
-            ExportFormat::Claude => ".mcp.json",
+            ExportFormat::Claude => claude::PROJECT_FILE,
             ExportFormat::Vscode => ".vscode/mcp.json",
         }
     }
@@ -186,20 +161,33 @@ impl ExportFormat {
 
     fn client_name(self) -> &'static str {
         match self {
-            ExportFormat::Claude => "Claude Code",
+            ExportFormat::Claude => Client::ClaudeCode.display_name(),
             ExportFormat::Vscode => "VS Code",
         }
     }
 
-    /// Claude Code expands `${VAR}` from the environment; VS Code reads `${env:VAR}` and prompts
-    /// for `${input:id}`, keeping the answer in its secret storage.
+    /// VS Code prompts for each secret plugbay keeps and stores the answer in its secret storage;
+    /// an `${env:...}` ref stays an environment variable. Claude Code only reads the environment.
+    fn prompts_for(self, source: &SecretSource) -> bool {
+        self == ExportFormat::Vscode && source.environment_variable().is_none()
+    }
+
     fn placeholder_text(self, placeholder: &Placeholder) -> String {
+        let name = &placeholder.name;
+        if self.prompts_for(&placeholder.source) {
+            return format!("${{input:{name}}}");
+        }
         match self {
-            ExportFormat::Claude => format!("${{{}}}", placeholder.name),
-            ExportFormat::Vscode if placeholder.from_environment => {
-                format!("${{env:{}}}", placeholder.name)
-            }
-            ExportFormat::Vscode => format!("${{input:{}}}", input_id(&placeholder.name)),
+            ExportFormat::Claude => format!("${{{name}}}"),
+            ExportFormat::Vscode => format!("${{env:{name}}}"),
+        }
+    }
+
+    /// Claude Code expands `${NAME}` only for shell-style names; VS Code's `${env:...}` takes any.
+    fn can_expand(self, variable: &str) -> bool {
+        match self {
+            ExportFormat::Claude => claude::is_env_variable_name(variable),
+            ExportFormat::Vscode => true,
         }
     }
 }
@@ -207,74 +195,101 @@ impl ExportFormat {
 impl Export {
     fn build(
         config: &ResolvedConfig,
-        logins: &BTreeMap<String, StoredAuth>,
+        logins: &BTreeMap<String, StoredLogin>,
         format: ExportFormat,
+        destination: &Destination,
     ) -> Self {
+        let mut notes = Vec::new();
+        for problem in &config.problems {
+            notes.push(format!("not exported: {}", problem.message));
+        }
+        let mut report = MergeReport::default();
+        let mut written = Vec::new();
+        for server in &config.servers {
+            let name = &server.tool_prefix;
+            if let Some(reason) = skip_reason(server, format) {
+                notes.push(format!("skipped {name}: {reason}"));
+            } else if !destination.has_server(format, name) {
+                report.added.push(name.clone());
+                written.push(server);
+            } else if destination.force {
+                report.replaced.push(name.clone());
+                written.push(server);
+            } else {
+                report.kept.push(name.clone());
+            }
+        }
+
+        let reserved = destination.reserved_names(format, &report.replaced);
         let mut export = Export {
             format,
             entries: Vec::new(),
-            placeholders: Vec::new(),
-            notes: Vec::new(),
+            placeholders: Placeholders::new(format, reserved),
+            notes,
+            report,
         };
-        for problem in &config.problems {
-            export
-                .notes
-                .push(format!("not exported: {}", problem.message));
+        for server in &written {
+            export.record_environment_refs(server);
         }
-        for server in &config.servers {
-            let auth = logins
-                .get(&server.tool_prefix)
-                .cloned()
-                .unwrap_or(StoredAuth::None);
-            let placeholders_before = export.placeholders.clone();
-            match export.entry(server, &auth) {
-                Ok(entry) => {
-                    export.entries.push(ExportedEntry {
-                        name: server.tool_prefix.clone(),
-                        entry,
-                    });
-                    export.notes.extend(export.server_notes(server, &auth));
-                }
-                Err(reason) => {
-                    export.placeholders = placeholders_before;
-                    export
-                        .notes
-                        .push(format!("skipped {}: {reason:#}", server.tool_prefix));
-                }
-            }
+        for server in written {
+            let login = logins.get(&server.tool_prefix).unwrap_or(&NO_LOGIN);
+            let entry = export.entry(server, login);
+            export.entries.push(ExportedEntry {
+                name: server.tool_prefix.clone(),
+                entry,
+            });
+            let server_notes = export.server_notes(server, login);
+            export.notes.extend(server_notes);
         }
         export
     }
 
-    fn entry(&mut self, server: &ResolvedServer, auth: &StoredAuth) -> anyhow::Result<Value> {
-        let name = server.tool_prefix.as_str();
-        match &server.transport {
-            ServerTransport::Http { url, headers } => {
-                if config::url_may_hold_secret(url) {
-                    bail!(
-                        "its url may hold a key ({}); add it to the file by hand",
-                        config::display_url(url)
-                    );
+    /// Takes the variables `${env:...}` refs read before any name is made up, so none is reused.
+    fn record_environment_refs(&mut self, server: &ResolvedServer) {
+        let (_, values) = configured_values(&server.transport);
+        for (field, value) in values {
+            if value_plan(field, value) != ValuePlan::SwapRefs {
+                continue;
+            }
+            let Ok(references) = secrets::parse_refs(value) else {
+                continue;
+            };
+            for reference in references {
+                if let SecretRef::Env(_) = reference {
+                    self.placeholders
+                        .add(&server.tool_prefix, SecretSource::Ref(reference), "");
                 }
-                let mut exported = Map::new();
+            }
+        }
+    }
+
+    fn entry(&mut self, server: &ResolvedServer, login: &StoredLogin) -> Value {
+        let name = server.tool_prefix.as_str();
+        let transport = match &server.transport {
+            ServerTransport::Http { url, headers } => {
+                let mut exported = BTreeMap::new();
                 for (header, value) in headers {
                     let preferred = header_placeholder_name(name, header);
-                    let value = self.without_secrets(name, header, value, &preferred)?;
-                    exported.insert(header.clone(), value.into());
+                    let value = self.exported_value(name, header, value, &preferred);
+                    exported.insert(header.clone(), value);
                 }
-                if let StoredAuth::Token { header } = auth {
-                    let source =
-                        format!("the token from `plugbay login {}`", server.display_name());
+                if let StoredLogin::Token { header } = login {
+                    let source = SecretSource::StoredToken {
+                        server: server.display_name(),
+                    };
                     let preferred = header_placeholder_name(name, header);
-                    let placeholder = self.placeholder(name, &source, &preferred, false);
+                    let placeholder = self.placeholders.text_for(name, source, &preferred);
                     let value = if header == AUTHORIZATION {
                         format!("Bearer {placeholder}")
                     } else {
                         placeholder
                     };
-                    exported.insert(header.clone(), value.into());
+                    exported.insert(header.clone(), value);
                 }
-                Ok(http_entry(url, exported))
+                NativeTransport::Http {
+                    url: url.to_string(),
+                    headers: exported,
+                }
             }
             ServerTransport::Stdio {
                 command,
@@ -282,114 +297,59 @@ impl Export {
                 env,
                 cwd,
             } => {
-                if has_secret_in_args(args) {
-                    bail!("its args seem to hold a secret; move it to `env` with a secret ref");
-                }
-                let mut exported = Map::new();
+                let mut exported = BTreeMap::new();
                 for (variable, value) in env {
                     let preferred = environment_variable_name(variable);
-                    let value = self.without_secrets(name, variable, value, &preferred)?;
-                    exported.insert(variable.clone(), value.into());
+                    let value = self.exported_value(name, variable, value, &preferred);
+                    exported.insert(variable.clone(), value);
                 }
                 let cwd = match self.format {
                     ExportFormat::Claude => None,
-                    ExportFormat::Vscode => cwd.as_deref(),
+                    ExportFormat::Vscode => cwd.as_ref().map(|cwd| cwd.display().to_string()),
                 };
-                Ok(stdio_entry(command, args, exported, cwd))
+                NativeTransport::Stdio {
+                    command: command.clone(),
+                    args: args.clone(),
+                    env: exported,
+                    cwd,
+                }
             }
-        }
+        };
+        transport.to_json()
     }
 
-    /// `value` with each secret ref swapped for a placeholder named `preferred` (numbered after the
-    /// first). A literal value in a secret-looking `field` becomes a placeholder as a whole.
-    fn without_secrets(
+    /// `value` as the file gets it, see [`value_plan`]. New placeholders are named `preferred`.
+    fn exported_value(
         &mut self,
         server: &str,
         field: &str,
         value: &str,
         preferred: &str,
-    ) -> anyhow::Result<String> {
-        if !secrets::contains_secret_ref(value) {
-            if value.is_empty() || !is_secret_field(field) {
-                return Ok(value.to_string());
-            }
-            let (scheme, _) = split_bearer_scheme(value);
-            let source = format!("the literal `{field}` value of {server}");
-            let placeholder = self.placeholder(server, &source, preferred, false);
-            return Ok(format!("{scheme}{placeholder}"));
-        }
-
-        let mut count = 0;
-        secrets::replace_refs(value, |reference| {
-            count += 1;
-            let source = reference.describe();
-            match reference {
-                SecretRef::Env(variable) => {
-                    self.placeholder(server, &source, &environment_variable_name(variable), true)
-                }
-                _ if count == 1 => self.placeholder(server, &source, preferred, false),
-                _ => self.placeholder(server, &source, &format!("{preferred}_{count}"), false),
-            }
-        })
-        .with_context(|| format!("reading the secret refs in `{field}`"))
-    }
-
-    /// The placeholder text for `source`, reusing the one already made for it.
-    fn placeholder(
-        &mut self,
-        server: &str,
-        source: &str,
-        preferred: &str,
-        from_environment: bool,
     ) -> String {
-        let index = match self
-            .placeholders
-            .iter()
-            .position(|placeholder| placeholder.source == source)
-        {
-            Some(index) => index,
-            None => {
-                let name = self.unused_name(server, preferred);
-                self.placeholders.push(Placeholder {
-                    name,
-                    source: source.to_string(),
-                    from_environment,
-                    servers: Vec::new(),
+        match value_plan(field, value) {
+            ValuePlan::Copy => return value.to_string(),
+            ValuePlan::SwapRefs => {
+                let swapped = secrets::replace_refs(value, |reference| {
+                    let source = SecretSource::Ref(reference.clone());
+                    self.placeholders.text_for(server, source, preferred)
                 });
-                self.placeholders.len() - 1
+                // `skip_reason` turned malformed refs away; if one slips by, replace it all.
+                if let Ok(swapped) = swapped {
+                    return swapped;
+                }
             }
-        };
-        let placeholder = &mut self.placeholders[index];
-        if !placeholder.servers.iter().any(|name| name == server) {
-            placeholder.servers.push(server.to_string());
+            ValuePlan::Replace => {}
         }
-        self.format.placeholder_text(placeholder)
+        let (scheme, _) = secrets::split_bearer_scheme(value);
+        let source = SecretSource::Literal {
+            server: server.to_string(),
+            field: field.to_string(),
+        };
+        let placeholder = self.placeholders.text_for(server, source, preferred);
+        format!("{scheme}{placeholder}")
     }
 
-    /// `preferred`, else `SERVER_preferred`, else that numbered: two secrets never share a name.
-    fn unused_name(&self, server: &str, preferred: &str) -> String {
-        let is_taken = |candidate: &str| {
-            self.placeholders
-                .iter()
-                .any(|placeholder| placeholder.name == candidate)
-        };
-        let prefixed = environment_variable_name(&format!("{server}_{preferred}"));
-        for candidate in [preferred, prefixed.as_str()] {
-            if !is_taken(candidate) {
-                return candidate.to_string();
-            }
-        }
-        let mut number = 2;
-        loop {
-            let candidate = format!("{prefixed}_{number}");
-            if !is_taken(&candidate) {
-                return candidate;
-            }
-            number += 1;
-        }
-    }
-
-    fn server_notes(&self, server: &ResolvedServer, auth: &StoredAuth) -> Vec<String> {
+    fn server_notes(&self, server: &ResolvedServer, login: &StoredLogin) -> Vec<String> {
         let name = &server.tool_prefix;
         let client = self.format.client_name();
         let mut notes = Vec::new();
@@ -399,7 +359,7 @@ impl Export {
                 server.account
             ));
         }
-        if *auth == StoredAuth::OAuth {
+        if *login == StoredLogin::OAuth {
             notes.push(format!(
                 "{name} signs in with OAuth here; {client} asks each teammate to sign in"
             ));
@@ -413,242 +373,146 @@ impl Export {
             && self.format == ExportFormat::Claude
         {
             notes.push(format!(
-                "{name} runs in {} here; .mcp.json has no `cwd`, so it starts in the project directory",
-                cwd.display()
+                "{name} runs in {} here; {} has no `cwd`, so it starts in the project directory",
+                cwd.display(),
+                claude::PROJECT_FILE
             ));
         }
         notes
-    }
-
-    /// `existing` (a missing file when `None`) with the exported entries merged in: entries of the
-    /// same name are kept unless `force`, everything else in the file is left as it was.
-    fn merge(&self, existing: Option<&str>, force: bool) -> anyhow::Result<(String, MergeReport)> {
-        let mut document = match existing.map(str::trim) {
-            None | Some("") => Map::new(),
-            Some(text) => match serde_json::from_str(text)
-                .context("parsing it as JSON (comments are not supported)")?
-            {
-                Value::Object(document) => document,
-                _ => bail!("expected a JSON object at the top level"),
-            },
-        };
-
-        let servers_key = self.format.servers_key();
-        let existing_names: Vec<String> = match document.get(servers_key) {
-            None => Vec::new(),
-            Some(Value::Object(servers)) => servers.keys().cloned().collect(),
-            Some(_) => bail!("`{servers_key}` is not an object"),
-        };
-        let mut report = MergeReport::default();
-        let mut written = Vec::new();
-        for entry in &self.entries {
-            if !existing_names.contains(&entry.name) {
-                report.added.push(entry.name.clone());
-                written.push(entry);
-            } else if force {
-                report.replaced.push(entry.name.clone());
-                written.push(entry);
-            } else {
-                report.kept.push(entry.name.clone());
-            }
-        }
-
-        if self.format == ExportFormat::Vscode {
-            self.add_inputs(&mut document, &written)?;
-        }
-        let servers = document
-            .entry(servers_key)
-            .or_insert_with(|| Value::Object(Map::new()));
-        let Value::Object(servers) = servers else {
-            bail!("`{servers_key}` is not an object");
-        };
-        for entry in written {
-            servers.insert(entry.name.clone(), entry.entry.clone());
-        }
-
-        let mut contents =
-            serde_json::to_string_pretty(&Value::Object(document)).context("rendering the JSON")?;
-        contents.push('\n');
-        Ok((contents, report))
-    }
-
-    /// A password prompt for every input the written entries use, unless one with that id exists.
-    fn add_inputs(
-        &self,
-        document: &mut Map<String, Value>,
-        written: &[&ExportedEntry],
-    ) -> anyhow::Result<()> {
-        let needed: Vec<&Placeholder> = self
-            .placeholders
-            .iter()
-            .filter(|placeholder| !placeholder.from_environment)
-            .filter(|placeholder| {
-                written
-                    .iter()
-                    .any(|entry| placeholder.servers.contains(&entry.name))
-            })
-            .collect();
-        if needed.is_empty() {
-            return Ok(());
-        }
-
-        let inputs = document
-            .entry("inputs")
-            .or_insert_with(|| Value::Array(Vec::new()));
-        let Value::Array(inputs) = inputs else {
-            bail!("`inputs` is not a list");
-        };
-        for placeholder in needed {
-            let id = input_id(&placeholder.name);
-            let exists = inputs
-                .iter()
-                .any(|input| input.get("id").and_then(Value::as_str) == Some(id.as_str()));
-            if !exists {
-                inputs.push(json!({
-                    "type": "promptString",
-                    "id": id,
-                    "description": format!("{} for {}", placeholder.name, placeholder.servers.join(", ")),
-                    "password": true,
-                }));
-            }
-        }
-        Ok(())
     }
 
     fn print_notes(&self) {
         for note in &self.notes {
             eprintln!("note: {note}");
         }
-        let (from_environment, prompted): (Vec<&Placeholder>, Vec<&Placeholder>) =
-            self.placeholders.iter().partition(|placeholder| {
-                placeholder.from_environment || self.format == ExportFormat::Claude
-            });
+        let (prompted, from_environment): (Vec<&Placeholder>, Vec<&Placeholder>) = self
+            .placeholders
+            .iter()
+            .partition(|placeholder| self.format.prompts_for(&placeholder.source));
         if !prompted.is_empty() {
             eprintln!(
                 "\nVS Code asks each teammate for these and keeps them in its secret storage:"
             );
-            print_placeholders(&prompted, |placeholder| input_id(&placeholder.name));
+            print_placeholders(&prompted);
         }
         if !from_environment.is_empty() {
             eprintln!(
                 "\nEach teammate sets these environment variables before starting {}:",
                 self.format.client_name()
             );
-            print_placeholders(&from_environment, |placeholder| placeholder.name.clone());
+            print_placeholders(&from_environment);
         }
     }
 }
 
-fn print_placeholders(placeholders: &[&Placeholder], label: impl Fn(&Placeholder) -> String) {
+fn print_placeholders(placeholders: &[&Placeholder]) {
     let width = placeholders
         .iter()
-        .map(|placeholder| label(placeholder).len())
+        .map(|placeholder| placeholder.name.len())
         .max()
         .unwrap_or(0);
     for placeholder in placeholders {
         eprintln!(
             "  {:width$}  {} (here: {})",
-            label(placeholder),
+            placeholder.name,
             placeholder.servers.join(", "),
-            placeholder.source
+            placeholder.source.describe()
         );
     }
 }
 
-impl MergeReport {
-    fn changes_file(&self) -> bool {
-        !self.added.is_empty() || !self.replaced.is_empty()
-    }
-
-    fn print(&self, file: &str) {
-        if self.changes_file() {
-            println!("Wrote {file}");
-        } else {
-            println!("{file} unchanged");
+/// Why `server` can't be exported safely, if it can't. Never quotes a value: it may be a secret.
+fn skip_reason(server: &ResolvedServer, format: ExportFormat) -> Option<String> {
+    match &server.transport {
+        ServerTransport::Http { url, .. } if config::url_may_hold_secret(url) => {
+            return Some(format!(
+                "its url may hold a key ({}); add it to the file by hand",
+                config::display_url(url)
+            ));
         }
-        if !self.added.is_empty() {
-            println!("  added {}", self.added.join(", "));
-        }
-        if !self.replaced.is_empty() {
-            println!("  replaced {}", self.replaced.join(", "));
-        }
-        if !self.kept.is_empty() {
-            println!(
-                "  kept the existing {} (use --force to replace)",
-                self.kept.join(", ")
+        ServerTransport::Stdio { args, .. } if secrets::has_secret_in_args(args) => {
+            return Some(
+                "its args seem to hold a secret; move it to `env` with a secret ref".to_string(),
             );
         }
+        ServerTransport::Stdio { args, .. }
+            if args
+                .iter()
+                .any(|argument| secrets::has_secret_url(argument)) =>
+        {
+            return Some(
+                "its args hold a url that may carry a credential; move it to `env` with a secret ref"
+                    .to_string(),
+            );
+        }
+        _ => {}
     }
-}
 
-fn http_entry(url: &Url, headers: Map<String, Value>) -> Value {
-    let mut entry = Map::new();
-    entry.insert("type".to_string(), "http".into());
-    entry.insert("url".to_string(), url.as_str().into());
-    if !headers.is_empty() {
-        entry.insert("headers".to_string(), Value::Object(headers));
-    }
-    Value::Object(entry)
-}
-
-fn stdio_entry(
-    command: &str,
-    args: &[String],
-    env: Map<String, Value>,
-    cwd: Option<&Path>,
-) -> Value {
-    let mut entry = Map::new();
-    entry.insert("type".to_string(), "stdio".into());
-    entry.insert("command".to_string(), command.into());
-    if !args.is_empty() {
-        entry.insert("args".to_string(), args.into());
-    }
-    if !env.is_empty() {
-        entry.insert("env".to_string(), Value::Object(env));
-    }
-    if let Some(cwd) = cwd {
-        entry.insert("cwd".to_string(), cwd.display().to_string().into());
-    }
-    Value::Object(entry)
-}
-
-/// `SERVER_TOKEN` for `Authorization`, `SERVER_HEADER_NAME` for any other header.
-fn header_placeholder_name(server: &str, header: &str) -> String {
-    if header.eq_ignore_ascii_case(AUTHORIZATION) {
-        environment_variable_name(&format!("{server}_token"))
-    } else {
-        environment_variable_name(&format!("{server}_{header}"))
-    }
-}
-
-/// Uppercase letters, digits and `_`, not starting with a digit: a name every shell and both
-/// clients expand.
-fn environment_variable_name(text: &str) -> String {
-    let mut name: String = text
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character.to_ascii_uppercase()
-            } else {
-                '_'
+    let (kind, values) = configured_values(&server.transport);
+    for (field, value) in values {
+        let Ok(references) = secrets::parse_refs(value) else {
+            return Some(format!(
+                "`{kind}.{field}` has a malformed secret ref; fix the `${{...}}` in the config"
+            ));
+        };
+        if value_plan(field, value) != ValuePlan::SwapRefs {
+            continue;
+        }
+        for reference in references {
+            if let SecretRef::Env(variable) = reference
+                && !format.can_expand(&variable)
+            {
+                return Some(format!(
+                    "`{kind}.{field}` reads `${{env:{variable}}}`, which {} can't expand; rename the variable to letters, digits and `_`",
+                    format.client_name()
+                ));
             }
-        })
-        .collect();
-    if name.is_empty() || name.starts_with(|character: char| character.is_ascii_digit()) {
-        name.insert(0, '_');
+        }
     }
-    name
+    None
 }
 
-/// `LINEAR_API_KEY` → `linear-api-key`.
-fn input_id(name: &str) -> String {
-    name.trim_start_matches('_')
-        .to_ascii_lowercase()
-        .replace('_', "-")
+/// The values that may hold secret refs: a remote server's headers or a local one's env.
+fn configured_values(transport: &ServerTransport) -> (&'static str, &BTreeMap<String, String>) {
+    match transport {
+        ServerTransport::Http { headers, .. } => ("headers", headers),
+        ServerTransport::Stdio { env, .. } => ("env", env),
+    }
+}
+
+/// In a secret-named field only a `Bearer ` scheme may sit next to a ref (`key-${env:SUFFIX}`
+/// would leak half the key), and nowhere may a literal URL carry a credential.
+fn value_plan(field: &str, value: &str) -> ValuePlan {
+    let secret_field = secrets::is_secret_field(field);
+    if !secrets::contains_secret_ref(value) {
+        let may_be_secret = secret_field || secrets::has_secret_url(value);
+        return if value.is_empty() || !may_be_secret {
+            ValuePlan::Copy
+        } else {
+            ValuePlan::Replace
+        };
+    }
+    let (_, after_scheme) = secrets::split_bearer_scheme(value);
+    let Ok(literal) = text_around_refs(after_scheme) else {
+        return ValuePlan::Replace;
+    };
+    let literal_next_to_secret = secret_field && !literal.trim().is_empty();
+    if literal_next_to_secret || secrets::has_secret_url(&literal) {
+        ValuePlan::Replace
+    } else {
+        ValuePlan::SwapRefs
+    }
+}
+
+/// `value` with each ref swapped for a space, so the text on either side never reads as one word.
+fn text_around_refs(value: &str) -> anyhow::Result<String> {
+    secrets::replace_refs(value, |_| " ".to_string())
 }
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
     use crate::config::{ConfigProblem, ToolFilter};
 
@@ -668,6 +532,13 @@ mod tests {
             }
         }
         server
+    }
+
+    fn stdio(name: &str, env: &[(&str, &str)]) -> ResolvedServer {
+        with_env(
+            ResolvedServer::test_stdio(name, DEFAULT_ACCOUNT, name, &[]),
+            env,
+        )
     }
 
     fn tool() -> ResolvedServer {
@@ -691,20 +562,24 @@ mod tests {
 
     fn build_with_logins(
         servers: Vec<ResolvedServer>,
-        logins: &[(&str, StoredAuth)],
+        logins: &[(&str, StoredLogin)],
         format: ExportFormat,
     ) -> Export {
         let config = ResolvedConfig::test_with(Vec::new(), servers);
         let logins = logins
             .iter()
-            .map(|(name, auth)| (name.to_string(), auth.clone()))
+            .map(|(name, login)| (name.to_string(), login.clone()))
             .collect();
-        Export::build(&config, &logins, format)
+        Export::build(&config, &logins, format, &Destination::default())
     }
 
     fn printed(export: &Export) -> Value {
-        let (contents, _) = export.merge(None, false).unwrap();
+        let contents = export.merge(Destination::default()).unwrap();
         serde_json::from_str(&contents).unwrap()
+    }
+
+    fn printed_text(export: &Export) -> String {
+        export.merge(Destination::default()).unwrap()
     }
 
     #[test]
@@ -739,7 +614,7 @@ mod tests {
                 "inputs": [{
                     "type": "promptString",
                     "id": "tool-api-key",
-                    "description": "TOOL_API_KEY for tool",
+                    "description": "tool-api-key for tool",
                     "password": true,
                 }],
                 "servers": {
@@ -760,15 +635,13 @@ mod tests {
 
     #[test]
     fn vscode_keeps_inputs_before_servers_in_a_new_file() {
-        let (contents, _) = build(vec![tool()], ExportFormat::Vscode)
-            .merge(None, false)
-            .unwrap();
+        let contents = printed_text(&build(vec![tool()], ExportFormat::Vscode));
         assert!(contents.find("\"inputs\"") < contents.find("\"servers\""));
     }
 
     #[test]
     fn stored_bearer_token_becomes_an_authorization_placeholder() {
-        let token = StoredAuth::Token {
+        let token = StoredLogin::Token {
             header: AUTHORIZATION.to_string(),
         };
         let export = build_with_logins(vec![linear()], &[("linear", token)], ExportFormat::Claude);
@@ -780,7 +653,7 @@ mod tests {
 
     #[test]
     fn stored_token_in_a_custom_header_is_sent_bare() {
-        let token = StoredAuth::Token {
+        let token = StoredLogin::Token {
             header: "x-api-key".to_string(),
         };
         let export = build_with_logins(vec![linear()], &[("linear", token)], ExportFormat::Vscode);
@@ -794,7 +667,7 @@ mod tests {
     fn oauth_login_gets_no_header_and_a_note() {
         let export = build_with_logins(
             vec![linear()],
-            &[("linear", StoredAuth::OAuth)],
+            &[("linear", StoredLogin::OAuth)],
             ExportFormat::Claude,
         );
         assert_eq!(
@@ -826,36 +699,90 @@ mod tests {
 
     #[test]
     fn literal_secret_values_never_reach_the_file() {
-        let server = with_env(
-            ResolvedServer::test_stdio("tool", DEFAULT_ACCOUNT, "npx", &[]),
-            &[("API_KEY", "literal-test-token")],
+        let export = build(
+            vec![stdio("tool", &[("API_KEY", "literal-test-token")])],
+            ExportFormat::Claude,
         );
-        let export = build(vec![server], ExportFormat::Claude);
-        let (contents, _) = export.merge(None, false).unwrap();
+        let contents = printed_text(&export);
         assert!(!contents.contains("literal-test-token"), "{contents}");
         assert!(contents.contains("${API_KEY}"), "{contents}");
     }
 
     #[test]
-    fn one_secret_used_twice_shares_a_placeholder() {
-        let other = with_env(
-            ResolvedServer::test_stdio("other", DEFAULT_ACCOUNT, "other", &[]),
-            &[("KEY", "${keychain:plugbay/tool-key}")],
+    fn literal_text_next_to_a_ref_in_a_secret_field_becomes_one_placeholder() {
+        let server = stdio("tool", &[("API_KEY", "fake-private-${env:SUFFIX}")]);
+        let export = build(vec![server], ExportFormat::Claude);
+        let contents = printed_text(&export);
+        assert!(!contents.contains("fake-private"), "{contents}");
+        assert_eq!(
+            printed(&export)["mcpServers"]["tool"]["env"]["API_KEY"],
+            "${API_KEY}"
         );
+        assert_eq!(export.placeholders.iter().count(), 1);
+    }
+
+    #[test]
+    fn malformed_refs_skip_the_server_without_quoting_the_value() {
+        let server = stdio("tool", &[("API_KEY", "fake-private-${env:SUFFIX")]);
+        let export = build(vec![server], ExportFormat::Claude);
+        assert!(export.entries.is_empty());
+        let notes = export.notes.join("\n");
+        assert!(
+            notes.contains("`env.API_KEY` has a malformed secret ref"),
+            "{notes}"
+        );
+        assert!(!notes.contains("fake-private"), "{notes}");
+    }
+
+    #[test]
+    fn credential_urls_in_args_skip_the_server() {
+        let server = ResolvedServer::test_stdio(
+            "tool",
+            DEFAULT_ACCOUNT,
+            "npx",
+            &["--url", "https://fake-user:fake-pass@mcp.example.com/mcp"],
+        );
+        let export = build(vec![server], ExportFormat::Claude);
+        assert!(export.entries.is_empty());
+        let notes = export.notes.join("\n");
+        assert!(notes.contains("may carry a credential"), "{notes}");
+        assert!(!notes.contains("fake-pass"), "{notes}");
+    }
+
+    #[test]
+    fn credential_urls_in_env_values_become_placeholders() {
+        let server = stdio(
+            "db",
+            &[
+                (
+                    "DATABASE_URL",
+                    "postgres://fake-user:fake-pass@db.internal/app",
+                ),
+                ("LOG_URL", "https://logs.example.com/ingest"),
+            ],
+        );
+        let export = build(vec![server], ExportFormat::Claude);
+        let contents = printed_text(&export);
+        assert!(!contents.contains("fake-pass"), "{contents}");
+        let env = &printed(&export)["mcpServers"]["db"]["env"];
+        assert_eq!(env["DATABASE_URL"], "${DATABASE_URL}");
+        assert_eq!(env["LOG_URL"], "https://logs.example.com/ingest");
+    }
+
+    #[test]
+    fn one_secret_used_twice_shares_a_placeholder() {
+        let other = stdio("other", &[("KEY", "${keychain:plugbay/tool-key}")]);
         let export = build(vec![tool(), other], ExportFormat::Claude);
         assert_eq!(
             printed(&export)["mcpServers"]["other"]["env"]["KEY"],
             "${TOOL_API_KEY}"
         );
-        assert_eq!(export.placeholders.len(), 2);
+        assert_eq!(export.placeholders.iter().count(), 2);
     }
 
     #[test]
     fn different_secrets_under_one_name_get_the_server_prefix() {
-        let other = with_env(
-            ResolvedServer::test_stdio("other", DEFAULT_ACCOUNT, "other", &[]),
-            &[("TOOL_API_KEY", "${op://work/other/key}")],
-        );
+        let other = stdio("other", &[("TOOL_API_KEY", "${op://work/other/key}")]);
         let export = build(vec![tool(), other], ExportFormat::Claude);
         assert_eq!(
             printed(&export)["mcpServers"]["other"]["env"]["TOOL_API_KEY"],
@@ -865,8 +792,8 @@ mod tests {
 
     #[test]
     fn several_refs_in_one_value_are_numbered() {
-        let server = with_env(
-            ResolvedServer::test_stdio("db", DEFAULT_ACCOUNT, "db", &[]),
+        let server = stdio(
+            "db",
             &[(
                 "DB_URL",
                 "postgres://${env:DB_USER}:${fnox:DB_PASSWORD}@${fnox:DB_HOST}/app",
@@ -875,8 +802,61 @@ mod tests {
         let export = build(vec![server], ExportFormat::Claude);
         assert_eq!(
             printed(&export)["mcpServers"]["db"]["env"]["DB_URL"],
-            "postgres://${DB_USER}:${DB_URL_2}@${DB_URL_3}/app"
+            "postgres://${DB_USER}:${DB_URL}@${DB_URL_2}/app"
         );
+    }
+
+    #[test]
+    fn input_ids_stay_distinct_when_names_differ_only_in_underscores() {
+        let server = stdio(
+            "tool",
+            &[
+                ("KEY", "${keychain:plugbay/a}"),
+                ("_KEY", "${keychain:plugbay/b}"),
+            ],
+        );
+        let printed = printed(&build(vec![server], ExportFormat::Vscode));
+        assert_eq!(printed["servers"]["tool"]["env"]["KEY"], "${input:key}");
+        assert_eq!(printed["servers"]["tool"]["env"]["_KEY"], "${input:key-2}");
+        assert_eq!(printed["inputs"][1]["id"], "key-2");
+    }
+
+    #[test]
+    fn env_refs_keep_their_exact_name() {
+        let server = stdio("tool", &[("TOKEN", "${env:my_token}")]);
+        let claude = printed(&build(vec![server.clone()], ExportFormat::Claude));
+        assert_eq!(claude["mcpServers"]["tool"]["env"]["TOKEN"], "${my_token}");
+        let vscode = printed(&build(vec![server], ExportFormat::Vscode));
+        assert_eq!(vscode["servers"]["tool"]["env"]["TOKEN"], "${env:my_token}");
+    }
+
+    #[test]
+    fn env_ref_names_are_taken_before_any_name_is_made_up() {
+        let first = stdio("first", &[("GITHUB_TOKEN", "${keychain:plugbay/github}")]);
+        let second = stdio("second", &[("TOKEN", "${env:GITHUB_TOKEN}")]);
+        let printed = printed(&build(vec![first, second], ExportFormat::Claude));
+        assert_eq!(
+            printed["mcpServers"]["first"]["env"]["GITHUB_TOKEN"],
+            "${FIRST_GITHUB_TOKEN}"
+        );
+        assert_eq!(
+            printed["mcpServers"]["second"]["env"]["TOKEN"],
+            "${GITHUB_TOKEN}"
+        );
+    }
+
+    #[test]
+    fn env_names_claude_code_cannot_expand_skip_the_server() {
+        let server = stdio("tool", &[("TOKEN", "${env:my-token}")]);
+        let claude = build(vec![server.clone()], ExportFormat::Claude);
+        assert!(claude.entries.is_empty());
+        assert!(
+            claude.notes[0].contains("can't expand"),
+            "{:?}",
+            claude.notes
+        );
+        let vscode = printed(&build(vec![server], ExportFormat::Vscode));
+        assert_eq!(vscode["servers"]["tool"]["env"]["TOKEN"], "${env:my-token}");
     }
 
     #[test]
@@ -928,13 +908,13 @@ mod tests {
 
     #[test]
     fn a_skipped_server_leaves_no_placeholders_behind() {
-        let server = with_env(
-            ResolvedServer::test_stdio("broken", DEFAULT_ACCOUNT, "broken", &[]),
+        let server = stdio(
+            "broken",
             &[("A_KEY", "${keychain:plugbay/a}"), ("B_KEY", "${nope:b}")],
         );
         let export = build(vec![server], ExportFormat::Claude);
         assert!(export.entries.is_empty());
-        assert!(export.placeholders.is_empty());
+        assert_eq!(export.placeholders.iter().count(), 0);
     }
 
     #[test]
@@ -944,7 +924,12 @@ mod tests {
             servers: vec!["linear".to_string()],
             message: "linear is bound to two accounts".to_string(),
         });
-        let export = Export::build(&config, &BTreeMap::new(), ExportFormat::Claude);
+        let export = Export::build(
+            &config,
+            &BTreeMap::new(),
+            ExportFormat::Claude,
+            &Destination::default(),
+        );
         assert_eq!(
             export.notes,
             ["not exported: linear is bound to two accounts"]
@@ -962,96 +947,5 @@ mod tests {
         assert!(claude.notes[0].contains("no `cwd`"), "{:?}", claude.notes);
         let vscode = build(vec![server], ExportFormat::Vscode);
         assert_eq!(printed(&vscode)["servers"]["tool"]["cwd"], "/srv/tool");
-    }
-
-    const EXISTING_MCP_JSON: &str = r#"{
-  "mcpServers": {
-    "linear": { "type": "http", "url": "https://linear.example/mcp" },
-    "mine": { "command": "mine" }
-  },
-  "custom": true
-}"#;
-
-    #[test]
-    fn merge_keeps_same_named_entries_and_unrelated_keys() {
-        let export = build(vec![linear(), tool()], ExportFormat::Claude);
-        let (contents, report) = export.merge(Some(EXISTING_MCP_JSON), false).unwrap();
-        let merged: Value = serde_json::from_str(&contents).unwrap();
-        assert_eq!(
-            merged["mcpServers"]["linear"]["url"],
-            "https://linear.example/mcp"
-        );
-        assert_eq!(merged["custom"], true);
-        assert_eq!(
-            report,
-            MergeReport {
-                added: vec!["tool".to_string()],
-                replaced: Vec::new(),
-                kept: vec!["linear".to_string()],
-            }
-        );
-    }
-
-    #[test]
-    fn merge_keeps_the_order_of_existing_keys() {
-        let export = build(vec![tool()], ExportFormat::Claude);
-        let (contents, _) = export.merge(Some(EXISTING_MCP_JSON), false).unwrap();
-        let positions: Vec<usize> = ["\"linear\"", "\"mine\"", "\"tool\"", "\"custom\""]
-            .iter()
-            .map(|key| contents.find(key).unwrap())
-            .collect();
-        assert!(positions.is_sorted(), "{contents}");
-    }
-
-    #[test]
-    fn force_replaces_same_named_entries_in_place() {
-        let export = build(vec![linear()], ExportFormat::Claude);
-        let (contents, report) = export.merge(Some(EXISTING_MCP_JSON), true).unwrap();
-        let merged: Value = serde_json::from_str(&contents).unwrap();
-        assert_eq!(
-            merged["mcpServers"]["linear"]["url"],
-            "https://mcp.linear.app/mcp"
-        );
-        assert_eq!(report.replaced, ["linear"]);
-        assert!(
-            contents.find("\"linear\"") < contents.find("\"mine\""),
-            "{contents}"
-        );
-    }
-
-    #[test]
-    fn merge_does_not_add_an_input_that_exists() {
-        let existing = r#"{ "inputs": [{ "type": "promptString", "id": "tool-api-key", "description": "mine" }] }"#;
-        let export = build(vec![tool()], ExportFormat::Vscode);
-        let (contents, _) = export.merge(Some(existing), false).unwrap();
-        let merged: Value = serde_json::from_str(&contents).unwrap();
-        assert_eq!(merged["inputs"].as_array().unwrap().len(), 1);
-        assert_eq!(merged["inputs"][0]["description"], "mine");
-    }
-
-    #[test]
-    fn kept_entries_add_no_inputs() {
-        let existing = r#"{ "servers": { "tool": { "type": "stdio", "command": "tool" } } }"#;
-        let export = build(vec![tool()], ExportFormat::Vscode);
-        let (contents, report) = export.merge(Some(existing), false).unwrap();
-        assert!(!report.changes_file());
-        assert!(!contents.contains("inputs"), "{contents}");
-    }
-
-    #[test]
-    fn merge_refuses_files_it_cannot_read_as_json() {
-        let export = build(vec![linear()], ExportFormat::Vscode);
-        assert!(export.merge(Some("// comment\n{}"), false).is_err());
-        assert!(export.merge(Some(r#"{ "servers": [] }"#), false).is_err());
-    }
-
-    #[test]
-    fn names_become_environment_variables_and_input_ids() {
-        assert_eq!(
-            environment_variable_name("my-server_x-api-key"),
-            "MY_SERVER_X_API_KEY"
-        );
-        assert_eq!(environment_variable_name("1password"), "_1PASSWORD");
-        assert_eq!(input_id("_1PASSWORD_TOKEN"), "1password-token");
     }
 }

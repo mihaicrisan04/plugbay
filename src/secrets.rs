@@ -6,6 +6,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
+use url::Url;
 
 /// Keychain service that `store_in_keychain` (and `plugbay import`) writes under.
 pub const KEYCHAIN_SERVICE: &str = "plugbay";
@@ -39,7 +40,6 @@ pub fn contains_secret_ref(value: &str) -> bool {
 }
 
 /// Every reference in `value`, in order. Fails on unknown schemes and unterminated `${`.
-#[cfg(test)]
 pub fn parse_refs(value: &str) -> anyhow::Result<Vec<SecretRef>> {
     let mut references = Vec::new();
     for segment in parse(value)? {
@@ -120,6 +120,92 @@ pub fn looks_secret(name: &str) -> bool {
     ];
     let name = name.to_ascii_uppercase();
     SECRET_WORDS.iter().any(|word| name.contains(word))
+}
+
+/// An env var or header whose value is a secret by its name, `Authorization` included.
+pub fn is_secret_field(field: &str) -> bool {
+    field.eq_ignore_ascii_case("authorization") || looks_secret(field)
+}
+
+/// `"Bearer abc"` → `("Bearer ", "abc")`, so the keychain holds the bare token.
+pub fn split_bearer_scheme(value: &str) -> (&str, &str) {
+    let scheme_length = "Bearer ".len();
+    match value.get(..scheme_length) {
+        Some(scheme) if scheme.eq_ignore_ascii_case("Bearer ") => value.split_at(scheme_length),
+        _ => ("", value),
+    }
+}
+
+/// True when an arg looks like it carries a secret inline: `--token=abc`, `Authorization:Bearer abc`,
+/// or a secret-named flag followed by a value. Args using `${...}` expansion are fine.
+pub fn has_secret_in_args(args: &[String]) -> bool {
+    for (index, argument) in args.iter().enumerate() {
+        if let Some((name, value)) = argument.split_once(['=', ':'])
+            && looks_secret(name)
+            && !value.is_empty()
+            && !value.contains("${")
+        {
+            return true;
+        }
+        let is_secret_flag = argument.starts_with('-') && looks_secret(argument);
+        if let Some(next) = args.get(index + 1)
+            && is_secret_flag
+            && !argument.contains('=')
+            && !next.starts_with('-')
+            && !next.contains("${")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when a URL in `text`, of any scheme, may carry a credential: userinfo, a query value or a
+/// token-looking path segment, i.e. what [`crate::config::display_url`] masks.
+pub fn has_secret_url(text: &str) -> bool {
+    for candidate in url_candidates(text) {
+        let may_hold_secret = match Url::parse(candidate) {
+            Ok(url) => crate::config::url_may_hold_secret(&url),
+            // `https://token@` has no host, so it doesn't parse; its userinfo still counts.
+            Err(_) => authority(candidate).contains('@'),
+        };
+        if may_hold_secret {
+            return true;
+        }
+    }
+    false
+}
+
+/// Every `scheme://...` run in `text`, up to the next whitespace or quote.
+fn url_candidates(text: &str) -> Vec<&str> {
+    let is_scheme_character =
+        |character: char| character.is_ascii_alphanumeric() || "+-.".contains(character);
+    let mut candidates = Vec::new();
+    let mut searched = 0;
+    while let Some(offset) = text[searched..].find("://") {
+        let separator = searched + offset;
+        let scheme_start = text[..separator]
+            .rfind(|character: char| !is_scheme_character(character))
+            .map_or(0, |index| index + 1);
+        let end = text[separator..]
+            .find(|character: char| character.is_whitespace() || "\"'".contains(character))
+            .map_or(text.len(), |index| separator + index);
+        let scheme = &text[scheme_start..separator];
+        if scheme.starts_with(|character: char| character.is_ascii_alphabetic()) {
+            candidates.push(&text[scheme_start..end]);
+        }
+        searched = separator + "://".len();
+    }
+    candidates
+}
+
+/// The `user:pass@host:port` part of `scheme://user:pass@host:port/path`.
+fn authority(url: &str) -> &str {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    &after_scheme[..end]
 }
 
 /// A log-safe stand-in for a resolved secret value. Keeps a leading auth scheme
@@ -352,6 +438,45 @@ pub(crate) mod keychain {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_urls_of_any_scheme_are_detected() {
+        assert!(has_secret_url("postgres://fake-user:fake-pass@db/app"));
+        assert!(has_secret_url(
+            "--url=https://fake-user@mcp.example.com/mcp"
+        ));
+        assert!(has_secret_url("https://mcp.example.com/mcp?api_key=fake"));
+        assert!(has_secret_url("https://fake-token@"));
+    }
+
+    #[test]
+    fn plain_urls_and_text_are_not_secrets() {
+        assert!(!has_secret_url("https://mcp.example.com/mcp"));
+        assert!(!has_secret_url("postgres://db.internal:5432/app"));
+        assert!(!has_secret_url("postgres://fake-user: @db/app"));
+        assert!(!has_secret_url("debug"));
+    }
+
+    #[test]
+    fn inline_secret_args_are_detected() {
+        let args = ["--api-key".to_string(), "test-key".to_string()];
+        assert!(has_secret_in_args(&args));
+        assert!(has_secret_in_args(&["--token=test-token".to_string()]));
+        assert!(has_secret_in_args(&[
+            "Authorization:Bearer test-token".to_string()
+        ]));
+    }
+
+    #[test]
+    fn args_with_expansion_or_plain_names_are_not_secrets() {
+        let args = [
+            "--header".to_string(),
+            "Authorization:Bearer ${INTRANET_TOKEN}".to_string(),
+            "keycloak-mcp".to_string(),
+            "https://example.test/mcp".to_string(),
+        ];
+        assert!(!has_secret_in_args(&args));
+    }
 
     fn literal(text: &str) -> Segment {
         Segment::Literal(text.to_string())

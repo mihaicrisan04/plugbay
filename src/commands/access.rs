@@ -5,7 +5,6 @@ use std::path::PathBuf;
 
 use anyhow::{Context, bail};
 
-use crate::commands::inspect::display_path;
 use crate::commands::{
     notify_credentials_changed, notify_daemon_reload, resolve_everywhere, resolve_here,
 };
@@ -13,7 +12,7 @@ use crate::config::{
     self, ConfigFile, ConfigScope, ResolvedConfig, ResolvedServer, ServerTransport, SessionPin,
 };
 use crate::credentials::{StaticToken, StoredLogin};
-use crate::paths::Paths;
+use crate::paths::{Paths, display_path};
 use crate::project::ProjectLocation;
 use crate::protocol::{ControlRequest, send_control};
 use crate::secrets;

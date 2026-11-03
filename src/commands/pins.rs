@@ -6,11 +6,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, bail};
 use toml_edit::{DocumentMut, Item, Table, TableLike, Value};
 
-use crate::commands::inspect::display_path;
 use crate::commands::{location_here, notify_daemon_reload, resolve_everywhere, search};
 use crate::config::{self, LOCAL_FILE, PROJECT_FILE, ResolvedConfig};
 use crate::index;
-use crate::paths::Paths;
+use crate::paths::{Paths, display_path};
 use crate::project::ProjectLocation;
 use crate::{registry, secrets};
 

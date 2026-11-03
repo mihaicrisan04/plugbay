@@ -365,13 +365,13 @@ fn move_secrets_out(
     let mut kept = BTreeMap::new();
     let mut pending = Vec::new();
     for (field, value) in values {
-        if !is_secret_field(field) || secrets::contains_secret_ref(value) {
+        if !secrets::is_secret_field(field) || secrets::contains_secret_ref(value) {
             kept.insert(field.clone(), value.clone());
             continue;
         }
         let keychain_name = keychain_name(server_key, identity, field);
         let placeholder = format!("${{keychain:{KEYCHAIN_SERVICE}/{keychain_name}}}");
-        let (scheme, secret) = split_bearer_scheme(value);
+        let (scheme, secret) = secrets::split_bearer_scheme(value);
         kept.insert(field.clone(), format!("{scheme}{placeholder}"));
         pending.push(PendingSecret {
             keychain_name,
@@ -388,43 +388,6 @@ fn keychain_name(server_key: &str, identity: &str, field: &str) -> String {
     let short_fingerprint = &hex::encode(fingerprint)[..8];
     let field_name = normalize_server_name(field).unwrap_or_default();
     format!("{server_key}-{field_name}-{short_fingerprint}")
-}
-
-pub(super) fn is_secret_field(field: &str) -> bool {
-    field.eq_ignore_ascii_case("authorization") || secrets::looks_secret(field)
-}
-
-/// `"Bearer abc"` → `("Bearer ", "abc")`, so the keychain holds the bare token.
-pub(super) fn split_bearer_scheme(value: &str) -> (&str, &str) {
-    let scheme_length = "Bearer ".len();
-    match value.get(..scheme_length) {
-        Some(scheme) if scheme.eq_ignore_ascii_case("Bearer ") => value.split_at(scheme_length),
-        _ => ("", value),
-    }
-}
-
-/// True when an arg looks like it carries a secret inline: `--token=abc`, `Authorization:Bearer abc`,
-/// or a secret-named flag followed by a value. Args using `${...}` expansion are fine.
-pub(super) fn has_secret_in_args(args: &[String]) -> bool {
-    for (index, argument) in args.iter().enumerate() {
-        if let Some((name, value)) = argument.split_once(['=', ':'])
-            && secrets::looks_secret(name)
-            && !value.is_empty()
-            && !value.contains("${")
-        {
-            return true;
-        }
-        let is_secret_flag = argument.starts_with('-') && secrets::looks_secret(argument);
-        if let Some(next) = args.get(index + 1)
-            && is_secret_flag
-            && !argument.contains('=')
-            && !next.starts_with('-')
-            && !next.contains("${")
-        {
-            return true;
-        }
-    }
-    false
 }
 
 async fn store_secrets(servers: &mut [ImportedServer]) -> anyhow::Result<()> {
@@ -633,7 +596,7 @@ pub(super) fn print_secrets_in_args(servers: &[ImportedServer]) {
         let PlugbayEntry::Stdio { args, .. } = &server.entry else {
             continue;
         };
-        if has_secret_in_args(args) {
+        if secrets::has_secret_in_args(args) {
             println!(
                 "warning: `{}` seems to pass a secret in its args, which were copied as they are; move it to `env` with a secret ref",
                 server.key
@@ -833,27 +796,6 @@ mod tests {
             first_plan.servers[0].secrets[0].keychain_name,
             second_plan.servers[0].secrets[0].keychain_name
         );
-    }
-
-    #[test]
-    fn inline_secret_args_are_detected() {
-        let args = ["--api-key".to_string(), "test-key".to_string()];
-        assert!(has_secret_in_args(&args));
-        assert!(has_secret_in_args(&["--token=test-token".to_string()]));
-        assert!(has_secret_in_args(&[
-            "Authorization:Bearer test-token".to_string()
-        ]));
-    }
-
-    #[test]
-    fn args_with_expansion_or_plain_names_are_not_secrets() {
-        let args = [
-            "--header".to_string(),
-            "Authorization:Bearer ${INTRANET_TOKEN}".to_string(),
-            "keycloak-mcp".to_string(),
-            "https://example.test/mcp".to_string(),
-        ];
-        assert!(!has_secret_in_args(&args));
     }
 
     #[test]

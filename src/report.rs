@@ -314,7 +314,7 @@ pub async fn login_state(server: &ResolvedServer) -> LoginState {
     }
     match credentials::stored_login(&server.identity, &server.account).await {
         Ok(StoredLogin::OAuth) => LoginState::OAuth,
-        Ok(StoredLogin::Token) => LoginState::Token,
+        Ok(StoredLogin::Token { .. }) => LoginState::Token,
         Ok(StoredLogin::None) => LoginState::Missing,
         Err(error) => {
             tracing::warn!(%error, server = %server.display_name(), "could not read stored credentials");
