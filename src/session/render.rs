@@ -4,6 +4,7 @@ use super::tools::{ENABLE_TOOL, STATUS_TOOL, TOOL_SEPARATOR};
 use super::{ActiveServer, Resolved};
 use crate::config::{DEFAULT_ACCOUNT, ResolvedConfig, ResolvedServer};
 use crate::identity::{self, VerifiedAccounts};
+use crate::protocol::{SessionStatus, StatusServer, StatusState};
 use crate::registry;
 use crate::report::{Audience, ServerState};
 
@@ -119,12 +120,29 @@ fn problem_summary(config: &ResolvedConfig) -> String {
         .join("; ")
 }
 
-pub(super) fn status_text(
+/// The `plugbay__status` report: text for the agent, and the same servers and problems typed
+/// for `plugbay tools` and `call`.
+pub(super) struct StatusReport {
+    pub text: String,
+    pub status: SessionStatus,
+}
+
+impl StatusReport {
+    pub fn not_resolved_yet() -> Self {
+        Self {
+            text: "plugbay has not resolved any config yet".to_string(),
+            status: SessionStatus::default(),
+        }
+    }
+}
+
+pub(super) fn status_report(
     resolved: &Resolved,
     servers: &[ActiveServer],
     verified: &VerifiedAccounts,
-) -> String {
+) -> StatusReport {
     let mut lines = Vec::new();
+    let mut status = SessionStatus::default();
     match &resolved.location.config_dir {
         Some(dir) => lines.push(format!("project: {}", dir.display())),
         None => lines.push("project: none (global config only)".to_string()),
@@ -139,7 +157,11 @@ pub(super) fn status_text(
         Ok(config) => config,
         Err(error) => {
             lines.push(format!("config error: {error}"));
-            return lines.join("\n");
+            status.problems.push(error.to_string());
+            return StatusReport {
+                text: lines.join("\n"),
+                status,
+            };
         }
     };
     lines.push("config files:".to_string());
@@ -156,28 +178,47 @@ pub(super) fn status_text(
     }
     for active in servers {
         let server = &active.server;
-        let status = ServerState::from(&active.status).status(
-            server,
-            verified_login(server, verified),
-            Audience::Agent,
-        );
-        lines.push(format!(
-            "  {} ({}) — {status}",
+        let state = ServerState::from(&active.status);
+        let status_line = format!(
+            "{} ({}) — {}",
             server.display_name(),
-            server.transport.target()
-        ));
+            server.transport.target(),
+            state.status(server, verified_login(server, verified), Audience::Agent)
+        );
+        lines.push(format!("  {status_line}"));
+        status.servers.push(StatusServer {
+            name: server.name.clone(),
+            account: Some(server.account.clone()),
+            tool_prefix: server.tool_prefix.clone(),
+            label: server.display_name(),
+            state: StatusState::from(&state),
+            status_line,
+        });
     }
     for disabled in &config.disabled {
-        lines.push(format!(
-            "  {} — disabled by {}",
+        let status_line = format!(
+            "{} — disabled by {}",
             disabled.name,
             disabled.disabled_by.display()
-        ));
+        );
+        lines.push(format!("  {status_line}"));
+        status.servers.push(StatusServer {
+            name: disabled.name.clone(),
+            account: None,
+            tool_prefix: disabled.name.clone(),
+            label: disabled.name.clone(),
+            state: StatusState::Disabled,
+            status_line,
+        });
     }
     for problem in &config.problems {
         lines.push(format!("problem: {}", problem.message));
+        status.problems.push(problem.message.clone());
     }
-    lines.join("\n")
+    StatusReport {
+        text: lines.join("\n"),
+        status,
+    }
 }
 
 #[cfg(test)]

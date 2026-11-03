@@ -138,6 +138,15 @@ pub fn one_safe_line(text: &str, max_chars: usize) -> String {
     truncate(&one_line, max_chars)
 }
 
+/// Text of any length for a terminal, keeping its lines and tabs: no other control characters
+/// (so no escape sequences or carriage returns) and no direction-changing ones.
+pub fn safe_for_terminal(text: &str) -> String {
+    text.chars()
+        .filter(|character| matches!(character, '\n' | '\t') || !character.is_control())
+        .filter(|character| !is_invisible_formatting(*character))
+        .collect()
+}
+
 fn is_invisible_formatting(character: char) -> bool {
     matches!(
         character,
@@ -256,5 +265,12 @@ mod tests {
         let shown = one_safe_line(&"a".repeat(200), MAX_SHOWN_CHARS);
         assert_eq!(shown.chars().count(), MAX_SHOWN_CHARS);
         assert!(shown.ends_with('…'));
+    }
+
+    #[test]
+    fn terminal_text_keeps_lines_and_tabs_but_not_escapes() {
+        let shown =
+            safe_for_terminal("red \u{1b}[31mtext\u{1b}]0;title\u{7}\r\nnext\tcol\u{202E}\u{9b}2J");
+        assert_eq!(shown, "red [31mtext]0;title\nnext\tcol2J");
     }
 }

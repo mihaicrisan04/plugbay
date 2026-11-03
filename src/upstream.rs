@@ -349,16 +349,18 @@ impl UpstreamPool {
             .filter(|(key, _)| matches(key))
             .map(|(_, entry)| entry.slot.clone())
             .collect();
-        let mut closed = 0;
-        for slot in slots {
-            if let Some(upstream) = slot.lock().await.take() {
-                upstream.retired.store(true, Ordering::SeqCst);
-                upstream.stop_process();
-                close(upstream).await;
-                closed += 1;
-            }
-        }
-        closed
+        let retire = |slot: Arc<tokio::sync::Mutex<Option<Arc<Upstream>>>>| async move {
+            let Some(upstream) = slot.lock().await.take() else {
+                return false;
+            };
+            upstream.retired.store(true, Ordering::SeqCst);
+            upstream.stop_process();
+            close(upstream).await;
+            true
+        };
+        // Together, so a connection still being made (its slot locked) doesn't hold up the rest.
+        let retired = futures::future::join_all(slots.into_iter().map(retire)).await;
+        retired.into_iter().filter(|closed| *closed).count()
     }
 
     /// Closes every connection; used when the daemon exits so no upstream process outlives it.

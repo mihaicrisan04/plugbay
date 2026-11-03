@@ -558,7 +558,7 @@ impl Session {
     async fn call(&self, request: CallToolRequestParams) -> CallToolResult {
         self.ensure_ready().await;
         if request.name == STATUS_TOOL {
-            return text_result(self.status_report().await);
+            return self.status_report().await;
         }
         self.reconnect_if_an_upstream_died().await;
         match request.name.as_ref() {
@@ -618,14 +618,14 @@ impl Session {
         }
     }
 
-    async fn status_report(&self) -> String {
+    async fn status_report(&self) -> CallToolResult {
         let verified = VerifiedAccounts::load(&self.shared.paths).await;
         let mut report = {
             let state = self.state.lock();
-            let Some(resolved) = &state.resolved else {
-                return "plugbay has not resolved any config yet".to_string();
-            };
-            render::status_text(resolved, &state.servers, &verified)
+            match &state.resolved {
+                Some(resolved) => render::status_report(resolved, &state.servers, &verified),
+                None => render::StatusReport::not_resolved_yet(),
+            }
         };
         let pins = self.pins.lock();
         if !pins.is_empty() {
@@ -639,12 +639,17 @@ impl Session {
                     SessionPin::Off => format!("{name} off"),
                 })
                 .collect();
-            report.push_str(&format!(
+            report.text.push_str(&format!(
                 "\nthis session only (not saved): {}",
                 described.join(", ")
             ));
         }
-        report
+        let mut result = text_result(report.text);
+        match report.status.into_meta() {
+            Ok(meta) => result.meta = Some(meta),
+            Err(error) => tracing::warn!(%error, "could not attach the typed status"),
+        }
+        result
     }
 
     /// Learns the project from MCP roots when the shim's cwd was `/` or `$HOME`.

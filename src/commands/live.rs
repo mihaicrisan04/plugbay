@@ -1,7 +1,7 @@
 //! `plugbay tools`, `call` and `restart`: what an agent started here sees and does, from the
 //! command line. `tools` and `call` open a real session on the daemon, the way the shim does.
 
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -15,11 +15,11 @@ use rmcp::{RoleClient, ServiceExt};
 use serde_json::Value;
 
 use crate::commands::access::find_server;
-use crate::commands::server_account;
-use crate::identity::one_safe_line;
+use crate::commands::credentials_changed;
+use crate::identity::{one_safe_line, safe_for_terminal};
 use crate::paths::Paths;
 use crate::project::ProjectHints;
-use crate::protocol::{self, ControlRequest};
+use crate::protocol::{self, ControlRequest, SessionStatus, StatusServer, StatusState};
 use crate::session::{self, STATUS_TOOL, TOOL_SEPARATOR};
 use crate::shim;
 
@@ -28,14 +28,19 @@ const MAX_DESCRIPTION_CHARS: usize = 120;
 
 pub async fn tools(paths: &Paths, cd: Option<PathBuf>, server: Option<&str>) -> anyhow::Result<()> {
     let session = AgentSession::open(paths, cd).await?;
-    let status = session.wait_while_connecting(server).await?;
-    let mut tools = session.list_tools().await?;
+    let listed = session.status_and_tools(server).await;
     session.close().await;
+    let (mut status, mut tools) = listed?;
 
     if let Some(server) = server {
-        let prefix = format!("{server}{TOOL_SEPARATOR}");
-        tools.retain(|tool| tool.name.starts_with(&prefix));
-        if tools.is_empty() && !status.servers.iter().any(|line| line.name() == server) {
+        status.servers.retain(|line| is_named(line, server));
+        // The server's own prefixes, every account's, and `server` itself for `plugbay__*`.
+        let mut prefixes = vec![server];
+        prefixes.extend(status.servers.iter().map(|line| line.tool_prefix.as_str()));
+        tools.retain(|tool| {
+            tool_prefix(&tool.name).is_some_and(|prefix| prefixes.contains(&prefix))
+        });
+        if tools.is_empty() && status.servers.is_empty() {
             bail!(
                 "no server `{server}` in this session; run `plugbay tools` to see every server, or `plugbay use {server}` to pin it here"
             );
@@ -43,24 +48,23 @@ pub async fn tools(paths: &Paths, cd: Option<PathBuf>, server: Option<&str>) -> 
     }
     print!("{}", tool_table(&tools));
 
-    let unavailable: Vec<&ServerLine> = status
+    let (disabled, unavailable): (Vec<&StatusServer>, Vec<&StatusServer>) = status
         .servers
         .iter()
-        .filter(|line| !line.is_connected())
-        .filter(|line| server.is_none_or(|server| line.name() == server))
-        .collect();
-    if !unavailable.is_empty() {
-        println!("\nnot available:");
-        for line in unavailable {
-            println!("  {}", line.text);
-        }
-    }
-    if !status.problems.is_empty() {
-        println!("\nconfig problems (`plugbay doctor` explains them):");
-        for problem in &status.problems {
-            println!("  {problem}");
-        }
-    }
+        .filter(|line| !line.state.is_usable())
+        .partition(|line| line.state == StatusState::Disabled);
+    print_section(
+        "not available:",
+        unavailable.iter().map(|line| line.status_line.as_str()),
+    );
+    print_section(
+        "disabled by config:",
+        disabled.iter().map(|line| line.status_line.as_str()),
+    );
+    print_section(
+        "config problems (`plugbay doctor` explains them):",
+        status.problems.iter().map(String::as_str),
+    );
     Ok(())
 }
 
@@ -70,7 +74,7 @@ pub async fn call(
     tool: &str,
     arguments: Option<&str>,
 ) -> anyhow::Result<()> {
-    let Some((server, _)) = tool.split_once(TOOL_SEPARATOR) else {
+    let Some(prefix) = tool_prefix(tool) else {
         bail!(
             "tools are named <server>__<tool>, e.g. `echo__whoami`; run `plugbay tools` to list them"
         );
@@ -78,17 +82,16 @@ pub async fn call(
     let arguments = parse_arguments(arguments)?;
 
     let session = AgentSession::open(paths, cd).await?;
-    session.wait_while_connecting(Some(server)).await?;
-    let result = session.call(tool, arguments).await;
+    let result = session.call_once_connected(prefix, tool, arguments).await;
     session.close().await;
     let result = result?;
 
     let output = render_result(&result);
     if result.is_error == Some(true) {
-        eprint!("{output}");
+        eprint!("{}", for_stream(output, std::io::stderr().is_terminal()));
         bail!("{tool} returned an error");
     }
-    print!("{output}");
+    print!("{}", for_stream(output, std::io::stdout().is_terminal()));
     Ok(())
 }
 
@@ -97,11 +100,11 @@ pub async fn restart(
     cd: Option<PathBuf>,
     target: Option<&str>,
 ) -> anyhow::Result<()> {
-    let only = match target {
-        Some(target) => Some(server_account(&find_server(paths, cd, target).await?)),
-        None => None,
+    let request = match target {
+        Some(target) => credentials_changed(&find_server(paths, cd, target).await?),
+        None => ControlRequest::ReconnectAll,
     };
-    match protocol::send_control(paths, ControlRequest::Reconnect { only }).await {
+    match protocol::send_control(paths, request).await {
         Ok(response) => {
             match response.sessions {
                 0 => println!("{}", response.message),
@@ -112,7 +115,7 @@ pub async fn restart(
             }
             Ok(())
         }
-        Err(error) if daemon_is_not_running(&error) => {
+        Err(error) if protocol::daemon_is_not_running(&error) => {
             println!("the daemon is not running, so there is nothing to restart");
             Ok(())
         }
@@ -122,15 +125,38 @@ pub async fn restart(
     }
 }
 
-fn daemon_is_not_running(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
-            matches!(
-                io.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-            )
-        })
-    })
+/// `tools <server>` covers every account of `server`, or one account by its tool prefix.
+fn is_named(line: &StatusServer, wanted: &str) -> bool {
+    line.name == wanted || line.tool_prefix == wanted
+}
+
+fn tool_prefix(tool_name: &str) -> Option<&str> {
+    tool_name
+        .split_once(TOOL_SEPARATOR)
+        .map(|(prefix, _)| prefix)
+}
+
+/// A blank line, `heading`, then the lines indented; nothing when there are none. Status lines
+/// can quote an upstream's error, so they are made safe for the terminal too.
+fn print_section<'a>(heading: &str, lines: impl IntoIterator<Item = &'a str>) {
+    let mut lines = lines.into_iter().peekable();
+    if lines.peek().is_none() {
+        return;
+    }
+    println!("\n{heading}");
+    for line in lines {
+        println!("  {}", one_safe_line(line, usize::MAX));
+    }
+}
+
+/// A tool's output as it sent it when redirected; on a terminal, without the control sequences
+/// that could rewrite the screen or the window title.
+fn for_stream(output: String, is_terminal: bool) -> String {
+    if is_terminal {
+        safe_for_terminal(&output)
+    } else {
+        output
+    }
 }
 
 /// Arguments for `call`: a JSON object given inline, `-` for stdin, or nothing for `{}`.
@@ -185,20 +211,50 @@ impl AgentSession {
         Ok(Self { service })
     }
 
-    /// `initialize` already waited the ready deadline for upstreams; servers still connecting
-    /// then get one more, so the output is complete. Only `server` is waited for when given.
-    async fn wait_while_connecting(&self, server: Option<&str>) -> anyhow::Result<StatusReport> {
+    async fn status_and_tools(
+        &self,
+        server: Option<&str>,
+    ) -> anyhow::Result<(SessionStatus, Vec<Tool>)> {
+        let status = self
+            .wait_while_connecting(|line| server.is_none_or(|server| is_named(line, server)))
+            .await?;
+        Ok((status, self.list_tools().await?))
+    }
+
+    async fn call_once_connected(
+        &self,
+        prefix: &str,
+        tool: &str,
+        arguments: JsonObject,
+    ) -> anyhow::Result<CallToolResult> {
+        self.wait_while_connecting(|line| line.tool_prefix == prefix)
+            .await?;
+        self.call(tool, arguments).await
+    }
+
+    /// `initialize` already waited the ready deadline for upstreams; the servers `wanted` picks
+    /// that are still connecting then get one more, so the output is complete.
+    async fn wait_while_connecting(
+        &self,
+        wanted: impl Fn(&StatusServer) -> bool,
+    ) -> anyhow::Result<SessionStatus> {
         let deadline = tokio::time::Instant::now() + session::ready_deadline();
         loop {
-            let status = StatusReport::parse(&self.call_text(STATUS_TOOL).await?);
-            let waiting = status.servers.iter().any(|line| {
-                line.is_connecting() && server.is_none_or(|server| line.name() == server)
-            });
+            let status = self.status().await?;
+            let waiting = status
+                .servers
+                .iter()
+                .any(|line| line.state == StatusState::Connecting && wanted(line));
             if !waiting || tokio::time::Instant::now() >= deadline {
                 return Ok(status);
             }
             tokio::time::sleep(STATUS_POLL_INTERVAL).await;
         }
+    }
+
+    async fn status(&self) -> anyhow::Result<SessionStatus> {
+        let result = self.call(STATUS_TOOL, JsonObject::new()).await?;
+        SessionStatus::from_meta(result.meta.as_ref())
     }
 
     async fn list_tools(&self) -> anyhow::Result<Vec<Tool>> {
@@ -216,83 +272,10 @@ impl AgentSession {
             .with_context(|| format!("calling {tool}"))
     }
 
-    async fn call_text(&self, tool: &str) -> anyhow::Result<String> {
-        let result = self.call(tool, JsonObject::new()).await?;
-        Ok(text_blocks(&result).join("\n"))
-    }
-
     async fn close(self) {
         if let Err(error) = self.service.cancel().await {
             tracing::debug!(%error, "closing the session");
         }
-    }
-}
-
-/// One server line of `plugbay__status`, e.g. `echo:client-a (echo-server) — connected`.
-#[derive(Debug, PartialEq)]
-struct ServerLine {
-    label: String,
-    state: String,
-    text: String,
-}
-
-impl ServerLine {
-    fn parse(entry: &str) -> Option<Self> {
-        let (server, state) = entry.split_once(" — ")?;
-        let label = server.split_whitespace().next().unwrap_or(server);
-        Some(Self {
-            label: label.to_string(),
-            state: state.to_string(),
-            text: entry.to_string(),
-        })
-    }
-
-    /// The server name, without the account: what tool names start with.
-    fn name(&self) -> &str {
-        self.label.split(':').next().unwrap_or(&self.label)
-    }
-
-    fn is_connected(&self) -> bool {
-        self.state.starts_with("connected")
-    }
-
-    fn is_connecting(&self) -> bool {
-        self.state.starts_with("connecting")
-    }
-}
-
-/// What `plugbay__status` says, as far as these commands need it: the lines under `servers:`
-/// (which already say why each one is off) and the config problems.
-#[derive(Debug, Default, PartialEq)]
-struct StatusReport {
-    servers: Vec<ServerLine>,
-    problems: Vec<String>,
-}
-
-impl StatusReport {
-    fn parse(status: &str) -> Self {
-        let mut report = Self::default();
-        let mut in_servers = false;
-        for line in status.lines() {
-            if line == "servers:" {
-                in_servers = true;
-                continue;
-            }
-            if let Some(problem) = line
-                .strip_prefix("problem: ")
-                .or_else(|| line.strip_prefix("config error: "))
-            {
-                report.problems.push(problem.to_string());
-            }
-            let Some(entry) = line.strip_prefix("  ").filter(|_| in_servers) else {
-                in_servers = false;
-                continue;
-            };
-            if let Some(server) = ServerLine::parse(entry) {
-                report.servers.push(server);
-            }
-        }
-        report
     }
 }
 
@@ -304,7 +287,7 @@ fn tool_table(tools: &[Tool]) -> String {
             let description = tool.description.as_deref().unwrap_or_default();
             let first_line = description.lines().next().unwrap_or_default();
             (
-                one_safe_line(&tool.name, MAX_DESCRIPTION_CHARS),
+                one_safe_line(&tool.name, usize::MAX),
                 one_safe_line(first_line, MAX_DESCRIPTION_CHARS),
             )
         })
@@ -319,25 +302,17 @@ fn tool_table(tools: &[Tool]) -> String {
     table
 }
 
-/// The tool's own output as it sent it: text blocks verbatim, other blocks described, and the
-/// structured content as pretty JSON (in place of a text block that carries the same JSON).
+/// The tool's own output as it sent it: text blocks verbatim, other blocks described, then the
+/// structured content once, as pretty JSON (text blocks that only repeat it are left out).
 fn render_result(result: &CallToolResult) -> String {
     let structured = result.structured_content.as_ref();
-    let mut structured_shown = false;
-    let mut parts = Vec::new();
-    for block in &result.content {
-        if let (Some(structured), ContentBlock::Text(text)) = (structured, block)
-            && serde_json::from_str::<Value>(&text.text).ok().as_ref() == Some(structured)
-        {
-            parts.push(pretty_json(structured));
-            structured_shown = true;
-        } else {
-            parts.push(describe_block(block));
-        }
-    }
-    if let Some(structured) = structured
-        && !structured_shown
-    {
+    let mut parts: Vec<String> = result
+        .content
+        .iter()
+        .filter(|block| !repeats_structured(block, structured))
+        .map(describe_block)
+        .collect();
+    if let Some(structured) = structured {
         parts.push(pretty_json(structured));
     }
     let mut output = parts.join("\n");
@@ -345,6 +320,13 @@ fn render_result(result: &CallToolResult) -> String {
         output.push('\n');
     }
     output
+}
+
+fn repeats_structured(block: &ContentBlock, structured: Option<&Value>) -> bool {
+    let (Some(structured), ContentBlock::Text(text)) = (structured, block) else {
+        return false;
+    };
+    serde_json::from_str::<Value>(&text.text).is_ok_and(|value| &value == structured)
 }
 
 /// Content kinds newer than this plugbay, shown as the JSON they came in.
@@ -387,63 +369,11 @@ fn describe_block(block: &ContentBlock) -> String {
     }
 }
 
-fn text_blocks(result: &CallToolResult) -> Vec<String> {
-    result
-        .content
-        .iter()
-        .filter_map(|block| block.as_text())
-        .map(|text| text.text.clone())
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use super::*;
-
-    const STATUS: &str = "project: /work/app
-config files:
-  /work/app/plugbay.toml
-servers:
-  echo:client-a (/bin/echo-server) — connected
-  linear:initech (https://mcp.linear.app/mcp) — needs login: call linear__login or run `plugbay login linear:initech` (add `--token` for an API token)
-  paper (paper-mcp) — connecting: its tools appear once it is up
-  sentry — disabled by /work/plugbay.toml
-problem: something odd";
-
-    #[test]
-    fn status_server_lines_carry_name_and_state() {
-        let lines = StatusReport::parse(STATUS).servers;
-        let summary: Vec<(&str, bool, bool)> = lines
-            .iter()
-            .map(|line| (line.name(), line.is_connected(), line.is_connecting()))
-            .collect();
-        assert_eq!(
-            summary,
-            [
-                ("echo", true, false),
-                ("linear", false, false),
-                ("paper", false, true),
-                ("sentry", false, false),
-            ]
-        );
-        assert!(lines[1].text.starts_with("linear:initech (https://"));
-    }
-
-    #[test]
-    fn config_file_lines_are_not_servers() {
-        let status = "config files:\n  /odd — name/plugbay.toml\nservers:\n  (none)";
-        assert_eq!(StatusReport::parse(status), StatusReport::default());
-    }
-
-    #[test]
-    fn status_problems_are_collected() {
-        let report = StatusReport::parse(STATUS);
-        assert_eq!(report.problems, ["something odd"]);
-        let broken = StatusReport::parse("project: /work\nconfig error: bad toml");
-        assert_eq!(broken.problems, ["bad toml"]);
-    }
 
     #[test]
     fn arguments_must_be_a_json_object() {
@@ -482,15 +412,34 @@ problem: something odd";
     }
 
     #[test]
-    fn structured_content_is_shown_once() {
+    fn long_tool_names_are_not_cut() {
+        let name = format!("echo__{}", "x".repeat(MAX_DESCRIPTION_CHARS));
+        assert_eq!(
+            tool_table(&[tool(&name, "Long")]),
+            format!("{name}  Long\n")
+        );
+    }
+
+    #[test]
+    fn structured_content_is_shown_once_after_the_other_blocks() {
         let structured = CallToolResult::structured(serde_json::json!({ "count": 2 }));
         assert_eq!(render_result(&structured), "{\n  \"count\": 2\n}\n");
 
-        let mut separate = CallToolResult::success(vec![ContentBlock::text("two items")]);
+        let mut separate = CallToolResult::success(vec![
+            ContentBlock::text(r#"{"count": 2}"#),
+            ContentBlock::text("two items"),
+        ]);
         separate.structured_content = Some(serde_json::json!({ "count": 2 }));
         assert_eq!(
             render_result(&separate),
             "two items\n{\n  \"count\": 2\n}\n"
         );
+    }
+
+    #[test]
+    fn tool_output_loses_escape_sequences_only_on_a_terminal() {
+        let output = "\u{1b}]0;owned\u{7}\u{1b}[2Jline\n\tnext\n".to_string();
+        assert_eq!(for_stream(output.clone(), false), output);
+        assert_eq!(for_stream(output, true), "]0;owned[2Jline\n\tnext\n");
     }
 }

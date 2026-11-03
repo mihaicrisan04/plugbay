@@ -49,24 +49,19 @@ fn show_log(path: &Path, follow: bool, lines: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Prints what is appended to the log until interrupted. A log that appears, is replaced
-/// (rotated) or truncated is read again from its start; the old file is finished first.
+/// Prints what is appended to the log until interrupted, reading it again from the start once
+/// it appears, or when someone deletes, replaces or empties it (plugbay itself only appends).
 fn follow_log(path: &Path, mut log: Option<OpenLog>, out: &mut impl Write) -> anyhow::Result<()> {
     loop {
         if let Some(log) = &mut log {
             io::copy(&mut log.file, out)?;
             out.flush()?;
         }
-        log = match (log, std::fs::metadata(path)) {
-            (Some(current), Ok(metadata)) if current.is_same_file(&metadata) => {
-                Some(current.rewound_if_truncated(&metadata)?)
-            }
-            (_, Ok(_)) => {
-                Some(OpenLog::open(path).with_context(|| format!("opening {}", path.display()))?)
-            }
-            // Moved away and not recreated yet: keep reading the old file meanwhile.
-            (current, Err(_)) => current,
-        };
+        if let Ok(metadata) = std::fs::metadata(path)
+            && log.as_ref().is_none_or(|log| log.is_stale(&metadata))
+        {
+            log = Some(OpenLog::open(path).with_context(|| format!("opening {}", path.display()))?);
+        }
         std::thread::sleep(FOLLOW_INTERVAL);
     }
 }
@@ -88,15 +83,11 @@ impl OpenLog {
         })
     }
 
-    fn is_same_file(&self, metadata: &std::fs::Metadata) -> bool {
-        self.device == metadata.dev() && self.inode == metadata.ino()
-    }
-
-    fn rewound_if_truncated(mut self, metadata: &std::fs::Metadata) -> io::Result<Self> {
-        if metadata.len() < self.file.stream_position()? {
-            self.file.seek(SeekFrom::Start(0))?;
-        }
-        Ok(self)
+    /// The path's file changed or got shorter than what was read of it.
+    fn is_stale(&self, metadata: &std::fs::Metadata) -> bool {
+        let same_file = self.device == metadata.dev() && self.inode == metadata.ino();
+        let read = (&self.file).stream_position().unwrap_or(0);
+        !same_file || metadata.len() < read
     }
 }
 
@@ -174,34 +165,47 @@ mod tests {
         assert_eq!(tail(&text, 3), text);
     }
 
-    #[test]
-    fn following_picks_up_a_replaced_log() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let path = temp.path().join("daemon.log");
-        std::fs::write(&path, "old\n").unwrap();
-        let mut log = OpenLog::open(&path).unwrap();
-        log.file.seek(SeekFrom::End(0)).unwrap();
-
-        std::fs::rename(&path, temp.path().join("daemon.log.1")).unwrap();
-        std::fs::write(&path, "new\n").unwrap();
-
-        let metadata = std::fs::metadata(&path).unwrap();
-        assert!(!log.is_same_file(&metadata));
+    fn read_to_end(path: &Path) -> OpenLog {
+        let mut log = OpenLog::open(path).unwrap();
+        io::copy(&mut log.file, &mut io::sink()).unwrap();
+        log
     }
 
     #[test]
-    fn following_rewinds_a_truncated_log() {
+    fn a_replaced_log_is_stale() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("daemon.log");
+        std::fs::write(&path, "old\n").unwrap();
+        let log = read_to_end(&path);
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, "a much longer new log\n").unwrap();
+        assert!(log.is_stale(&std::fs::metadata(&path).unwrap()));
+    }
+
+    #[test]
+    fn a_shortened_log_is_stale() {
         let temp = tempfile::TempDir::new().unwrap();
         let path = temp.path().join("daemon.log");
         std::fs::write(&path, "a long first line\n").unwrap();
-        let mut log = OpenLog::open(&path).unwrap();
-        log.file.seek(SeekFrom::End(0)).unwrap();
+        let log = read_to_end(&path);
 
         std::fs::write(&path, "short\n").unwrap();
-        let metadata = std::fs::metadata(&path).unwrap();
-        let mut log = log.rewound_if_truncated(&metadata).unwrap();
-        let mut text = String::new();
-        log.file.read_to_string(&mut text).unwrap();
-        assert_eq!(text, "short\n");
+        assert!(log.is_stale(&std::fs::metadata(&path).unwrap()));
+    }
+
+    #[test]
+    fn a_growing_log_is_not_stale() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("daemon.log");
+        std::fs::write(&path, "first\n").unwrap();
+        let log = read_to_end(&path);
+
+        let mut appending = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        appending.write_all(b"second\n").unwrap();
+        assert!(!log.is_stale(&std::fs::metadata(&path).unwrap()));
     }
 }

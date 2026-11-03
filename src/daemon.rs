@@ -20,11 +20,13 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use crate::config::ServerIdentity;
 use crate::paths::Paths;
 use crate::project::ProjectHints;
-use crate::protocol::{self, ControlRequest, ControlResponse, Hello, ServerAccount, write_line};
+use crate::protocol::{self, ControlRequest, ControlResponse, Hello, write_line};
 use crate::session::{Session, Shared};
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_HELLO_BYTES: u64 = 64 * 1024;
+/// How long a reconnect request waits before answering; the client gives up after 5 s.
+const RECONNECT_ANSWER_WAIT: Duration = Duration::from_secs(2);
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 /// How long an upstream stays connected after its last session leaves, so a quick restart reuses it.
 const UPSTREAM_GRACE: Duration = Duration::from_secs(60);
@@ -253,20 +255,14 @@ async fn handle_control(
             shared.reload_all().await;
             "reloaded".to_string()
         }
-        ControlRequest::Reconnect { only } => {
-            crate::vault::forget_cached();
-            let closed = match only {
-                Some(ServerAccount { identity, account }) => {
-                    shared
-                        .pool
-                        .close_account(&ServerIdentity(identity), &account)
-                        .await
-                }
-                None => shared.pool.close_all().await,
+        ControlRequest::CredentialsChanged { identity, account } => {
+            let only = ServerAccount {
+                identity: ServerIdentity(identity),
+                account,
             };
-            shared.reload_all().await;
-            format!("closed {closed} connection(s) and reloaded")
+            reconnect(shared, Some(only)).await
         }
+        ControlRequest::ReconnectAll => reconnect(shared, None).await,
         ControlRequest::Stop => {
             stop.notify_one();
             "stopping".to_string()
@@ -276,6 +272,41 @@ async fn handle_control(
         version: protocol::VERSION.to_string(),
         sessions: activity.active_sessions(),
         message,
+    }
+}
+
+struct ServerAccount {
+    identity: ServerIdentity,
+    account: String,
+}
+
+/// Closes the pooled connections of `only` (or all of them) and reloads every session. Runs as a
+/// task of its own: closing a connection that is still being made waits until it is up, and the
+/// answer must not wait that long.
+async fn reconnect(shared: &Arc<Shared>, only: Option<ServerAccount>) -> String {
+    let task = tokio::spawn({
+        let shared = shared.clone();
+        async move {
+            crate::vault::forget_cached();
+            let closed = match only {
+                Some(ServerAccount { identity, account }) => {
+                    shared.pool.close_account(&identity, &account).await
+                }
+                None => shared.pool.close_all().await,
+            };
+            shared.reload_all().await;
+            tracing::info!(closed, "closed upstream connections and reloaded");
+            closed
+        }
+    });
+    match tokio::time::timeout(RECONNECT_ANSWER_WAIT, task).await {
+        Ok(Ok(closed)) => format!("closed {closed} connection(s) and reloaded"),
+        Ok(Err(error)) => {
+            tracing::error!(%error, "reconnecting failed");
+            "reconnecting failed; `plugbay logs` shows why".to_string()
+        }
+        Err(_) => "reconnecting; servers still connecting are closed and reloaded once they are up"
+            .to_string(),
     }
 }
 

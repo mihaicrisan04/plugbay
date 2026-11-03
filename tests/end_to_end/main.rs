@@ -1,6 +1,8 @@
 //! Drives the real binary the way an agent does: `plugbay connect` over stdio, daemon auto-started,
 //! a fake stdio upstream (`examples/echo_server.rs`) per account.
 
+mod live;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -232,17 +234,28 @@ env = {{ ECHO_ACCOUNT = "client-b" }}
         std::fs::write(path, format!("{top_level_keys}{existing}")).unwrap();
     }
 
-    fn plugbay(&self, args: &[&str], project: &str) -> String {
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_plugbay"))
+    /// The CLI run from `project`, with this sandbox's home and vault.
+    fn command(&self, args: &[&str], project: &str) -> std::process::Command {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_plugbay"));
+        command
             .args(args)
             .current_dir(self.projects.join(project))
             .env("PLUGBAY_HOME", &self.plugbay_home)
             .env(
                 "PLUGBAY_INSECURE_TEST_VAULT",
                 self.plugbay_home.join("vault.json"),
-            )
-            .output()
-            .unwrap();
+            );
+        if let Some(deadline) = self.ready_deadline {
+            command.env(
+                "PLUGBAY_READY_DEADLINE_MS",
+                deadline.as_millis().to_string(),
+            );
+        }
+        command
+    }
+
+    fn plugbay(&self, args: &[&str], project: &str) -> String {
+        let output = self.command(args, project).output().unwrap();
         String::from_utf8_lossy(&output.stdout).into_owned()
     }
 }
@@ -885,14 +898,8 @@ async fn use_and_unuse_write_pins_that_ls_and_accounts_see() {
 
 /// Runs the binary like `Sandbox::plugbay`, keeping stderr and the exit status too.
 fn plugbay_output(sandbox: &Sandbox, args: &[&str], project: &str) -> std::process::Output {
-    std::process::Command::new(env!("CARGO_BIN_EXE_plugbay"))
-        .args(args)
-        .current_dir(sandbox.projects.join(project))
-        .env("PLUGBAY_HOME", &sandbox.plugbay_home)
-        .env(
-            "PLUGBAY_INSECURE_TEST_VAULT",
-            sandbox.plugbay_home.join("vault.json"),
-        )
+    sandbox
+        .command(args, project)
         .env_remove("PLUGBAY_LOG")
         .output()
         .unwrap()
@@ -1633,233 +1640,4 @@ enabled = false
         "${input:tool-api-key}"
     );
     assert_eq!(vscode["inputs"].as_array().unwrap().len(), 2);
-}
-
-#[tokio::test]
-async fn cli_tools_lists_what_an_agent_here_sees() {
-    let sandbox = Sandbox::new();
-    let mut config = local_echo_config("\"--as-local\"");
-    config.push_str("echo = \"client-a\"\n");
-    write_project(&sandbox.projects.join("mixed"), &config);
-
-    let output = plugbay_output(&sandbox, &["tools"], "mixed");
-    let stdout = text(&output.stdout);
-    assert!(output.status.success(), "{stdout}{}", text(&output.stderr));
-    let rows: Vec<&str> = stdout.lines().take_while(|line| !line.is_empty()).collect();
-    assert!(
-        rows.iter()
-            .any(|row| row.starts_with("echo__echo ") && row.ends_with("Echo the `text` argument")),
-        "{stdout}"
-    );
-    assert!(
-        rows.iter().any(|row| row.starts_with("plugbay__status ")),
-        "{stdout}"
-    );
-    assert!(!stdout.contains("local__"), "{stdout}");
-    assert!(stdout.contains("\nnot available:\n  local"), "{stdout}");
-    assert!(stdout.contains("plugbay trust"), "{stdout}");
-
-    let only_echo = text(&plugbay_output(&sandbox, &["tools", "echo"], "mixed").stdout);
-    assert!(
-        only_echo.lines().all(|line| line.starts_with("echo__")),
-        "{only_echo}"
-    );
-
-    let unknown = plugbay_output(&sandbox, &["tools", "nope"], "mixed");
-    assert!(!unknown.status.success());
-    assert!(
-        text(&unknown.stderr).contains("plugbay use nope"),
-        "{}",
-        text(&unknown.stderr)
-    );
-}
-
-#[tokio::test]
-async fn cli_call_prints_tool_output_and_fails_on_tool_errors() {
-    let sandbox = Sandbox::new();
-
-    let invalid = plugbay_output(&sandbox, &["call", "echo__echo", "{text"], "client-b");
-    assert!(!invalid.status.success());
-    assert!(
-        text(&invalid.stderr).contains("not valid JSON"),
-        "{}",
-        text(&invalid.stderr)
-    );
-    assert!(
-        !sandbox.plugbay_home.join("state/daemon.sock").exists(),
-        "invalid arguments must not start the daemon"
-    );
-
-    let echoed = plugbay_output(
-        &sandbox,
-        &["call", "echo__echo", r#"{"text": "hi"}"#],
-        "client-b",
-    );
-    assert!(echoed.status.success(), "{}", text(&echoed.stderr));
-    assert_eq!(text(&echoed.stdout), "hi\n");
-
-    let failed = plugbay_output(
-        &sandbox,
-        &[
-            "call",
-            "echo__echo",
-            r#"{"text": "it broke", "fail": true}"#,
-        ],
-        "client-b",
-    );
-    assert!(!failed.status.success());
-    assert!(
-        text(&failed.stderr).contains("it broke"),
-        "{}",
-        text(&failed.stderr)
-    );
-
-    let mut from_stdin = std::process::Command::new(env!("CARGO_BIN_EXE_plugbay"))
-        .args(["call", "echo__echo", "-"])
-        .current_dir(sandbox.projects.join("client-b"))
-        .env("PLUGBAY_HOME", &sandbox.plugbay_home)
-        .env(
-            "PLUGBAY_INSECURE_TEST_VAULT",
-            sandbox.plugbay_home.join("vault.json"),
-        )
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    {
-        use std::io::Write;
-        let mut stdin = from_stdin.stdin.take().unwrap();
-        stdin.write_all(br#"{"text": "piped"}"#).unwrap();
-    }
-    let piped = from_stdin.wait_with_output().unwrap();
-    assert_eq!(text(&piped.stdout), "piped\n");
-}
-
-#[tokio::test]
-async fn restart_reconnects_upstreams_while_agents_stay_connected() {
-    let sandbox = Sandbox::new();
-    let nothing = sandbox.plugbay(&["restart"], "client-b");
-    assert!(nothing.contains("nothing to restart"), "{nothing}");
-
-    let client = sandbox.connect("client-b").await;
-    let before = call_text(&client, "echo__whoami").await;
-    let old_pid = before.rsplit("pid=").next().unwrap().trim().to_string();
-
-    let restarted = sandbox.plugbay(&["restart", "echo"], "client-b");
-    assert!(
-        restarted.starts_with("closed 1 connection(s)"),
-        "{restarted}"
-    );
-    let after = call_text(&client, "echo__whoami").await;
-    assert!(after.starts_with("account=client-b "), "{after}");
-    assert_ne!(after, before, "the upstream was not reconnected");
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while process_is_alive(&old_pid) {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "old upstream {old_pid} kept running"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    let everything = sandbox.plugbay(&["restart"], "client-b");
-    assert!(
-        everything.starts_with("closed 1 connection(s)"),
-        "{everything}"
-    );
-    let again = call_text(&client, "echo__whoami").await;
-    assert_ne!(again, after);
-    client.cancel().await.unwrap();
-}
-
-#[tokio::test]
-async fn logs_shows_the_end_of_the_daemon_log() {
-    let sandbox = Sandbox::new();
-    let missing = plugbay_output(&sandbox, &["logs"], "client-b");
-    assert!(!missing.status.success());
-    assert!(
-        text(&missing.stderr).contains("state/daemon.log"),
-        "{}",
-        text(&missing.stderr)
-    );
-
-    let log_path = sandbox.plugbay_home.join("state/daemon.log");
-    std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
-    let lines: String = (1..=100).map(|line| format!("line {line}\n")).collect();
-    std::fs::write(&log_path, lines).unwrap();
-
-    let default = text(&plugbay_output(&sandbox, &["logs"], "client-b").stdout);
-    assert_eq!(default.lines().count(), 50);
-    let last_two = text(&plugbay_output(&sandbox, &["logs", "-n", "2"], "client-b").stdout);
-    assert_eq!(last_two, "line 99\nline 100\n");
-
-    let mut follower = tokio::process::Command::new(env!("CARGO_BIN_EXE_plugbay"))
-        .args(["logs", "-f", "-n", "1"])
-        .env("PLUGBAY_HOME", &sandbox.plugbay_home)
-        .stdout(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
-    let mut stdout = tokio::io::BufReader::new(follower.stdout.take().unwrap());
-    let mut first = String::new();
-    tokio::io::AsyncBufReadExt::read_line(&mut stdout, &mut first)
-        .await
-        .unwrap();
-    assert_eq!(first, "line 100\n");
-
-    let mut log = std::fs::OpenOptions::new()
-        .append(true)
-        .open(&log_path)
-        .unwrap();
-    std::io::Write::write_all(&mut log, b"line 101\n").unwrap();
-    let mut next = String::new();
-    tokio::time::timeout(
-        Duration::from_secs(10),
-        tokio::io::AsyncBufReadExt::read_line(&mut stdout, &mut next),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(next, "line 101\n");
-}
-
-#[tokio::test]
-async fn cli_tools_waits_one_more_ready_deadline_for_servers_still_connecting() {
-    let sandbox = Sandbox::new();
-    let echo = echo_server_binary();
-    sandbox.append_to_global_config(&format!(
-        "\n[servers.late]\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"sleep 1.5; exec {echo}\"]\n\
-         \n[servers.hangs]\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30; exec {echo}\"]\n",
-        echo = echo.display()
-    ));
-
-    let started = std::time::Instant::now();
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_plugbay"))
-        .arg("tools")
-        .current_dir(sandbox.projects.join("client-b"))
-        .env("PLUGBAY_HOME", &sandbox.plugbay_home)
-        .env(
-            "PLUGBAY_INSECURE_TEST_VAULT",
-            sandbox.plugbay_home.join("vault.json"),
-        )
-        .env("PLUGBAY_READY_DEADLINE_MS", "1000")
-        .output()
-        .unwrap();
-    let elapsed = started.elapsed();
-    let stdout = text(&output.stdout);
-
-    assert!(
-        stdout.contains("late__whoami"),
-        "{stdout}\n{}",
-        sandbox.daemon_log()
-    );
-    assert!(stdout.contains("echo__whoami"), "{stdout}");
-    let hangs = stdout
-        .lines()
-        .find(|line| line.starts_with("  hangs:default (/bin/sh"))
-        .unwrap_or_default();
-    assert!(hangs.contains(" — connecting"), "{stdout}");
-    // Two 1 s deadlines plus startup; far from `hangs`' 30 s or the default 8 s deadline.
-    assert!(elapsed < Duration::from_secs(7), "took {elapsed:?}");
 }
