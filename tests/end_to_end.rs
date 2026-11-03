@@ -566,6 +566,9 @@ async fn trust_prompt_in_the_agent_unlocks_stdio_servers() {
         prompts[0].contains("echo_server"),
         "the prompt names the command: {prompts:?}"
     );
+    let status = call_text(&client, "plugbay__status").await;
+    assert!(status.contains("connected"), "{status}");
+    assert!(!status.contains("needs trust"), "{status}");
 
     client.cancel().await.unwrap();
 }
