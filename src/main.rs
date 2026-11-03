@@ -12,6 +12,7 @@ mod paths;
 mod project;
 mod protocol;
 mod registry;
+mod report;
 mod secrets;
 mod session;
 mod shim;

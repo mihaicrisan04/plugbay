@@ -7,9 +7,10 @@ use super::tools::{
     DisableArguments, EnableArguments, STATUS_TOOL, TOOL_SEPARATOR, error_result, parse_arguments,
     text_result,
 };
-use super::{ActiveServer, ServerStatus, Session};
+use super::{ActiveServer, Session};
 use crate::config::{self, ResolvedConfig, SessionPin};
 use crate::registry;
+use crate::report::ServerState;
 
 impl Session {
     /// Switches a catalog or registry server on for this session only, keeping the pin only if it works.
@@ -162,28 +163,24 @@ impl Session {
         for active in active {
             let display_name = active.server.display_name();
             let prefix = &active.server.tool_prefix;
-            match &active.status {
-                ServerStatus::Connected(_) => lines.push(format!(
+            let state = ServerState::from(&active.status);
+            match state {
+                ServerState::Connected => lines.push(format!(
                     "{display_name} is on for this session; its tools are {prefix}{TOOL_SEPARATOR}*. \
                      Nothing is saved: to keep it for this project the human can run `plugbay use {display_name}`."
                 )),
-                ServerStatus::Connecting { .. } => lines.push(format!(
+                ServerState::Connecting => lines.push(format!(
                     "{display_name} is on for this session but still connecting; its tools \
                      {prefix}{TOOL_SEPARATOR}* appear once it is up."
                 )),
-                ServerStatus::NeedsLogin { .. } => lines.push(format!(
-                    "{display_name} is on but needs a login: call {prefix}{TOOL_SEPARATOR}login, \
-                     or ask the human to run `plugbay login {display_name}`."
-                )),
-                ServerStatus::Untrusted => {
-                    return Err(format!(
-                        "{display_name} runs a command or reads secrets from config that is not trusted yet; ask the human to run `plugbay trust`"
-                    ));
-                }
-                ServerStatus::Failed(error) => {
-                    return Err(format!("{display_name} could not start: {error}"));
-                }
-                ServerStatus::WrongAccount(message) => return Err(message.clone()),
+                // Still on: its login tool is there.
+                ServerState::NeedsLogin => lines.push(state.explain_to_agent(&active.server)),
+                ServerState::Ready
+                | ServerState::NeedsTrust
+                | ServerState::LoginUnknown
+                | ServerState::WrongAccount { .. }
+                | ServerState::AccountUnknown { .. }
+                | ServerState::Failed(_) => return Err(state.explain_to_agent(&active.server)),
             }
         }
         Ok(lines.join("\n"))

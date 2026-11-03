@@ -131,6 +131,14 @@ impl VerifiedAccounts {
             unreadable: false,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_unreadable() -> Self {
+        Self {
+            unreadable: true,
+            ..Self::default()
+        }
+    }
 }
 
 /// Matches the keychain entry name, so a record follows exactly one stored login.
@@ -147,27 +155,33 @@ pub fn expected_account(server: &ResolvedServer) -> Option<&str> {
         .filter(|expected| !expected.is_empty())
 }
 
-/// Why `server` must stay off: its verified login doesn't contain what the project expects, or
-/// the record of who it is can't be read. A login nobody verified yet passes, since there is
-/// nothing to compare.
-pub fn expectation_failure(server: &ResolvedServer, verified: &VerifiedAccounts) -> Option<String> {
-    let expected = expected_account(server)?;
-    let name = server.display_name();
+/// Why a server with `expect` must stay off.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExpectationFailure {
+    /// The verified login doesn't contain what the project expects.
+    Mismatch { shown: String, expected: String },
+    /// The record of who the login is can't be read, so there is nothing to compare.
+    Unreadable { expected: String },
+}
+
+/// Whether `server`'s verified login fails its `expect`. A login nobody verified yet passes,
+/// since there is nothing to compare.
+pub fn expectation_failure(
+    server: &ResolvedServer,
+    verified: &VerifiedAccounts,
+) -> Option<ExpectationFailure> {
+    let expected = expected_account(server)?.to_string();
     if verified.unreadable {
-        return Some(format!(
-            "plugbay can't read its record of who {name} is logged in as, so it can't check for \
-             {expected}; ask the human to delete `accounts.toml` in plugbay's state directory, \
-             it is rebuilt on the next connection"
-        ));
+        return Some(ExpectationFailure::Unreadable { expected });
     }
     let shown = verified.shown(&server.identity, &server.account)?;
     if shown.to_lowercase().contains(&expected.to_lowercase()) {
         return None;
     }
-    Some(format!(
-        "{name} is logged in as {shown}, but this project expects {expected}; \
-         ask the human to run `plugbay logout {name} && plugbay login {name}`"
-    ))
+    Some(ExpectationFailure::Mismatch {
+        shown: shown.to_string(),
+        expected,
+    })
 }
 
 /// Checks who the login behind a newly connected upstream is, unless a recent answer is on record.
@@ -400,10 +414,11 @@ mod tests {
 
         let accounts = VerifiedAccounts::load(&paths).await;
         let expecting = linear_server("personal", Some("mihai"));
-        assert!(
-            expectation_failure(&expecting, &accounts)
-                .unwrap()
-                .contains("can't check for mihai")
+        assert_eq!(
+            expectation_failure(&expecting, &accounts),
+            Some(ExpectationFailure::Unreadable {
+                expected: "mihai".to_string()
+            })
         );
         assert_eq!(
             expectation_failure(&linear_server("personal", None), &accounts),
@@ -455,13 +470,15 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_expectation_says_how_to_fix_it() {
+    fn mismatched_expectation_names_both_accounts() {
         let accounts = VerifiedAccounts::test_with(&[(LINEAR, "personal", "Initech")]);
         let server = linear_server("personal", Some("mihaicrisan"));
         assert_eq!(
-            expectation_failure(&server, &accounts).unwrap(),
-            "linear:personal is logged in as Initech, but this project expects mihaicrisan; \
-             ask the human to run `plugbay logout linear:personal && plugbay login linear:personal`"
+            expectation_failure(&server, &accounts),
+            Some(ExpectationFailure::Mismatch {
+                shown: "Initech".to_string(),
+                expected: "mihaicrisan".to_string()
+            })
         );
     }
 

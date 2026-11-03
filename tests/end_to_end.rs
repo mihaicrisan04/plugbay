@@ -466,7 +466,7 @@ async fn stdio_servers_from_untrusted_project_config_stay_off() {
     let client = sandbox.connect("untrusted").await;
     assert_eq!(tool_names(&client).await, ["plugbay__status"]);
     let status = call_text(&client, "plugbay__status").await;
-    assert!(status.contains("not trusted"), "{status}");
+    assert!(status.contains("needs trust"), "{status}");
     client.cancel().await.unwrap();
 
     sandbox.prepend_to_global_config(&format!(
@@ -495,7 +495,7 @@ async fn stdio_config_written_on_this_machine_still_needs_trust() {
     let client = sandbox.connect("mine").await;
     assert_eq!(tool_names(&client).await, ["plugbay__status"]);
     let status = call_text(&client, "plugbay__status").await;
-    assert!(status.contains("not trusted"), "{status}");
+    assert!(status.contains("needs trust"), "{status}");
     let instructions = client
         .peer_info()
         .and_then(|info| info.instructions.clone())
@@ -566,6 +566,9 @@ async fn trust_prompt_in_the_agent_unlocks_stdio_servers() {
         prompts[0].contains("echo_server"),
         "the prompt names the command: {prompts:?}"
     );
+    let status = call_text(&client, "plugbay__status").await;
+    assert!(status.contains("connected"), "{status}");
+    assert!(!status.contains("needs trust"), "{status}");
 
     client.cancel().await.unwrap();
 }
@@ -1467,7 +1470,7 @@ async fn revoking_trust_stops_a_connection_still_resolving_secrets() {
         "the command ran after its trust was revoked; daemon log:\n{}",
         sandbox.daemon_log()
     );
-    wait_for_status(&sandbox, &client, "not trusted").await;
+    wait_for_status(&sandbox, &client, "needs trust").await;
     client.cancel().await.unwrap();
 }
 
@@ -1522,7 +1525,7 @@ async fn a_failed_enable_does_not_undo_a_newer_one() {
     };
     let (bad, good) = tokio::join!(enable_bad, enable_good);
 
-    assert!(bad.contains("could not start"), "{bad}");
+    assert!(bad.contains("echo:bad — failed: "), "{bad}");
     assert!(good.contains("echo:client-a is on"), "{good}");
     let status = call_text(&client, "plugbay__status").await;
     assert!(status.contains("echo:client-a on"), "{status}");
