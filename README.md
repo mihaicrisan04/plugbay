@@ -206,6 +206,7 @@ The full reference is [docs/config-schema.md](docs/config-schema.md).
 | `remove <name>` | Remove a server from the catalog (`unuse` stops using one here) |
 | `trust` | Trust the executable parts of this directory's config (`--revoke` to undo) |
 | `migrate` | Move servers out of Claude Code and Codex (`--apply`, `--undo`) |
+| `export --format claude\|vscode` | Print this directory's servers as `.mcp.json` or `.vscode/mcp.json` for teammates without plugbay; secrets become placeholders (`--write` merges into the file, `--force` replaces entries of the same name) |
 | `setup` | Register plugbay in Claude Code and Codex (`--client`, `--dry-run`) |
 | `doctor` | Check the installation, daemon, config and client setup |
 | `stop` | Stop the daemon; agents start a fresh one on their next connection |
@@ -244,6 +245,8 @@ v0.2, used daily across its author's client and personal projects. macOS first; 
 **Does it work with T3 Code?** Yes. T3 Code runs Claude Code and Codex, so `plugbay setup` covers it. Its Claude sessions can't show the trust prompt yet; the agent asks you to run `plugbay trust` instead.
 
 **Where do my tokens live?** In the macOS keychain (Secret Service on Linux), keyed by server URL and account. `plugbay accounts` shows which accounts are logged in and `plugbay logout` removes one. Release binaries are not signed with a Developer ID, so macOS may ask once again for keychain access after `brew upgrade`.
+
+**Some teammates don't use plugbay.** `plugbay export --format claude --write` (or `--format vscode`) writes this directory's servers into `.mcp.json` / `.vscode/mcp.json`. Secret refs and stored tokens become placeholders (`${TOOL_API_KEY}`, `${input:tool-api-key}`), never values; the command lists what each teammate must provide. Accounts don't carry over: each teammate signs in to the one they need.
 
 **How do I remove it?** If you used `migrate`, run `plugbay migrate --undo`: it restores your native configs (entries that held a secret are listed for you to copy back) and removes the plugbay entry. Otherwise run `claude mcp remove --scope user plugbay`, delete `[mcp_servers.plugbay]` from `~/.codex/config.toml`, `plugbay logout` your accounts, then `brew uninstall plugbay`.
 

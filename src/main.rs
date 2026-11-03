@@ -126,6 +126,9 @@ enum Command {
     },
     /// Move every MCP server from Claude Code and Codex into plugbay: definitions, pins, secrets.
     Migrate(clients::MigrateOptions),
+    /// Print this directory's servers as a Claude Code `.mcp.json` or VS Code `.vscode/mcp.json`
+    /// for teammates without plugbay; secrets become placeholders. `--write` merges into the file.
+    Export(clients::ExportOptions),
     /// Copy one project's native MCP servers into plugbay config (`migrate` does every project).
     #[command(hide = true)]
     Import(clients::ImportOptions),
@@ -174,6 +177,7 @@ async fn run(cli: Cli, paths: Paths) -> anyhow::Result<()> {
         Command::Trust { revoke } => commands::trust(&paths, cd, revoke).await,
         Command::Setup { clients, dry_run } => clients::setup(&paths, &clients, dry_run).await,
         Command::Migrate(options) => clients::migrate(&paths, options).await,
+        Command::Export(options) => clients::export(&paths, cd, options).await,
         Command::Import(options) => clients::import(&paths, options).await,
         Command::Doctor => doctor::run(&paths, cd).await,
         Command::Completion { shell } => {

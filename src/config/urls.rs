@@ -31,6 +31,11 @@ pub fn display_url(url: &Url) -> String {
     shown
 }
 
+/// True when [`display_url`] would mask part of `url`: it may carry a key.
+pub fn url_may_hold_secret(url: &Url) -> bool {
+    display_url(url).contains(MASK)
+}
+
 /// Replaces every occurrence of `url` in `text`, e.g. a transport error, with [`display_url`].
 pub fn mask_url_in(text: &str, url: &Url) -> String {
     text.replace(url.as_str(), &display_url(url))

@@ -390,12 +390,12 @@ fn keychain_name(server_key: &str, identity: &str, field: &str) -> String {
     format!("{server_key}-{field_name}-{short_fingerprint}")
 }
 
-fn is_secret_field(field: &str) -> bool {
+pub(super) fn is_secret_field(field: &str) -> bool {
     field.eq_ignore_ascii_case("authorization") || secrets::looks_secret(field)
 }
 
 /// `"Bearer abc"` → `("Bearer ", "abc")`, so the keychain holds the bare token.
-fn split_bearer_scheme(value: &str) -> (&str, &str) {
+pub(super) fn split_bearer_scheme(value: &str) -> (&str, &str) {
     let scheme_length = "Bearer ".len();
     match value.get(..scheme_length) {
         Some(scheme) if scheme.eq_ignore_ascii_case("Bearer ") => value.split_at(scheme_length),
@@ -405,7 +405,7 @@ fn split_bearer_scheme(value: &str) -> (&str, &str) {
 
 /// True when an arg looks like it carries a secret inline: `--token=abc`, `Authorization:Bearer abc`,
 /// or a secret-named flag followed by a value. Args using `${...}` expansion are fine.
-fn has_secret_in_args(args: &[String]) -> bool {
+pub(super) fn has_secret_in_args(args: &[String]) -> bool {
     for (index, argument) in args.iter().enumerate() {
         if let Some((name, value)) = argument.split_once(['=', ':'])
             && secrets::looks_secret(name)

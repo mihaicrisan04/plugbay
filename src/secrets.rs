@@ -68,6 +68,22 @@ pub async fn resolve(value: &str) -> anyhow::Result<String> {
     Ok(resolved)
 }
 
+/// `value` with every `${...}` reference swapped for what `replace` returns, resolving nothing.
+/// Fails like [`resolve`] on unknown schemes and unterminated `${`.
+pub fn replace_refs(
+    value: &str,
+    mut replace: impl FnMut(&SecretRef) -> String,
+) -> anyhow::Result<String> {
+    let mut replaced = String::new();
+    for segment in parse(value)? {
+        match segment {
+            Segment::Literal(text) => replaced.push_str(&text),
+            Segment::Reference(reference) => replaced.push_str(&replace(&reference)),
+        }
+    }
+    Ok(replaced)
+}
+
 pub async fn resolve_map(
     values: &BTreeMap<String, String>,
 ) -> anyhow::Result<BTreeMap<String, String>> {
@@ -423,6 +439,15 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{error:#}").contains("is not set"));
+    }
+
+    #[test]
+    fn replace_refs_swaps_references_without_resolving_them() {
+        let replaced = replace_refs("Bearer ${env:PLUGBAY_NEVER_SET} ${fnox:B}", |reference| {
+            format!("<{}>", reference.describe())
+        })
+        .unwrap();
+        assert_eq!(replaced, "Bearer <env:PLUGBAY_NEVER_SET> <fnox:B>");
     }
 
     #[tokio::test]

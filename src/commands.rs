@@ -14,7 +14,7 @@ use crate::project::{self, ProjectHints, ProjectLocation};
 use crate::protocol::ControlRequest;
 
 pub use access::{TokenOptions, login, logout, trust};
-pub use inspect::{accounts, ls, ls_all, why};
+pub use inspect::{accounts, display_path, ls, ls_all, why};
 pub use pins::{AddOptions, PinOptions, add, remove, unuse_servers, use_servers};
 pub use search::search;
 

@@ -481,7 +481,7 @@ mod tests {
                 "--scope".to_string(),
                 "user".to_string(),
                 "plugbay".to_string(),
-                r#"{"args":["connect"],"command":"/opt/plugbay","type":"stdio"}"#.to_string(),
+                r#"{"type":"stdio","command":"/opt/plugbay","args":["connect"]}"#.to_string(),
             ]]
         );
     }

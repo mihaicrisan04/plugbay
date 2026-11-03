@@ -2,6 +2,7 @@
 
 mod claude;
 mod codex;
+mod export;
 mod import;
 mod migrate;
 
@@ -17,6 +18,7 @@ use crate::config::ServerIdentity;
 use crate::paths::{self, Paths};
 
 pub(crate) use claude::ClaudeScope;
+pub use export::{ExportOptions, export};
 pub use import::{ImportOptions, import};
 pub use migrate::{MigrateOptions, migrate};
 

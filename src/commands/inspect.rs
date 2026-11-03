@@ -498,7 +498,7 @@ fn keyed_value(name: &str, value: Option<&String>) -> String {
     value.clone()
 }
 
-pub(super) fn display_path(path: &Path, home: &Path) -> String {
+pub fn display_path(path: &Path, home: &Path) -> String {
     match path.strip_prefix(home) {
         Ok(relative) if relative.as_os_str().is_empty() => "~".to_string(),
         Ok(relative) => format!("~/{}", relative.display()),

@@ -21,7 +21,7 @@ use crate::project::ProjectLocation;
 use self::file::LoadedFile;
 use self::merge::MergedConfig;
 
-pub use self::urls::{display_url, is_loopback, mask_url_in};
+pub use self::urls::{display_url, is_loopback, mask_url_in, url_may_hold_secret};
 
 pub const PROJECT_FILE: &str = "plugbay.toml";
 pub const LOCAL_FILE: &str = "plugbay.local.toml";
