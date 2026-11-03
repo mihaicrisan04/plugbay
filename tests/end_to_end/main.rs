@@ -2,6 +2,7 @@
 //! a fake stdio upstream (`examples/echo_server.rs`) per account.
 
 mod live;
+mod upgrades;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -98,6 +99,10 @@ struct Sandbox {
     /// Passed to the daemon as `PLUGBAY_READY_DEADLINE_MS`; the daemon's 8 s otherwise.
     ready_deadline: Option<Duration>,
 }
+
+/// A shim that loses its daemon while the sandbox is torn down can start one in the deleted
+/// sandbox; it exits after this long instead of the default 10 minutes.
+const DAEMON_IDLE_TIMEOUT: &str = "30";
 
 /// Stands in for `fnox get <NAME>`: `SLOW_TOKEN` answers after 3 s, `FAILS_SLOWLY` fails after 2 s.
 const FAKE_FNOX: &str = r#"#!/bin/sh
@@ -197,6 +202,7 @@ env = {{ ECHO_ACCOUNT = "client-b" }}
                 self.plugbay_home.join("vault.json"),
             )
             .env_remove("CLAUDE_PROJECT_DIR")
+            .env("PLUGBAY_IDLE_TIMEOUT", DAEMON_IDLE_TIMEOUT)
             .env("PLUGBAY_LOG", "debug")
             .env("PATH", self.path_with_fake_tools());
         if let Some(deadline) = self.ready_deadline {
@@ -241,6 +247,7 @@ env = {{ ECHO_ACCOUNT = "client-b" }}
             .args(args)
             .current_dir(self.projects.join(project))
             .env("PLUGBAY_HOME", &self.plugbay_home)
+            .env("PLUGBAY_IDLE_TIMEOUT", DAEMON_IDLE_TIMEOUT)
             .env(
                 "PLUGBAY_INSECURE_TEST_VAULT",
                 self.plugbay_home.join("vault.json"),

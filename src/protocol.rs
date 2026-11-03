@@ -15,7 +15,34 @@ use crate::project::ProjectHints;
 use crate::report::ServerState;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Debug builds only: the version a shim or daemon reports, so tests can stage an upgrade.
+pub const TEST_VERSION_ENV: &str = "PLUGBAY_TEST_VERSION";
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The version this process speaks the daemon protocol as: [`VERSION`], or in debug builds
+/// [`TEST_VERSION_ENV`] when set.
+pub fn version() -> &'static str {
+    #[cfg(debug_assertions)]
+    {
+        static OVERRIDE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        if let Some(version) = OVERRIDE.get_or_init(|| std::env::var(TEST_VERSION_ENV).ok()) {
+            return version;
+        }
+    }
+    VERSION
+}
+
+/// Whether `candidate` is a strictly newer plugbay than `current`. Versions that don't parse
+/// are never newer, so nothing unexpected can retire a daemon.
+pub fn is_newer(candidate: &str, current: &str) -> bool {
+    match (
+        semver::Version::parse(candidate),
+        semver::Version::parse(current),
+    ) {
+        (Ok(candidate), Ok(current)) => candidate > current,
+        _ => false,
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -23,6 +50,10 @@ pub enum Hello {
     Session {
         version: String,
         hints: ProjectHints,
+        /// The client finds a new daemon by itself when this one exits (shims since daemon
+        /// upgrades). Older shims and CLI sessions can't, so a daemon serving one never retires.
+        #[serde(default)]
+        reconnects: bool,
     },
     Control {
         version: String,
@@ -50,13 +81,25 @@ pub enum ControlRequest {
     /// connected and their sessions reconnect.
     ReconnectAll,
     Stop,
+    /// A strictly newer plugbay asks this daemon to exit so a daemon of its version takes over.
+    /// Refused unless every connected session reconnects on its own.
+    Retire,
 }
+
+/// The message of a daemon accepting `retire`.
+pub const RETIRING: &str = "retiring";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ControlResponse {
     pub version: String,
     pub sessions: usize,
     pub message: String,
+    /// Missing from daemons that predate it.
+    #[serde(default)]
+    pub pid: Option<u32>,
+    /// Whether the daemon knows `retire`; daemons that predate it don't.
+    #[serde(default)]
+    pub can_retire: bool,
 }
 
 /// Sends one control request to a running daemon. Errors when none is listening.
@@ -69,7 +112,7 @@ pub async fn send_control(
             .await
             .context("connecting to the daemon")?;
         let hello = Hello::Control {
-            version: VERSION.to_string(),
+            version: version().to_string(),
             request,
         };
         write_line(&mut stream, &hello).await?;
@@ -218,6 +261,36 @@ mod tests {
             ControlRequest::CredentialsChanged { identity, account }
                 if identity == "https://mcp.linear.app/mcp" && account == "work"
         ));
+    }
+
+    #[test]
+    fn hellos_from_older_shims_cannot_reconnect() {
+        let line = r#"{"kind":"session","version":"0.2.1","hints":{"explicit":null,"claude_project_dir":null,"root":null,"cwd":null}}"#;
+        let hello: Hello = serde_json::from_str(line).unwrap();
+        assert!(matches!(
+            hello,
+            Hello::Session {
+                reconnects: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn replies_from_older_daemons_cannot_retire() {
+        let line = r#"{"version":"0.2.1","sessions":1,"message":"running"}"#;
+        let response: ControlResponse = serde_json::from_str(line).unwrap();
+        assert!(!response.can_retire && response.pid.is_none());
+    }
+
+    #[test]
+    fn only_a_strictly_newer_version_is_newer() {
+        assert!(is_newer("0.3.0", "0.2.1"));
+        assert!(is_newer("0.3.0", "0.3.0-rc.1"));
+        assert!(!is_newer("0.3.0", "0.3.0"));
+        assert!(!is_newer("0.2.1", "0.3.0"));
+        assert!(!is_newer("garbage", "0.1.0"));
+        assert!(!is_newer("0.3.0", "garbage"));
     }
 
     #[test]

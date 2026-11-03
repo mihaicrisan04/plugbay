@@ -1,7 +1,13 @@
-//! `plugbay connect`: the stdio MCP server each agent launches. It forwards bytes to the daemon.
+//! `plugbay connect`: the stdio MCP server each agent launches. It relays the agent's messages
+//! to the daemon, and moves the session to a new daemon when that one exits (an upgrade, a
+//! `plugbay stop`, a crash).
+
+mod relay;
+mod replay;
 
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -10,7 +16,7 @@ use tokio::net::UnixStream;
 use crate::daemon;
 use crate::paths::Paths;
 use crate::project::ProjectHints;
-use crate::protocol::{self, Hello};
+use crate::protocol::{self, ControlRequest, Hello};
 
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(5);
 const DAEMON_RESTART_INTERVAL: Duration = Duration::from_secs(1);
@@ -23,7 +29,7 @@ pub async fn run(paths: &Paths, project: Option<PathBuf>) -> anyhow::Result<()> 
         cwd: std::env::current_dir().ok(),
     };
 
-    let mut stream = match connect_or_start_daemon(paths).await {
+    let stream = match connect_as_session(paths, hints.clone(), Reconnects::Yes).await {
         Ok(stream) => stream,
         Err(error) => {
             tracing::warn!(
@@ -34,10 +40,7 @@ pub async fn run(paths: &Paths, project: Option<PathBuf>) -> anyhow::Result<()> 
         }
     };
 
-    match greet_as_session(&mut stream, hints).await {
-        Ok(()) => forward(stream).await,
-        Err(error) => tracing::error!(error = format!("{error:#}"), "could not greet the daemon"),
-    }
+    relay::run(paths, hints, stream).await;
     // stdin is read on a blocking thread that can't be cancelled; exit instead of waiting for it.
     std::process::exit(0)
 }
@@ -45,19 +48,90 @@ pub async fn run(paths: &Paths, project: Option<PathBuf>) -> anyhow::Result<()> 
 /// A daemon connection that carries MCP for a session at `hints`, exactly like an agent's
 /// (used by `plugbay tools` and `call`). Starts the daemon if none is running.
 pub async fn open_session(paths: &Paths, hints: ProjectHints) -> anyhow::Result<UnixStream> {
+    connect_as_session(paths, hints, Reconnects::No).await
+}
+
+#[derive(Clone, Copy)]
+enum Reconnects {
+    Yes,
+    No,
+}
+
+async fn connect_as_session(
+    paths: &Paths,
+    hints: ProjectHints,
+    reconnects: Reconnects,
+) -> anyhow::Result<UnixStream> {
+    retire_older_daemon(paths).await;
     let mut stream = connect_or_start_daemon(paths).await?;
-    greet_as_session(&mut stream, hints).await?;
+    let hello = Hello::Session {
+        version: protocol::version().to_string(),
+        hints,
+        reconnects: matches!(reconnects, Reconnects::Yes),
+    };
+    protocol::write_line(&mut stream, &hello)
+        .await
+        .context("greeting the daemon")?;
     Ok(stream)
 }
 
-async fn greet_as_session(stream: &mut UnixStream, hints: ProjectHints) -> anyhow::Result<()> {
-    let hello = Hello::Session {
-        version: protocol::VERSION.to_string(),
-        hints,
+/// What became of a running daemon older than this plugbay.
+pub enum Handover {
+    /// None runs, or it runs this version or a newer one.
+    NotNeeded,
+    /// It exited; the next connection starts a daemon of this version.
+    Retired { old_version: String },
+    /// It keeps running; the warning logged says why.
+    Refused,
+}
+
+static WARNED_ABOUT_NEWER_DAEMON: AtomicBool = AtomicBool::new(false);
+
+/// Asks a daemon older than this plugbay to make way. Only strictly newer retires older, and the
+/// daemon checks that too, so a stale binary can never bounce a current daemon.
+pub async fn retire_older_daemon(paths: &Paths) -> Handover {
+    let Ok(status) = protocol::send_control(paths, ControlRequest::Status).await else {
+        return Handover::NotNeeded;
     };
-    protocol::write_line(stream, &hello)
-        .await
-        .context("greeting the daemon")
+    let ours = protocol::version();
+    if !protocol::is_newer(ours, &status.version) {
+        if protocol::is_newer(&status.version, ours)
+            && !WARNED_ABOUT_NEWER_DAEMON.swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                daemon_version = status.version,
+                version = ours,
+                "the daemon is newer than this plugbay; using it as is"
+            );
+        }
+        return Handover::NotNeeded;
+    }
+
+    let old_version = status.version;
+    let refused = |reason: String| {
+        tracing::warn!(
+            daemon_version = old_version,
+            reason,
+            "the older daemon keeps running"
+        );
+        Handover::Refused
+    };
+    if !status.can_retire {
+        return refused("it predates retiring; `plugbay stop` restarts it".to_string());
+    }
+    tracing::info!(
+        daemon_version = old_version,
+        version = ours,
+        "asking the older daemon to retire"
+    );
+    match protocol::send_control(paths, ControlRequest::Retire).await {
+        Ok(response) if response.message == protocol::RETIRING => {
+            tracing::info!(daemon_version = old_version, "the older daemon retired");
+            Handover::Retired { old_version }
+        }
+        Ok(response) => refused(response.message),
+        Err(error) => refused(format!("{error:#}")),
+    }
 }
 
 async fn connect_or_start_daemon(paths: &Paths) -> anyhow::Result<UnixStream> {
@@ -94,10 +168,14 @@ fn start_daemon(paths: &Paths) -> anyhow::Result<()> {
     use std::os::unix::process::CommandExt;
 
     paths.ensure_state_dir()?;
-    let executable = std::env::current_exe().context("locating the plugbay binary")?;
-    tracing::info!("starting the plugbay daemon");
+    let executable = daemon_executable().context(
+        "this plugbay binary is gone (upgraded?) and no `plugbay` is on PATH to start the daemon",
+    )?;
+    tracing::info!(executable = %executable.display(), "starting the plugbay daemon");
     std::process::Command::new(executable)
         .arg("daemon")
+        // The override stands for this process's version, not for the binary's.
+        .env_remove(protocol::TEST_VERSION_ENV)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -107,21 +185,18 @@ fn start_daemon(paths: &Paths) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Copies the agent's stdio to the daemon and back until either side closes.
-async fn forward(stream: UnixStream) {
-    let (mut from_daemon, mut to_daemon) = stream.into_split();
-    let mut stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
-    tokio::select! {
-        result = tokio::io::copy(&mut stdin, &mut to_daemon) => {
-            if let Err(error) = result {
-                tracing::debug!(%error, "agent side closed");
-            }
-        }
-        result = tokio::io::copy(&mut from_daemon, &mut stdout) => {
-            if let Err(error) = result {
-                tracing::warn!(%error, "daemon connection closed");
-            }
-        }
+/// The binary to run as the daemon. `current_exe` is the path this process was started from
+/// (on macOS a link like `/opt/homebrew/bin/plugbay` stays a link, so it already runs an upgrade);
+/// when an upgrade deleted that file (a Cellar path, or Linux, where it is always the resolved
+/// file), the `plugbay` on PATH is the package manager's link to the new version.
+fn daemon_executable() -> Option<PathBuf> {
+    if let Ok(executable) = std::env::current_exe()
+        && executable.is_file()
+    {
+        return Some(executable);
     }
+    let search_path = std::env::var_os("PATH")?;
+    std::env::split_paths(&search_path)
+        .map(|directory| directory.join("plugbay"))
+        .find(|candidate| candidate.is_file())
 }

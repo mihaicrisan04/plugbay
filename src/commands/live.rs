@@ -104,6 +104,12 @@ pub async fn restart(
         Some(target) => credentials_changed(&find_server(paths, cd, target).await?),
         None => ControlRequest::ReconnectAll,
     };
+    if let shim::Handover::Retired { old_version } = shim::retire_older_daemon(paths).await {
+        println!(
+            "the daemon ran plugbay {old_version} and handed over; agents reconnect to a new daemon, which connects every server afresh"
+        );
+        return Ok(());
+    }
     match protocol::send_control(paths, request).await {
         Ok(response) => {
             match response.sessions {
@@ -120,7 +126,7 @@ pub async fn restart(
             Ok(())
         }
         Err(error) => Err(error).context(
-            "the daemon did not answer; if it is older than this plugbay, run `plugbay stop` and agents start a new one",
+            "the daemon did not answer; if it is older than this plugbay, run `plugbay stop` (agents started before the upgrade then need a restart)",
         ),
     }
 }

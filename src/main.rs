@@ -58,10 +58,10 @@ enum Command {
     /// Run the daemon in the foreground (normally started by `connect`).
     Daemon {
         /// Exit after this many seconds without any connected agent.
-        #[arg(long, default_value_t = 600)]
+        #[arg(long, env = "PLUGBAY_IDLE_TIMEOUT", default_value_t = 600)]
         idle_timeout: u64,
     },
-    /// Ask a running daemon to exit (agents start a new one on their next connection).
+    /// Ask a running daemon to exit (connected agents move to a new one on their own).
     Stop,
     /// Reconnect upstream servers (all, or one server account) without disconnecting agents.
     Restart {

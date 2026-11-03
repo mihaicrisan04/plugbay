@@ -169,19 +169,30 @@ async fn check_daemon(paths: &Paths) -> Check {
         }
     };
 
-    let ours = protocol::VERSION.to_string();
+    let ours = protocol::VERSION;
+    let problem = format!(
+        "daemon runs version {}, this binary is {ours}",
+        response.version
+    );
     if response.version == ours {
         Check::ok(format!(
             "daemon {} running, {} session(s)",
             response.version, response.sessions
         ))
+    } else if !protocol::is_newer(ours, &response.version) {
+        Check::warn(
+            problem,
+            "an older plugbay may come first on PATH: check `which -a plugbay`",
+        )
+    } else if response.can_retire {
+        Check::warn(
+            problem,
+            "fixes itself: the next agent that connects moves every agent to the new daemon (`plugbay stop` does it now)",
+        )
     } else {
         Check::warn(
-            format!(
-                "daemon runs version {}, this binary is {ours}",
-                response.version
-            ),
-            "run `plugbay stop`; the next agent session starts the new version",
+            problem,
+            "run `plugbay stop`; agents started before the upgrade then need a restart",
         )
     }
 }
