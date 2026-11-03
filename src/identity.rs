@@ -5,7 +5,7 @@
 
 mod answer;
 
-pub use self::answer::one_safe_line;
+pub use self::answer::{one_safe_line, safe_for_terminal};
 
 use std::collections::BTreeMap;
 use std::future::Future;

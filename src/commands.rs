@@ -2,19 +2,25 @@
 
 mod access;
 mod inspect;
+mod live;
+mod logs;
 mod pins;
 mod search;
 
 use std::path::PathBuf;
 
+use anyhow::Context;
+
 use crate::config::{self, ResolvedConfig};
 use crate::index;
 use crate::paths::Paths;
 use crate::project::{self, ProjectHints, ProjectLocation};
-use crate::protocol::ControlRequest;
+use crate::protocol::{self, ControlRequest};
 
 pub use access::{TokenOptions, login, logout, trust};
 pub use inspect::{accounts, ls, ls_all, why};
+pub use live::{call, restart, tools};
+pub use logs::logs;
 pub use pins::{AddOptions, PinOptions, add, remove, unuse_servers, use_servers};
 pub use search::search;
 
@@ -56,9 +62,12 @@ pub fn resolve_everywhere(paths: &Paths) -> anyhow::Result<Vec<ResolvedConfig>> 
 }
 
 pub async fn stop(paths: &Paths) -> anyhow::Result<()> {
-    match crate::protocol::send_control(paths, ControlRequest::Stop).await {
+    match protocol::send_control(paths, ControlRequest::Stop).await {
         Ok(response) => println!("{}", response.message),
-        Err(_) => println!("daemon is not running"),
+        Err(error) if protocol::daemon_is_not_running(&error) => {
+            println!("daemon is not running")
+        }
+        Err(error) => return Err(error).context("the daemon did not answer the stop request"),
     }
     Ok(())
 }
@@ -66,18 +75,28 @@ pub async fn stop(paths: &Paths) -> anyhow::Result<()> {
 /// Tells a running daemon that `server`'s credentials changed, so it drops connections made with
 /// the old ones. Silent when none is running.
 pub async fn notify_credentials_changed(paths: &Paths, server: &config::ResolvedServer) {
-    let request = ControlRequest::CredentialsChanged {
+    match protocol::send_control(paths, credentials_changed(server)).await {
+        Ok(_) => {}
+        Err(error) if protocol::daemon_is_not_running(&error) => {
+            tracing::debug!(%error, "no daemon to tell about new credentials");
+        }
+        Err(error) => tracing::warn!(
+            error = format!("{error:#}"),
+            "the running daemon is older; run `plugbay stop` so the new login applies"
+        ),
+    }
+}
+
+fn credentials_changed(server: &config::ResolvedServer) -> ControlRequest {
+    ControlRequest::CredentialsChanged {
         identity: server.identity.0.clone(),
         account: server.account.clone(),
-    };
-    if let Err(error) = crate::protocol::send_control(paths, request).await {
-        tracing::debug!(%error, "no daemon to tell about new credentials");
     }
 }
 
 /// Tells a running daemon to re-read config, trust and credentials. Silent when none is running.
 pub async fn notify_daemon_reload(paths: &Paths) {
-    if let Err(error) = crate::protocol::send_control(paths, ControlRequest::Reload).await {
+    if let Err(error) = protocol::send_control(paths, ControlRequest::Reload).await {
         tracing::debug!(%error, "no daemon to reload");
     }
 }

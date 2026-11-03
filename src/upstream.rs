@@ -332,22 +332,35 @@ impl UpstreamPool {
     /// Closes the connections of one server account, e.g. after its credentials changed. Sessions
     /// see their lease closed on the next refresh and reconnect with the new credentials.
     pub async fn close_account(&self, identity: &ServerIdentity, account: &str) -> usize {
+        self.retire_where(|key| &key.identity == identity && key.account == account)
+            .await
+    }
+
+    /// Closes every connection while the daemon keeps running (`plugbay restart`); sessions
+    /// reconnect on their next refresh.
+    pub async fn close_all(&self) -> usize {
+        self.retire_where(|_| true).await
+    }
+
+    async fn retire_where(&self, matches: impl Fn(&UpstreamKey) -> bool) -> usize {
         let slots: Vec<_> = self
             .lock_entries()
             .iter()
-            .filter(|(key, _)| &key.identity == identity && key.account == account)
+            .filter(|(key, _)| matches(key))
             .map(|(_, entry)| entry.slot.clone())
             .collect();
-        let mut closed = 0;
-        for slot in slots {
-            if let Some(upstream) = slot.lock().await.take() {
-                upstream.retired.store(true, Ordering::SeqCst);
-                upstream.stop_process();
-                close(upstream).await;
-                closed += 1;
-            }
-        }
-        closed
+        let retire = |slot: Arc<tokio::sync::Mutex<Option<Arc<Upstream>>>>| async move {
+            let Some(upstream) = slot.lock().await.take() else {
+                return false;
+            };
+            upstream.retired.store(true, Ordering::SeqCst);
+            upstream.stop_process();
+            close(upstream).await;
+            true
+        };
+        // Together, so a connection still being made (its slot locked) doesn't hold up the rest.
+        let retired = futures::future::join_all(slots.into_iter().map(retire)).await;
+        retired.into_iter().filter(|closed| *closed).count()
     }
 
     /// Closes every connection; used when the daemon exits so no upstream process outlives it.

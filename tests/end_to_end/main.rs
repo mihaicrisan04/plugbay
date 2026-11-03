@@ -1,6 +1,8 @@
 //! Drives the real binary the way an agent does: `plugbay connect` over stdio, daemon auto-started,
 //! a fake stdio upstream (`examples/echo_server.rs`) per account.
 
+mod live;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -232,17 +234,28 @@ env = {{ ECHO_ACCOUNT = "client-b" }}
         std::fs::write(path, format!("{top_level_keys}{existing}")).unwrap();
     }
 
-    fn plugbay(&self, args: &[&str], project: &str) -> String {
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_plugbay"))
+    /// The CLI run from `project`, with this sandbox's home and vault.
+    fn command(&self, args: &[&str], project: &str) -> std::process::Command {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_plugbay"));
+        command
             .args(args)
             .current_dir(self.projects.join(project))
             .env("PLUGBAY_HOME", &self.plugbay_home)
             .env(
                 "PLUGBAY_INSECURE_TEST_VAULT",
                 self.plugbay_home.join("vault.json"),
-            )
-            .output()
-            .unwrap();
+            );
+        if let Some(deadline) = self.ready_deadline {
+            command.env(
+                "PLUGBAY_READY_DEADLINE_MS",
+                deadline.as_millis().to_string(),
+            );
+        }
+        command
+    }
+
+    fn plugbay(&self, args: &[&str], project: &str) -> String {
+        let output = self.command(args, project).output().unwrap();
         String::from_utf8_lossy(&output.stdout).into_owned()
     }
 }
@@ -286,7 +299,16 @@ async fn wait_for_tool<H: ClientHandler>(
     client: &RunningService<RoleClient, H>,
     tool: &str,
 ) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    wait_for_tool_within(sandbox, client, tool, Duration::from_secs(10)).await;
+}
+
+async fn wait_for_tool_within<H: ClientHandler>(
+    sandbox: &Sandbox,
+    client: &RunningService<RoleClient, H>,
+    tool: &str,
+    timeout: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + timeout;
     while !tool_names(client).await.contains(&tool.to_string()) {
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -885,14 +907,8 @@ async fn use_and_unuse_write_pins_that_ls_and_accounts_see() {
 
 /// Runs the binary like `Sandbox::plugbay`, keeping stderr and the exit status too.
 fn plugbay_output(sandbox: &Sandbox, args: &[&str], project: &str) -> std::process::Output {
-    std::process::Command::new(env!("CARGO_BIN_EXE_plugbay"))
-        .args(args)
-        .current_dir(sandbox.projects.join(project))
-        .env("PLUGBAY_HOME", &sandbox.plugbay_home)
-        .env(
-            "PLUGBAY_INSECURE_TEST_VAULT",
-            sandbox.plugbay_home.join("vault.json"),
-        )
+    sandbox
+        .command(args, project)
         .env_remove("PLUGBAY_LOG")
         .output()
         .unwrap()

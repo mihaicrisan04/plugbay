@@ -31,10 +31,12 @@ use crate::report::ServerState;
 use crate::trust::Trust;
 use crate::upstream::{ConnectError, Lease, MayConnect, Upstream, UpstreamKey, UpstreamPool};
 
+pub use self::tools::{STATUS_TOOL, TOOL_SEPARATOR};
+
 use self::prompt::TrustPromptKey;
 use self::tools::{
-    DISABLE_TOOL, ENABLE_TOOL, STATUS_TOOL, TOOL_SEPARATOR, disable_tool, enable_tool,
-    error_result, exposed_tools, login_tool, status_tool, text_result,
+    DISABLE_TOOL, ENABLE_TOOL, disable_tool, enable_tool, error_result, exposed_tools, login_tool,
+    status_tool, text_result,
 };
 
 const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -45,7 +47,7 @@ const READY_DEADLINE: Duration = Duration::from_secs(8);
 
 /// [`READY_DEADLINE`], or less via `PLUGBAY_READY_DEADLINE_MS` (for tests, which would otherwise
 /// sit through it). It can only shorten the wait.
-fn ready_deadline() -> Duration {
+pub fn ready_deadline() -> Duration {
     static DEADLINE: OnceLock<Duration> = OnceLock::new();
     *DEADLINE.get_or_init(|| {
         let configured = std::env::var("PLUGBAY_READY_DEADLINE_MS")
@@ -95,6 +97,17 @@ impl Shared {
         let sessions = self.live_sessions();
         futures::future::join_all(sessions.iter().map(|session| session.refresh_and_notify()))
             .await;
+    }
+
+    /// A pending attempt may still be listing tools or publishing its retired lease. Replace it
+    /// too, so the reload cannot keep that attempt and later accept a closed connection.
+    pub async fn reload_after_retiring(&self, matches: impl Fn(&UpstreamKey) -> bool + Sync) {
+        let sessions = self.live_sessions();
+        futures::future::join_all(sessions.iter().map(|session| async {
+            session.discard_connecting(&matches).await;
+            session.refresh_and_notify().await;
+        }))
+        .await;
     }
 
     /// Drops every `allow_once` grant, e.g. after `plugbay trust --revoke`, and re-checks every session.
@@ -255,6 +268,21 @@ impl Session {
         for active in &self.state.lock().servers {
             active.stop_connecting();
         }
+        self.connections_settled.send_replace(());
+    }
+
+    async fn discard_connecting(&self, matches: &impl Fn(&UpstreamKey) -> bool) {
+        let _refreshing = self.refreshing.lock().await;
+        self.state.lock().servers.retain(|active| {
+            if let ServerStatus::Connecting { key, task, .. } = &active.status
+                && matches(key)
+            {
+                tracing::info!(server = %active.server.display_name(), "restarting pending upstream connection");
+                task.abort();
+                return false;
+            }
+            true
+        });
         self.connections_settled.send_replace(());
     }
 
@@ -556,7 +584,7 @@ impl Session {
     async fn call(&self, request: CallToolRequestParams) -> CallToolResult {
         self.ensure_ready().await;
         if request.name == STATUS_TOOL {
-            return text_result(self.status_report().await);
+            return self.status_report().await;
         }
         self.reconnect_if_an_upstream_died().await;
         match request.name.as_ref() {
@@ -616,14 +644,14 @@ impl Session {
         }
     }
 
-    async fn status_report(&self) -> String {
+    async fn status_report(&self) -> CallToolResult {
         let verified = VerifiedAccounts::load(&self.shared.paths).await;
         let mut report = {
             let state = self.state.lock();
-            let Some(resolved) = &state.resolved else {
-                return "plugbay has not resolved any config yet".to_string();
-            };
-            render::status_text(resolved, &state.servers, &verified)
+            match &state.resolved {
+                Some(resolved) => render::status_report(resolved, &state.servers, &verified),
+                None => render::StatusReport::not_resolved_yet(),
+            }
         };
         let pins = self.pins.lock();
         if !pins.is_empty() {
@@ -637,12 +665,17 @@ impl Session {
                     SessionPin::Off => format!("{name} off"),
                 })
                 .collect();
-            report.push_str(&format!(
+            report.text.push_str(&format!(
                 "\nthis session only (not saved): {}",
                 described.join(", ")
             ));
         }
-        report
+        let mut result = text_result(report.text);
+        match report.status.into_meta() {
+            Ok(meta) => result.meta = Some(meta),
+            Err(error) => tracing::warn!(%error, "could not attach the typed status"),
+        }
+        result
     }
 
     /// Learns the project from MCP roots when the shim's cwd was `/` or `$HOME`.
@@ -926,4 +959,100 @@ fn stamp_files(paths: &[PathBuf]) -> Vec<FileStamp> {
             Some((metadata.modified().ok()?, metadata.len()))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn pending_server(
+        server: ResolvedServer,
+        attempt: u64,
+    ) -> (ActiveServer, tokio::task::JoinHandle<()>) {
+        let task = tokio::spawn(std::future::pending());
+        let active = ActiveServer {
+            status: ServerStatus::Connecting {
+                attempt,
+                key: UpstreamKey::for_server(&server, None),
+                task: task.abort_handle(),
+            },
+            server,
+        };
+        (active, task)
+    }
+
+    #[tokio::test]
+    async fn retirement_reload_replaces_an_attempt_before_its_result_arrives() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::for_test(temp.path());
+        std::fs::create_dir_all(&paths.config_dir).unwrap();
+        std::fs::write(
+            paths.global_config(),
+            "[servers.echo]\ncommand = '/bin/sh'\nargs = ['-c', 'exit 0']\n",
+        )
+        .unwrap();
+        let shared = Shared::new(paths);
+        let session = Session::new(shared.clone(), ProjectHints::default());
+        let resolved = session.resolve_config();
+        let server = resolved.outcome.as_ref().unwrap().servers[0].clone();
+        // The pool has retired the connection, but this attempt hasn't published its lease yet.
+        let (pending, task) = pending_server(server, 0);
+        session.state.lock().resolved = Some(resolved);
+        session.state.lock().servers.push(pending);
+        session.next_attempt.store(1, Ordering::SeqCst);
+
+        shared.reload_after_retiring(|_| true).await;
+
+        assert_eq!(session.next_attempt.load(Ordering::SeqCst), 2);
+        assert!(task.await.unwrap_err().is_cancelled());
+        session
+            .finish_connecting(
+                0,
+                ServerStatus::NeedsLogin {
+                    challenge: "stale retired attempt".to_string(),
+                },
+            )
+            .await;
+        // The replacement's command exits immediately, so it fails instead of needing login.
+        assert!(matches!(
+            session.state.lock().servers[0].status,
+            ServerStatus::Failed(_)
+        ));
+        session.end();
+        shared.pool.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn targeted_retirement_keeps_other_accounts_and_servers_connecting() {
+        let temp = TempDir::new().unwrap();
+        let shared = Shared::new(Paths::for_test(temp.path()));
+        let session = Session::new(shared, ProjectHints::default());
+        let server = ResolvedServer::test_http("echo", "a", "https://example.test/echo");
+        let identity = server.identity.clone();
+        let (matching, matching_task) = pending_server(server, 0);
+        let (other_account, other_account_task) = pending_server(
+            ResolvedServer::test_http("echo", "b", "https://example.test/echo"),
+            1,
+        );
+        let (other_server, other_server_task) = pending_server(
+            ResolvedServer::test_http("other", "a", "https://example.test/other"),
+            2,
+        );
+        session.state.lock().servers = vec![matching, other_account, other_server];
+
+        session
+            .discard_connecting(&|key| key.identity == identity && key.account == "a")
+            .await;
+
+        assert!(matching_task.await.unwrap_err().is_cancelled());
+        assert!(session.any_connecting(&[1]));
+        assert!(session.any_connecting(&[2]));
+        assert!(!other_account_task.is_finished());
+        assert!(!other_server_task.is_finished());
+        session.end();
+        assert!(other_account_task.await.unwrap_err().is_cancelled());
+        assert!(other_server_task.await.unwrap_err().is_cancelled());
+    }
 }

@@ -5,12 +5,14 @@
 use std::time::Duration;
 
 use anyhow::Context;
+use rmcp::model::MetaObject;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use crate::paths::Paths;
 use crate::project::ProjectHints;
+use crate::report::ServerState;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -38,11 +40,15 @@ pub enum ControlRequest {
     /// Drop every `allow_once` grant, then reload (after `plugbay trust --revoke`).
     ForgetSessionTrust,
     /// Close connections made with a server account's old credentials, then reload
-    /// (after `login` or `logout`), so the new ones apply right away.
+    /// (after `login` or `logout`, and `plugbay restart server[:account]`), so the new ones
+    /// apply right away.
     CredentialsChanged {
         identity: String,
         account: String,
     },
+    /// Close every pooled upstream connection, then reload (`plugbay restart`). Agents stay
+    /// connected and their sessions reconnect.
+    ReconnectAll,
     Stop,
 }
 
@@ -77,6 +83,18 @@ pub async fn send_control(
         .context("the daemon did not answer in time")?
 }
 
+/// Whether `send_control` failed because no daemon listens, rather than one that answered badly.
+pub fn daemon_is_not_running(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            )
+        })
+    })
+}
+
 pub async fn write_line(
     stream: &mut (impl AsyncWrite + Unpin),
     message: &impl Serialize,
@@ -85,4 +103,149 @@ pub async fn write_line(
     line.push(b'\n');
     stream.write_all(&line).await?;
     Ok(())
+}
+
+const STATUS_SERVERS_KEY: &str = "plugbay/servers";
+const STATUS_PROBLEMS_KEY: &str = "plugbay/problems";
+
+/// What `plugbay__status` reports, typed, in its result's `_meta` (agents read the same report as
+/// its text), so `plugbay tools` and `call` never parse prose.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct SessionStatus {
+    pub servers: Vec<StatusServer>,
+    pub problems: Vec<String>,
+}
+
+/// One server line of the status report.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StatusServer {
+    pub name: String,
+    /// `None` for a server the config disables.
+    pub account: Option<String>,
+    /// What its tool names start with: `echo`, or `echo-work` when it has several accounts.
+    pub tool_prefix: String,
+    /// `name:account`, as people type it.
+    pub label: String,
+    pub state: StatusState,
+    /// The whole line as the text shows it, e.g. `echo:work (echo-server) — connected`.
+    pub status_line: String,
+}
+
+/// [`ServerState`] without its details, plus servers the config disables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusState {
+    Ready,
+    Connected,
+    Connecting,
+    NeedsTrust,
+    NeedsLogin,
+    LoginUnknown,
+    WrongAccount,
+    AccountUnknown,
+    Failed,
+    Disabled,
+    /// A state from a newer daemon.
+    #[serde(other)]
+    Unknown,
+}
+
+impl StatusState {
+    pub fn is_usable(self) -> bool {
+        matches!(self, Self::Ready | Self::Connected)
+    }
+}
+
+impl From<&ServerState> for StatusState {
+    fn from(state: &ServerState) -> Self {
+        match state {
+            ServerState::Ready => Self::Ready,
+            ServerState::Connected => Self::Connected,
+            ServerState::Connecting => Self::Connecting,
+            ServerState::NeedsTrust => Self::NeedsTrust,
+            ServerState::NeedsLogin => Self::NeedsLogin,
+            ServerState::LoginUnknown => Self::LoginUnknown,
+            ServerState::WrongAccount { .. } => Self::WrongAccount,
+            ServerState::AccountUnknown { .. } => Self::AccountUnknown,
+            ServerState::Failed(_) => Self::Failed,
+        }
+    }
+}
+
+impl SessionStatus {
+    pub fn into_meta(self) -> anyhow::Result<MetaObject> {
+        let mut meta = MetaObject::new();
+        meta.0.insert(
+            STATUS_SERVERS_KEY.to_string(),
+            serde_json::to_value(self.servers)?,
+        );
+        meta.0.insert(
+            STATUS_PROBLEMS_KEY.to_string(),
+            serde_json::to_value(self.problems)?,
+        );
+        Ok(meta)
+    }
+
+    pub fn from_meta(meta: Option<&MetaObject>) -> anyhow::Result<Self> {
+        let field = |key: &str| meta.and_then(|meta| meta.0.get(key)).cloned();
+        let (Some(servers), Some(problems)) =
+            (field(STATUS_SERVERS_KEY), field(STATUS_PROBLEMS_KEY))
+        else {
+            anyhow::bail!(
+                "the running daemon is older than this plugbay; run `plugbay stop` and try again"
+            );
+        };
+        Ok(Self {
+            servers: serde_json::from_value(servers).context("reading the daemon's server list")?,
+            problems: serde_json::from_value(problems)
+                .context("reading the daemon's config problems")?,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credentials_changed_keeps_the_wire_format_older_plugbays_send() {
+        let line = r#"{"kind":"control","version":"0.2.1","request":{"credentials_changed":{"identity":"https://mcp.linear.app/mcp","account":"work"}}}"#;
+        let Hello::Control { request, .. } = serde_json::from_str(line).unwrap() else {
+            panic!("not a control hello");
+        };
+        assert!(matches!(
+            request,
+            ControlRequest::CredentialsChanged { identity, account }
+                if identity == "https://mcp.linear.app/mcp" && account == "work"
+        ));
+    }
+
+    #[test]
+    fn session_status_survives_the_meta_round_trip() {
+        let status = SessionStatus {
+            servers: vec![StatusServer {
+                name: "echo".to_string(),
+                account: Some("work".to_string()),
+                tool_prefix: "echo-work".to_string(),
+                label: "echo:work".to_string(),
+                state: StatusState::Connecting,
+                status_line: "echo:work (echo) — connecting".to_string(),
+            }],
+            problems: vec!["odd".to_string()],
+        };
+        let meta = status.clone().into_meta().unwrap();
+        assert_eq!(SessionStatus::from_meta(Some(&meta)).unwrap(), status);
+    }
+
+    #[test]
+    fn a_status_without_meta_comes_from_an_older_daemon() {
+        let error = SessionStatus::from_meta(None).unwrap_err().to_string();
+        assert!(error.contains("plugbay stop"), "{error}");
+    }
+
+    #[test]
+    fn states_from_a_newer_daemon_are_unknown() {
+        let state: StatusState = serde_json::from_str(r#""sleeping""#).unwrap();
+        assert_eq!(state, StatusState::Unknown);
+    }
 }
