@@ -4,7 +4,7 @@ mod enable;
 mod login;
 mod prompt;
 mod render;
-mod tools;
+pub mod tools;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;

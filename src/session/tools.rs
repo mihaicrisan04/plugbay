@@ -10,8 +10,8 @@ use crate::config::ResolvedServer;
 pub const TOOL_SEPARATOR: &str = "__";
 const MAX_TOOL_NAME_LENGTH: usize = 64;
 pub const STATUS_TOOL: &str = "plugbay__status";
-pub(super) const ENABLE_TOOL: &str = "plugbay__enable";
-pub(super) const DISABLE_TOOL: &str = "plugbay__disable";
+pub const ENABLE_TOOL: &str = "plugbay__enable";
+pub const DISABLE_TOOL: &str = "plugbay__disable";
 
 /// Upstream tools the config's filters allow, renamed `<prefix>__<tool>`.
 pub(super) fn exposed_tools(server: &ResolvedServer, upstream_tools: Vec<Tool>) -> Vec<Tool> {
@@ -40,14 +40,14 @@ pub(super) fn status_tool() -> Tool {
 }
 
 #[derive(Deserialize)]
-pub(super) struct EnableArguments {
-    pub(super) server: String,
-    pub(super) account: Option<String>,
+pub struct EnableArguments {
+    pub server: String,
+    pub account: Option<String>,
 }
 
 #[derive(Deserialize)]
-pub(super) struct DisableArguments {
-    pub(super) server: String,
+pub struct DisableArguments {
+    pub server: String,
 }
 
 pub(super) fn parse_arguments<T: serde::de::DeserializeOwned>(

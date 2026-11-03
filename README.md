@@ -59,7 +59,7 @@ flowchart LR
 - **One entry per agent.** `plugbay setup` registers `plugbay connect` once in Claude Code and Codex. You never edit their MCP config again.
 - **Resolved per project.** The shim tells a per-user daemon where the agent started. The daemon walks from `/` down to that directory and merges every `plugbay.toml` on the way, deeper files winning, like mise.
 - **Shared upstreams.** Each server + account connects once and is shared by every agent that needs it. Tools pass through as `server__tool`, and the server instructions tell the agent which account it is talking to.
-- **Live.** Edit a file and the tools change in the running Claude Code session. An agent can switch a known server on for one session with `plugbay__enable`. The daemon starts on demand and exits when idle; there is no service to manage.
+- **Live.** Edit a file and the tools change in the running Claude Code session. An agent can switch a known server on for one session with `plugbay__enable`. The daemon starts on demand and exits when idle; there is no service to manage. After an upgrade the first agent that connects hands every running agent over to a new daemon, without restarting them.
 
 ## Like mise, for MCP
 
@@ -213,7 +213,7 @@ The full reference is [docs/config-schema.md](docs/config-schema.md).
 | `call <server>__<tool> [json]` | Call a tool as an agent here would: `plugbay call linear__list_teams '{}'` (`-` reads the JSON from stdin) |
 | `restart [server[:account]]` | Reconnect upstream servers (all, or one account) while agents stay connected |
 | `logs` | The end of the daemon log (`-n 200` lines, `-f` to follow) |
-| `stop` | Stop the daemon; agents start a fresh one on their next connection |
+| `stop` | Stop the daemon; connected agents move to a fresh one on their own |
 | `completion <shell>` | Shell completions for bash, zsh, fish, elvish, powershell |
 
 `connect` (what agents run) and `daemon` (started by `connect`; run it by hand with `--log-level debug` to debug) are internal. Every command takes `-C <dir>` to act as if started in another directory. Agents get three tools of their own: `plugbay__status` (what resolved and why), `plugbay__enable` and `plugbay__disable` (switch a known server on or off for this session only).

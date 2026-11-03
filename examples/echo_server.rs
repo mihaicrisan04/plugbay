@@ -1,7 +1,8 @@
 //! A tiny stdio MCP server for plugbay's end-to-end tests.
 //! `whoami` reports `ECHO_ACCOUNT` and the process id, so tests can see which account and
 //! which shared upstream process answered. `ECHO_LIST_DELAY_MS` makes `tools/list` slow.
-//! `echo` with `"fail": true` answers with a tool error.
+//! `echo` with `"fail": true` answers with a tool error, with `"delay_ms": n` after n ms, and
+//! with `"started": path` creates that file as soon as the call arrives.
 
 use std::sync::Arc;
 
@@ -46,6 +47,17 @@ impl ServerHandler for EchoServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let arguments = request.arguments.as_ref();
+        if let Some(started) = arguments
+            .and_then(|arguments| arguments.get("started"))
+            .and_then(|path| path.as_str())
+        {
+            std::fs::write(started, "").unwrap();
+        }
+        let delay_millis = arguments
+            .and_then(|arguments| arguments.get("delay_ms"))
+            .and_then(|delay| delay.as_u64())
+            .unwrap_or(0);
+        tokio::time::sleep(std::time::Duration::from_millis(delay_millis)).await;
         if request.name == "echo"
             && arguments.and_then(|arguments| arguments.get("fail")) == Some(&true.into())
         {

@@ -25,6 +25,7 @@ use crate::shim;
 
 const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_DESCRIPTION_CHARS: usize = 120;
+const SESSION_ATTEMPTS: usize = 2;
 
 pub async fn tools(paths: &Paths, cd: Option<PathBuf>, server: Option<&str>) -> anyhow::Result<()> {
     let session = AgentSession::open(paths, cd).await?;
@@ -104,6 +105,12 @@ pub async fn restart(
         Some(target) => credentials_changed(&find_server(paths, cd, target).await?),
         None => ControlRequest::ReconnectAll,
     };
+    if let Some(old_version) = shim::retire_older_daemon(paths).await {
+        println!(
+            "the daemon ran plugbay {old_version} and handed over; agents reconnect to a new daemon, which connects every server afresh"
+        );
+        return Ok(());
+    }
     match protocol::send_control(paths, request).await {
         Ok(response) => {
             match response.sessions {
@@ -120,7 +127,7 @@ pub async fn restart(
             Ok(())
         }
         Err(error) => Err(error).context(
-            "the daemon did not answer; if it is older than this plugbay, run `plugbay stop` and agents start a new one",
+            "the daemon did not answer; if it is older than this plugbay, run `plugbay stop` (agents started before the upgrade then need a restart)",
         ),
     }
 }
@@ -197,18 +204,30 @@ impl AgentSession {
             cwd,
             ..ProjectHints::default()
         };
-        let stream = shim::open_session(paths, hints).await.context(
-            "could not reach the plugbay daemon; run `plugbay daemon --log-level debug` to see why it does not start",
-        )?;
         let client = ClientConfig::new(
             ClientCapabilities::default(),
             Implementation::new("plugbay-cli", protocol::VERSION),
         );
-        let service = client
-            .serve(stream.into_split())
-            .await
-            .context("the MCP handshake with the daemon failed")?;
-        Ok(Self { service })
+        // A daemon that is exiting (retiring for a newer plugbay) closes new sessions at once;
+        // the next attempt reaches its successor.
+        let mut attempt = 1;
+        loop {
+            let stream = shim::open_session(paths, hints.clone()).await.context(
+                "could not reach the plugbay daemon; run `plugbay daemon --log-level debug` to see why it does not start",
+            )?;
+            match client.clone().serve(stream.into_split()).await {
+                Ok(service) => return Ok(Self { service }),
+                Err(error) if attempt < SESSION_ATTEMPTS => {
+                    tracing::debug!(%error, "the daemon closed the session; trying the next one");
+                    attempt += 1;
+                }
+                Err(error) => {
+                    return Err(error).context(
+                        "the MCP handshake with the daemon failed; `plugbay logs` shows why",
+                    );
+                }
+            }
+        }
     }
 
     async fn status_and_tools(

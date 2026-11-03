@@ -172,7 +172,7 @@ impl ShimCommand {
 }
 
 /// The first `plugbay` on `search_path` that resolves to `executable`, as written on the path.
-fn link_on_path(executable: &Path, search_path: &std::ffi::OsStr) -> Option<PathBuf> {
+pub(crate) fn link_on_path(executable: &Path, search_path: &std::ffi::OsStr) -> Option<PathBuf> {
     std::env::split_paths(search_path)
         .map(|directory| directory.join("plugbay"))
         .find(|candidate| {

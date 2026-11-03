@@ -113,7 +113,7 @@ async fn cli_call_prints_tool_output_and_fails_on_tool_errors() {
         text(&invalid.stderr)
     );
     assert!(
-        !sandbox.plugbay_home.join("state/daemon.sock").exists(),
+        !sandbox.socket().exists(),
         "invalid arguments must not start the daemon"
     );
 
@@ -251,9 +251,7 @@ async fn credentials_changed_in_the_old_wire_format_is_answered() {
     let sandbox = Sandbox::new();
     let client = sandbox.connect("client-b").await;
 
-    let mut socket =
-        std::os::unix::net::UnixStream::connect(sandbox.plugbay_home.join("state/daemon.sock"))
-            .unwrap();
+    let mut socket = std::os::unix::net::UnixStream::connect(sandbox.socket()).unwrap();
     socket
         .write_all(
             br#"{"kind":"control","version":"0.2.1","request":{"credentials_changed":{"identity":"stdio:unknown","account":"client-b"}}}

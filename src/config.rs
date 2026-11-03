@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::paths::Paths;
@@ -141,7 +142,8 @@ pub struct DisabledServer {
 
 /// A server an agent switched on or off for its session only, layered over every config file.
 /// Pins only choose servers and accounts, so they never need trust.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SessionPin {
     /// On, with this account or the tree's default.
     On {
