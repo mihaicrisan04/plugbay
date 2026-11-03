@@ -4,9 +4,11 @@
 
 use anyhow::bail;
 
+use super::pins::AddOptions;
 use crate::config::{self, ServerIdentity};
 use crate::identity::one_safe_line;
-use crate::registry::official::{self, Argument, Package, RegistryServer, Remote};
+use crate::registry::official::package::{self, PackageCommand, shell_word};
+use crate::registry::official::{self, Offer, Package, RegistryServer, Remote};
 use crate::registry::{self, RegistryEntry};
 
 const MAX_SHOWN: usize = 15;
@@ -78,81 +80,98 @@ fn format_results(query: &str, servers: &[RegistryServer], more_in_registry: boo
 
 /// `remote https://…`, `npm @scope/pkg`, or why plugbay can't use it.
 fn what_it_is(server: &RegistryServer) -> String {
-    let streamable = server.streamable_remotes();
-    let usable: Vec<&&Remote> = streamable
-        .iter()
-        .filter(|remote| official::https_url(&remote.url).is_ok())
-        .collect();
-    if !usable.is_empty() {
-        let urls: Vec<String> = usable
-            .iter()
-            .map(|remote| one_safe_line(&remote.url, MAX_URL_CHARS))
-            .collect();
-        let needs_token = usable
-            .iter()
-            .any(|remote| !remote.required_headers().is_empty());
-        let token_note = if needs_token { " (needs a token)" } else { "" };
-        return format!("remote: {}{token_note}", urls.join(", "));
-    }
-    if let Some(remote) = streamable.first()
-        && let Err(error) = official::https_url(&remote.url)
-    {
-        return format!(
+    match server.offer() {
+        Offer::Remotes(remotes) => {
+            let urls: Vec<String> = remotes
+                .iter()
+                .map(|remote| one_safe_line(&remote.url, MAX_URL_CHARS))
+                .collect();
+            let needs_token = remotes
+                .iter()
+                .any(|remote| !remote.required_headers().is_empty());
+            let token_note = if needs_token { " (needs a token)" } else { "" };
+            format!("remote: {}{token_note}", urls.join(", "))
+        }
+        Offer::RefusedRemote(error) => format!(
             "remote, but {}",
             one_safe_line(&format!("{error:#}"), MAX_URL_CHARS)
-        );
+        ),
+        Offer::Packages(packages) => {
+            let packages: Vec<String> = packages
+                .iter()
+                .map(|package| {
+                    format!(
+                        "{} {}",
+                        package.registry_type,
+                        one_safe_line(&package.identifier, MAX_URL_CHARS)
+                    )
+                })
+                .collect();
+            format!("runs locally: {}", packages.join(", "))
+        }
+        Offer::SseOnly => "remote over SSE only, which plugbay doesn't support".to_string(),
+        Offer::Nothing => "lists nothing to connect to".to_string(),
     }
-    if !server.packages.is_empty() {
-        let packages: Vec<String> = server
-            .packages
-            .iter()
-            .map(|package| {
-                format!(
-                    "{} {}",
-                    package.registry_type,
-                    one_safe_line(&package.identifier, MAX_URL_CHARS)
-                )
-            })
-            .collect();
-        return format!("runs locally: {}", packages.join(", "));
-    }
-    if !server.remotes.is_empty() {
-        return "remote over SSE only, which plugbay doesn't support".to_string();
-    }
-    "lists nothing to connect to".to_string()
 }
 
 /// The built-in server a registry entry's remote already points at, so `plugbay use` works as is.
 fn built_in_entry(server: &RegistryServer) -> Option<&'static RegistryEntry> {
-    server
-        .streamable_remotes()
+    let Offer::Remotes(remotes) = server.offer() else {
+        return None;
+    };
+    remotes
         .iter()
         .find_map(|remote| built_in_for_url(&remote.url))
 }
 
 fn built_in_for_url(text: &str) -> Option<&'static RegistryEntry> {
-    let identity = ServerIdentity::for_url(&url::Url::parse(text).ok()?);
-    registry::all().iter().find(|entry| {
-        url::Url::parse(entry.url).is_ok_and(|url| ServerIdentity::for_url(&url) == identity)
-    })
+    let url = url::Url::parse(text).ok()?;
+    registry::entry_for_identity(&ServerIdentity::for_url(&url))
 }
 
-/// The remote `plugbay add --from` writes, and what the user still has to do for it.
-pub struct ChosenRemote {
-    pub url: String,
+/// `plugbay add com.acme/tracker` means `plugbay add tracker --from com.acme/tracker`.
+pub fn take_registry_name(options: &mut AddOptions) -> anyhow::Result<()> {
+    let is_bare_name =
+        options.from.is_none() && options.url.is_none() && options.command.is_empty();
+    if !is_bare_name || !options.name.contains('/') {
+        return Ok(());
+    }
+    let Some(name) = name_from_registry_name(&options.name) else {
+        bail!(
+            "pick a name for it: `plugbay add <name> --from {}`",
+            options.name
+        );
+    };
+    options.from = Some(std::mem::replace(&mut options.name, name));
+    Ok(())
+}
+
+/// Where `plugbay add --from` got a catalog entry, and what the user still has to do for it.
+pub struct RegistrySource {
+    pub registry_name: String,
+    url: String,
     required_headers: Vec<String>,
 }
 
-/// Looks `registry_name` up and picks the remote to write as catalog entry `name`, or explains
-/// why nothing can be written (and, for a package, prints the command to add it by hand).
-pub async fn remote_from_registry(
-    name: &str,
-    registry_name: &str,
-    chosen_url: Option<&str>,
-    force: bool,
-) -> anyhow::Result<ChosenRemote> {
+/// For `plugbay add --from`: looks the registry server up and sets `options.url` to the remote
+/// to write, or explains why nothing can be written (for a package, with the command to add it
+/// by hand). `None` when the options don't come from the registry.
+pub async fn registry_source(options: &mut AddOptions) -> anyhow::Result<Option<RegistrySource>> {
+    let Some(registry_name) = &options.from else {
+        if options.remote.is_some() {
+            bail!("`--remote` picks one of a registry server's remotes; use it with `--from`");
+        }
+        return Ok(None);
+    };
     let server = official::lookup(registry_name).await?;
-    choose_remote(&server, name, chosen_url, force)
+    let source = choose_remote(
+        &server,
+        &options.name,
+        options.remote.as_deref(),
+        options.force,
+    )?;
+    options.url = Some(source.url.clone());
+    Ok(Some(source))
 }
 
 fn choose_remote(
@@ -160,18 +179,28 @@ fn choose_remote(
     name: &str,
     chosen_url: Option<&str>,
     force: bool,
-) -> anyhow::Result<ChosenRemote> {
-    let streamable = server.streamable_remotes();
-    if streamable.is_empty() {
-        bail!("nothing written: {}", why_no_remote(server, name));
-    }
-    let remote = pick_remote(server, &streamable, chosen_url)?;
-    if let Err(error) = official::https_url(&remote.url) {
-        bail!(
+) -> anyhow::Result<RegistrySource> {
+    let remotes = match server.offer() {
+        Offer::Remotes(remotes) => remotes,
+        Offer::RefusedRemote(error) => bail!(
             "nothing written: plugbay won't connect to {}: {error:#}",
             server.name
-        );
-    }
+        ),
+        Offer::Packages(packages) => {
+            bail!("nothing written: {}", package_steps(server, packages, name))
+        }
+        Offer::SseOnly => bail!(
+            "nothing written: {} only offers a remote over SSE, which plugbay doesn't support. {}",
+            server.name,
+            add_by_hand(name)
+        ),
+        Offer::Nothing => bail!(
+            "nothing written: {} lists no remote or package. {}",
+            server.name,
+            add_by_hand(name)
+        ),
+    };
+    let remote = pick_remote(server, &remotes, chosen_url)?;
     if let Some(entry) = built_in_for_url(&remote.url)
         && !force
     {
@@ -182,7 +211,8 @@ fn choose_remote(
             built_in = entry.name
         );
     }
-    Ok(ChosenRemote {
+    Ok(RegistrySource {
+        registry_name: server.name.clone(),
         url: remote.url.clone(),
         required_headers: remote
             .required_headers()
@@ -194,58 +224,58 @@ fn choose_remote(
 
 fn pick_remote<'a>(
     server: &RegistryServer,
-    streamable: &[&'a Remote],
+    remotes: &[&'a Remote],
     chosen_url: Option<&str>,
 ) -> anyhow::Result<&'a Remote> {
-    let listed = || {
-        streamable
+    // Full and shell-quoted, so a pasted choice is exactly the remote and never runs anything.
+    let choices = || {
+        remotes
             .iter()
-            .map(|remote| format!("  --remote {}", one_safe_line(&remote.url, MAX_URL_CHARS)))
+            .map(|remote| format!("  --remote {}", shell_word(&remote.url)))
             .collect::<Vec<_>>()
             .join("\n")
     };
-    match (chosen_url, streamable) {
-        (Some(url), _) => match streamable.iter().find(|remote| remote.url == url) {
+    match (chosen_url, remotes) {
+        (Some(url), _) => match remotes.iter().find(|remote| remote.url == url) {
             Some(remote) => Ok(remote),
             None => bail!(
-                "nothing written: `{url}` is not one of {}'s remotes; pick one of:\n{}",
+                "nothing written: `{url}` is not one of {}'s https remotes; pick one of:\n{}",
                 server.name,
-                listed()
+                choices()
             ),
         },
         (None, [only]) => Ok(only),
         (None, _) => bail!(
             "nothing written: {} has {} remotes; pick one with `--remote`:\n{}",
             server.name,
-            streamable.len(),
-            listed()
+            remotes.len(),
+            choices()
         ),
     }
 }
 
-fn why_no_remote(server: &RegistryServer, requested_name: &str) -> String {
+fn add_by_hand(name: &str) -> String {
+    format!(
+        "If you know how to run it, add it with `plugbay add {name} --url <url>` or \
+         `plugbay add {name} -- <command>`"
+    )
+}
+
+/// The `plugbay add` command for each package plugbay knows how to run, to review and run by hand.
+fn package_steps(server: &RegistryServer, packages: &[Package], requested_name: &str) -> String {
     let name = match registry::lookup(requested_name) {
         Some(_) => format!("{requested_name}-local"),
         None => requested_name.to_string(),
     };
-    let commands: Vec<String> = server
-        .packages
+    let commands: Vec<PackageCommand> = packages
         .iter()
-        .filter_map(|package| package_command(&name, package))
+        .filter_map(|package| package::package_command(&name, package))
         .collect();
-    let sse_only = !server.remotes.is_empty();
     if commands.is_empty() {
-        let reason = if sse_only {
-            "only offers a remote over SSE, which plugbay doesn't support"
-        } else if server.packages.is_empty() {
-            "lists no remote or package"
-        } else {
-            "only ships packages plugbay can't suggest a command for"
-        };
         return format!(
-            "{} {reason}. If you know how to run it, add it with \
-             `plugbay add {requested_name} --url <url>` or `plugbay add {requested_name} -- <command>`",
-            server.name
+            "{} only ships packages plugbay can't suggest a command for. {}",
+            server.name,
+            add_by_hand(requested_name)
         );
     }
     let mut message = format!(
@@ -254,7 +284,13 @@ fn why_no_remote(server: &RegistryServer, requested_name: &str) -> String {
         server.name
     );
     for command in &commands {
-        message.push_str(&format!("\n  {command}\n"));
+        message.push_str(&format!("\n  {}\n", command.command_line()));
+        if !command.optional_env.is_empty() {
+            message.push_str(&format!(
+                "    (optional env: {})\n",
+                command.optional_env.join(", ")
+            ));
+        }
     }
     let mut notes = Vec::new();
     if name != requested_name {
@@ -262,13 +298,10 @@ fn why_no_remote(server: &RegistryServer, requested_name: &str) -> String {
             "{requested_name} is built in, so the command adds it as {name}."
         ));
     }
-    if commands.iter().any(|command| command.contains('<')) {
+    if commands.iter().any(|command| command.has_placeholders) {
         notes.push("Replace each `<...>` first.".to_string());
     }
-    if commands
-        .iter()
-        .any(|command| command.contains("${keychain:"))
-    {
+    if commands.iter().any(|command| command.has_secret_refs) {
         notes.push(format!(
             "Store each secret before using it, e.g. on macOS \
              `security add-generic-password -s {name} -a <NAME> -w`, or point the ref at \
@@ -282,157 +315,32 @@ fn why_no_remote(server: &RegistryServer, requested_name: &str) -> String {
     message.trim_end().to_string()
 }
 
-/// The `plugbay add <name> [--env ...] -- <command>` line for a stdio package, or `None` when
-/// plugbay doesn't know how to run that kind of package.
-fn package_command(name: &str, package: &Package) -> Option<String> {
-    let is_stdio = package
-        .transport
-        .kind
-        .as_deref()
-        .is_none_or(|kind| kind == "stdio");
-    let has_valid_env_names = package
-        .environment_variables
-        .iter()
-        .all(|variable| is_env_name(&variable.name));
-    if !is_stdio || !has_valid_env_names {
-        return None;
-    }
-    let required_env: Vec<&official::EnvironmentVariable> = package
-        .environment_variables
-        .iter()
-        .filter(|variable| variable.is_required)
-        .collect();
-
-    let mut words: Vec<String> = vec!["plugbay".into(), "add".into(), name.into()];
-    for variable in &required_env {
-        let value = match (&variable.default_value, variable.is_secret) {
-            (_, true) => format!("${{keychain:{name}/{}}}", variable.name),
-            (Some(default), false) => default.clone(),
-            (None, false) => "<value>".to_string(),
-        };
-        words.push("--env".into());
-        words.push(format!("{}={value}", variable.name));
-    }
-    words.push("--".into());
-    words.extend(run_command(package, &required_env)?);
-
-    let mut command = words
-        .iter()
-        .map(|word| shell_word(word))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let optional: Vec<&str> = package
-        .environment_variables
-        .iter()
-        .filter(|variable| !variable.is_required)
-        .map(|variable| variable.name.as_str())
-        .collect();
-    if !optional.is_empty() {
-        command.push_str(&format!("\n    (optional env: {})", optional.join(", ")));
-    }
-    Some(command)
-}
-
-/// The command line that runs `package`, with the runtime chosen by its registry type. The
-/// registry's own `runtimeHint` is ignored: plugbay picks the runtime, not the entry.
-fn run_command(package: &Package, env: &[&official::EnvironmentVariable]) -> Option<Vec<String>> {
-    let identifier = package.identifier.as_str();
-    let version = package.version.as_deref();
-    let mut words: Vec<String> = Vec::new();
-    match package.registry_type.as_str() {
-        "npm" => {
-            words.push("npx".into());
-            if package.runtime_arguments.is_empty() {
-                words.push("-y".into());
-            }
-            words.extend(argument_words(&package.runtime_arguments));
-            words.push(match version {
-                Some(version) => format!("{identifier}@{version}"),
-                None => identifier.to_string(),
-            });
+impl RegistrySource {
+    /// The `login` step for a remote that declared required headers, if it has any.
+    pub fn next_steps(&self, name: &str) -> Option<String> {
+        match self.required_headers.as_slice() {
+            [] => None,
+            [header] if header.eq_ignore_ascii_case("authorization") => Some(format!(
+                "It needs a token: store it with `plugbay login {name} --token`."
+            )),
+            [header] => Some(format!(
+                "It needs a token in the `{header}` header: store it with \
+                 `plugbay login {name} --token --header {}`.",
+                shell_word(header)
+            )),
+            several => Some(format!(
+                "It needs these headers: {}. `plugbay login {name} --token --header <NAME>` stores \
+                 one of them; give the others as `${{keychain:...}}` refs under \
+                 `[servers.{name}.headers]` in your global config.",
+                several.join(", ")
+            )),
         }
-        "pypi" => {
-            words.push("uvx".into());
-            words.extend(argument_words(&package.runtime_arguments));
-            words.push(match version {
-                Some(version) => format!("{identifier}=={version}"),
-                None => identifier.to_string(),
-            });
-        }
-        "oci" => {
-            words.extend(["docker", "run", "-i", "--rm"].map(String::from));
-            words.extend(argument_words(&package.runtime_arguments));
-            for variable in env {
-                words.push("-e".into());
-                words.push(variable.name.clone());
-            }
-            let image_has_tag = identifier
-                .rsplit('/')
-                .next()
-                .is_some_and(|last| last.contains(':'))
-                || identifier.contains('@');
-            words.push(match version {
-                Some(version) if !image_has_tag => format!("{identifier}:{version}"),
-                _ => identifier.to_string(),
-            });
-        }
-        _ => return None,
-    }
-    words.extend(argument_words(&package.package_arguments));
-    Some(words)
-}
-
-/// Fixed and required arguments as words; optional ones without a value are left out.
-fn argument_words(arguments: &[Argument]) -> Vec<String> {
-    let mut words = Vec::new();
-    for argument in arguments {
-        let given = argument.value.clone().or(argument.default_value.clone());
-        if given.is_none() && !argument.is_required {
-            continue;
-        }
-        let value = given.unwrap_or_else(|| {
-            let hint = argument
-                .value_hint
-                .as_deref()
-                .or(argument.name.as_deref())
-                .unwrap_or("value");
-            format!("<{}>", hint.trim_start_matches('-'))
-        });
-        if argument.kind == "named"
-            && let Some(name) = &argument.name
-        {
-            words.push(name.clone());
-        }
-        words.push(value);
-    }
-    words
-}
-
-/// The `login` step for a remote that declared required headers, if it has any.
-pub fn token_steps(name: &str, remote: &ChosenRemote) -> Option<String> {
-    let headers = &remote.required_headers;
-    match headers.as_slice() {
-        [] => None,
-        [header] if header.eq_ignore_ascii_case("authorization") => Some(format!(
-            "It needs a token: store it with `plugbay login {name} --token`."
-        )),
-        [header] => Some(format!(
-            "It needs a token in the `{header}` header: store it with \
-             `plugbay login {name} --token --header {}`.",
-            shell_word(header)
-        )),
-        several => Some(format!(
-            "It needs these headers: {}. `plugbay login {name} --token --header <NAME>` stores \
-             one of them; give the others as `${{keychain:...}}` refs under \
-             `[servers.{name}.headers]` in your global config.",
-            several.join(", ")
-        )),
     }
 }
 
 /// `plugbay add <registry-name>` without `--from`: the catalog name to use,
 /// `io.github.acme/tracker-mcp` → `tracker`.
-pub fn name_from_registry_name(registry_name: &str) -> Option<String> {
+fn name_from_registry_name(registry_name: &str) -> Option<String> {
     let (_, server) = registry_name.split_once('/')?;
     let mut name = String::new();
     for character in server.to_ascii_lowercase().chars() {
@@ -453,31 +361,6 @@ pub fn name_from_registry_name(registry_name: &str) -> Option<String> {
         .filter(|shortened| !shortened.is_empty())
         .unwrap_or(name);
     config::is_valid_name(shortened).then(|| shortened.to_string())
-}
-
-fn is_env_name(name: &str) -> bool {
-    let mut characters = name.chars();
-    characters
-        .next()
-        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
-        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
-}
-
-/// Quotes a word for a POSIX shell unless it is plainly safe, so a printed command means what it
-/// shows even when the registry put shell syntax in a package name or argument.
-fn shell_word(word: &str) -> String {
-    let is_plain = !word.is_empty()
-        && word.chars().all(|character| {
-            character.is_ascii_alphanumeric()
-                || matches!(
-                    character,
-                    '@' | '%' | '+' | '=' | ':' | ',' | '.' | '/' | '_' | '-'
-                )
-        });
-    if is_plain {
-        return word.to_string();
-    }
-    format!("'{}'", word.replace('\'', r"'\''"))
 }
 
 #[cfg(test)]
@@ -521,10 +404,11 @@ mod tests {
     #[test]
     fn a_single_streamable_remote_is_chosen_and_its_token_header_explained() {
         let server = fixture_server("com.acme/tracker");
-        let remote = choose_remote(&server, "acme", None, false).unwrap();
-        assert_eq!(remote.url, "https://mcp.acme.example/mcp");
+        let source = choose_remote(&server, "acme", None, false).unwrap();
+        assert_eq!(source.url, "https://mcp.acme.example/mcp");
+        assert_eq!(source.registry_name, "com.acme/tracker");
         assert_eq!(
-            token_steps("acme", &remote).as_deref(),
+            source.next_steps("acme").as_deref(),
             Some("It needs a token: store it with `plugbay login acme --token`.")
         );
     }
@@ -549,10 +433,51 @@ mod tests {
         )
         .unwrap();
         assert_eq!(chosen.url, "https://mcp.linear.app/mcp/readonly");
-        assert!(token_steps("linear-readonly", &chosen).is_none());
+        assert!(chosen.next_steps("linear-readonly").is_none());
 
         let unknown = choose_remote(&server, "lin", Some("https://evil.example/mcp"), false);
         assert!(unknown.is_err());
+    }
+
+    #[test]
+    fn only_https_remotes_count_when_a_server_also_lists_plain_http() {
+        let server = fixture_server("net.mixed/tracker");
+        let chosen = choose_remote(&server, "mixed", None, false).unwrap();
+        assert_eq!(chosen.url, "https://mcp.mixed.example/mcp");
+        assert_eq!(what_it_is(&server), "remote: https://mcp.mixed.example/mcp");
+
+        let error = choose_remote(
+            &server,
+            "mixed",
+            Some("http://mcp.mixed.example/mcp"),
+            false,
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(
+            error.ends_with("pick one of:\n  --remote https://mcp.mixed.example/mcp"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn remote_choices_are_printed_whole_and_shell_quoted() {
+        let server: RegistryServer = serde_json::from_str(
+            r#"{"name": "com.evil/tracker", "remotes": [
+                {"type": "streamable-http", "url": "https://example.com/$(printf INJECTED)"},
+                {"type": "streamable-http", "url": "https://example.com/mcp"}
+            ]}"#,
+        )
+        .unwrap();
+        let error = choose_remote(&server, "evil", None, false)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("\n  --remote 'https://example.com/$(printf INJECTED)'\n"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -602,37 +527,12 @@ mod tests {
     #[test]
     fn a_package_suggested_under_a_built_in_name_gets_another_name() {
         let server = fixture_server("io.github.acme-dev/tracker-mcp");
-        let message = why_no_remote(&server, "linear");
+        let message = package_steps(&server, &server.packages, "linear");
         assert!(
             message.contains("  plugbay add linear-local --env"),
             "{message}"
         );
         assert!(message.contains("linear is built in"), "{message}");
-    }
-
-    #[test]
-    fn pypi_and_oci_packages_get_commands_and_bundles_are_skipped() {
-        let server = fixture_server("org.pyco/finder");
-        let commands: Vec<String> = server
-            .packages
-            .iter()
-            .filter_map(|package| package_command("finder", package))
-            .collect();
-        assert_eq!(
-            commands,
-            [
-                "plugbay add finder -- uvx pyco-finder==1.2.0",
-                "plugbay add finder --env 'FINDER_TOKEN=${keychain:finder/FINDER_TOKEN}' -- docker run -i --rm -e FINDER_TOKEN ghcr.io/pyco/finder:1.2.0",
-            ]
-        );
-    }
-
-    #[test]
-    fn shell_syntax_from_the_registry_is_quoted() {
-        assert_eq!(shell_word("@acme/tracker@1.0.0"), "@acme/tracker@1.0.0");
-        assert_eq!(shell_word("$(touch pwned)"), "'$(touch pwned)'");
-        assert_eq!(shell_word("it's"), r"'it'\''s'");
-        assert_eq!(shell_word("<workspace>"), "'<workspace>'");
     }
 
     #[test]

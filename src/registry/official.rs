@@ -2,12 +2,15 @@
 //! Its answers are hostile input: text is made safe while it is parsed, and a remote url is only
 //! used once `https_url` accepts it.
 
+pub mod package;
+
 use std::time::Duration;
 
 use anyhow::{Context, bail};
 use serde::{Deserialize, Deserializer};
 use url::Url;
 
+use crate::config;
 use crate::identity::one_safe_line;
 
 const SERVERS_URL: &str = "https://registry.modelcontextprotocol.io/v0.1/servers";
@@ -19,6 +22,7 @@ const MAX_QUERY_CHARS: usize = 100;
 const MAX_NAME_CHARS: usize = 200;
 /// Long enough for any real url or description; longer text is cut (and a cut url stops parsing).
 const MAX_TEXT_CHARS: usize = 2048;
+const MAX_STATUS_CHARS: usize = 40;
 const STREAMABLE_HTTP: &str = "streamable-http";
 
 #[derive(Debug, Deserialize)]
@@ -109,12 +113,49 @@ pub struct EnvironmentVariable {
     pub is_secret: bool,
 }
 
+/// What a registry server offers plugbay, decided once so `search` and `add` agree.
+#[derive(Debug)]
+pub enum Offer<'a> {
+    /// Streamable HTTP remotes plugbay may connect to (`https_url` accepts them).
+    Remotes(Vec<&'a Remote>),
+    /// Streamable HTTP remotes only, and none plugbay may connect to: why the first one isn't.
+    RefusedRemote(anyhow::Error),
+    /// Packages to run locally, which plugbay only ever prints a command for.
+    Packages(&'a [Package]),
+    /// Remotes over the old SSE transport only.
+    SseOnly,
+    Nothing,
+}
+
 impl RegistryServer {
-    pub fn streamable_remotes(&self) -> Vec<&Remote> {
-        self.remotes
+    pub fn offer(&self) -> Offer<'_> {
+        let mut usable = Vec::new();
+        let mut refusal = None;
+        let streamable = self
+            .remotes
             .iter()
-            .filter(|remote| remote.transport == STREAMABLE_HTTP)
-            .collect()
+            .filter(|remote| remote.transport == STREAMABLE_HTTP);
+        for remote in streamable {
+            match https_url(&remote.url) {
+                Ok(_) => usable.push(remote),
+                Err(error) => {
+                    refusal.get_or_insert(error);
+                }
+            }
+        }
+        if !usable.is_empty() {
+            return Offer::Remotes(usable);
+        }
+        if let Some(error) = refusal {
+            return Offer::RefusedRemote(error);
+        }
+        if !self.packages.is_empty() {
+            return Offer::Packages(&self.packages);
+        }
+        if !self.remotes.is_empty() {
+            return Offer::SseOnly;
+        }
+        Offer::Nothing
     }
 }
 
@@ -227,11 +268,12 @@ fn parse_lookup(body: &[u8], name: &str) -> anyhow::Result<RegistryServer> {
         bail!("the MCP Registry answered with another server than {name}");
     }
     if let Some(official) = &entry.meta.official
-        && !is_active(official.status.as_deref())
+        && let Some(status) = official.status.as_deref()
+        && !is_active(Some(status))
     {
         bail!(
             "{name} is marked `{}` in the MCP Registry, so plugbay won't add it",
-            official.status.as_deref().unwrap_or_default()
+            one_safe_line(status, MAX_STATUS_CHARS)
         );
     }
     Ok(entry.server)
@@ -330,7 +372,7 @@ fn rank(servers: &mut [RegistryServer], query: &str) {
         let name = server.name.to_lowercase();
         let (namespace, server_name) = name.split_once('/').unwrap_or((&name, ""));
         (
-            !namespace_owners(namespace).contains(&query.as_str()),
+            !namespace_belongs_to(namespace, &query),
             is_open_namespace(namespace),
             server_name != query,
             name.clone(),
@@ -338,13 +380,13 @@ fn rank(servers: &mut [RegistryServer], query: &str) {
     });
 }
 
-/// The labels that say who publishes under a namespace: `app.linear` → `linear`,
-/// `io.github.acme` → `acme`.
-fn namespace_owners(namespace: &str) -> Vec<&str> {
-    if let Some(account) = namespace.strip_prefix("io.github.") {
-        return vec![account];
+/// Whether the query names who publishes under a namespace: `linear` owns `app.linear`,
+/// `acme` owns `io.github.acme`.
+fn namespace_belongs_to(namespace: &str, query: &str) -> bool {
+    match namespace.strip_prefix("io.github.") {
+        Some(account) => account == query,
+        None => namespace.split('.').skip(1).any(|label| label == query),
     }
-    namespace.split('.').skip(1).collect()
 }
 
 /// Namespaces anyone can publish under (a GitHub account, a hosting service), unlike a vendor's
@@ -385,13 +427,7 @@ pub fn https_url(text: &str) -> anyhow::Result<Url> {
     if !url.username().is_empty() || url.password().is_some() {
         bail!("its url holds a user name or password");
     }
-    let is_loopback = match url.host() {
-        Some(url::Host::Domain(domain)) => domain == "localhost",
-        Some(url::Host::Ipv4(address)) => address.is_loopback() || address.is_unspecified(),
-        Some(url::Host::Ipv6(address)) => address.is_loopback() || address.is_unspecified(),
-        None => true,
-    };
-    if is_loopback {
+    if url.host().is_none() || config::is_loopback(&url) {
         bail!("its url `{text}` points at this machine");
     }
     Ok(url)
@@ -453,6 +489,7 @@ pub(crate) mod tests {
                 "dev.oldco/legacy",
                 "dev.tricky/tracker",
                 "org.pyco/finder",
+                "net.mixed/tracker",
             ]
         );
         let linear = fixture_server("app.linear/linear");
@@ -490,7 +527,7 @@ pub(crate) mod tests {
             [
                 "com.acme/tracker",
                 "dev.tricky/tracker",
-                "app.linear/linear"
+                "net.mixed/tracker"
             ]
         );
         assert_eq!(
@@ -516,6 +553,53 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_hostile_status_is_refused_and_shown_as_one_short_line() {
+        let status = format!("active\\n\\u001b[2Jdeprecated{}", "x".repeat(500));
+        let entry = format!(
+            r#"{{"server": {{"name": "app.linear/linear"}}, "_meta": {{"io.modelcontextprotocol.registry/official": {{"status": "{status}", "isLatest": true}}}}}}"#
+        );
+        let error = parse_lookup(entry.as_bytes(), "app.linear/linear")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !error.contains('\n') && !error.contains('\u{1b}'),
+            "{error}"
+        );
+        assert!(error.len() < 200, "{error}");
+    }
+
+    fn offer_of(name: &str) -> String {
+        match fixture_server(name).offer() {
+            Offer::Remotes(remotes) => {
+                let urls: Vec<&str> = remotes.iter().map(|remote| remote.url.as_str()).collect();
+                format!("remotes {}", urls.join(" "))
+            }
+            Offer::RefusedRemote(error) => format!("refused: {error:#}"),
+            Offer::Packages(packages) => format!("{} packages", packages.len()),
+            Offer::SseOnly => "sse only".to_string(),
+            Offer::Nothing => "nothing".to_string(),
+        }
+    }
+
+    #[test]
+    fn offers_keep_only_usable_streamable_remotes() {
+        assert_eq!(
+            offer_of("com.acme/tracker"),
+            "remotes https://mcp.acme.example/mcp"
+        );
+        assert_eq!(
+            offer_of("net.mixed/tracker"),
+            "remotes https://mcp.mixed.example/mcp"
+        );
+        assert_eq!(
+            offer_of("dev.tricky/tracker"),
+            "refused: its url `http://tricky.example/mcp` is not https"
+        );
+        assert_eq!(offer_of("org.pyco/finder"), "3 packages");
+        assert_eq!(offer_of("dev.oldco/legacy"), "sse only");
+    }
+
+    #[test]
     fn registry_names_are_namespace_slash_server() {
         assert!(is_registry_name("app.linear/linear"));
         assert!(is_registry_name("io.github.acme-dev/tracker_mcp.v2"));
@@ -536,6 +620,9 @@ pub(crate) mod tests {
         assert!(https_url("https://localhost/mcp").is_err());
         assert!(https_url("https://127.0.0.1/mcp").is_err());
         assert!(https_url("https://[::1]/mcp").is_err());
+        assert!(https_url("https://localhost./mcp").is_err());
+        assert!(https_url("https://[::ffff:127.0.0.1]/mcp").is_err());
+        assert!(https_url("https://0.0.0.0/mcp").is_err());
         assert!(https_url("file:///etc/passwd").is_err());
     }
 }

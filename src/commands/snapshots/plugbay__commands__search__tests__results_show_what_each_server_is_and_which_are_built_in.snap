@@ -1,6 +1,6 @@
 ---
 source: src/commands/search.rs
-expression: "format_results(\"tracker\", &fixture_search(\"tracker\"))"
+expression: "format_results(\"tracker\", &fixture_search(\"tracker\"), false)"
 ---
 com.acme/tracker  Acme Tracker
     The official Acme Tracker server.
@@ -9,6 +9,10 @@ com.acme/tracker  Acme Tracker
 dev.tricky/tracker  Tricky rekcart
     Line one line two with hidden marks.
     remote, but its url `http://tricky.example/mcp` is not https
+
+net.mixed/tracker
+    One https remote, one plain http remote.
+    remote: https://mcp.mixed.example/mcp
 
 app.linear/linear  Linear  (built in: `plugbay use linear`)
     Find and manage issues, projects, and documents in your Linear workspace.

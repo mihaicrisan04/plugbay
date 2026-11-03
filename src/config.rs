@@ -368,6 +368,26 @@ impl ServerIdentity {
     }
 }
 
+/// Whether `url` points at this machine: `localhost` (or a name under it, with or without the
+/// final DNS dot) or a loopback or unspecified address, IPv4-mapped IPv6 included.
+pub fn is_loopback(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(domain)) => {
+            let domain = domain
+                .strip_suffix('.')
+                .unwrap_or(domain)
+                .to_ascii_lowercase();
+            domain == "localhost" || domain.ends_with(".localhost")
+        }
+        Some(url::Host::Ipv4(address)) => address.is_loopback() || address.is_unspecified(),
+        Some(url::Host::Ipv6(address)) => match address.to_ipv4_mapped() {
+            Some(mapped) => mapped.is_loopback() || mapped.is_unspecified(),
+            None => address.is_loopback() || address.is_unspecified(),
+        },
+        None => false,
+    }
+}
+
 impl ServerIdentity {
     /// For logs: a url identity keeps its path, which may hold a key, so it is masked like
     /// [`display_url`]. Stdio identities are hashes already.
@@ -957,6 +977,35 @@ mod tests {
         for (input, expected) in cases {
             let url = Url::parse(input).unwrap();
             assert_eq!(ServerIdentity::for_url(&url).0, expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn loopback_urls_include_dotted_localhost_and_mapped_addresses() {
+        let local = [
+            "http://localhost:7373/mcp",
+            "https://LOCALHOST./mcp",
+            "https://app.localhost/mcp",
+            "http://127.0.0.1/mcp",
+            "http://127.1.2.3/mcp",
+            "http://0.0.0.0/mcp",
+            "http://[::1]/mcp",
+            "http://[::]/mcp",
+            "https://[::ffff:127.0.0.1]/mcp",
+            "https://[::ffff:0.0.0.0]/mcp",
+            "http://2130706433/mcp",
+        ];
+        for text in local {
+            assert!(is_loopback(&Url::parse(text).unwrap()), "{text}");
+        }
+        let remote = [
+            "https://mcp.linear.app/mcp",
+            "https://localhost.example.com/mcp",
+            "https://[::ffff:8.8.8.8]/mcp",
+            "https://10.0.0.1/mcp",
+        ];
+        for text in remote {
+            assert!(!is_loopback(&Url::parse(text).unwrap()), "{text}");
         }
     }
 

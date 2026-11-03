@@ -27,31 +27,31 @@ pub struct PinOptions {
     local: bool,
 }
 
-#[derive(clap::Args, Debug)]
+#[derive(clap::Args, Debug, Default)]
 pub struct AddOptions {
     /// Name to pin it by, e.g. `huggingface` or `playwright`. An MCP Registry name such as
     /// `com.acme/tracker` is looked up as with `--from`, under a short name (`tracker`).
-    name: String,
+    pub(super) name: String,
     /// Streamable HTTP endpoint of a remote server: `--url https://huggingface.co/mcp`.
     #[arg(long, conflicts_with = "command")]
-    url: Option<String>,
+    pub(super) url: Option<String>,
     /// Add a remote server from the official MCP Registry: `--from com.acme/tracker`.
     /// `plugbay search` finds names; packages are printed as a command to review, never added.
     #[arg(long, value_name = "REGISTRY_NAME", conflicts_with_all = ["url", "command"])]
-    from: Option<String>,
+    pub(super) from: Option<String>,
     /// Which remote of a registry server to add, when it lists several.
     #[arg(long, value_name = "URL", conflicts_with_all = ["url", "command"])]
-    remote: Option<String>,
+    pub(super) remote: Option<String>,
     /// Environment for a stdio server, `NAME=value`. Secrets must be refs like
     /// `${keychain:service/account}` or `${op://vault/item/field}`, never the value itself.
     #[arg(long = "env", value_name = "NAME=VALUE", requires = "command")]
-    env: Vec<String>,
+    pub(super) env: Vec<String>,
     /// Replace a built-in server of the same name everywhere it is pinned.
     #[arg(long)]
-    force: bool,
+    pub(super) force: bool,
     /// Command line of a stdio server, after `--`: `plugbay add playwright -- npx -y @playwright/mcp`.
     #[arg(last = true, value_name = "COMMAND")]
-    command: Vec<String>,
+    pub(super) command: Vec<String>,
 }
 
 /// One `server[:account]` argument.
@@ -189,39 +189,13 @@ pub async fn unuse_servers(
 }
 
 pub async fn add(paths: &Paths, mut options: AddOptions) -> anyhow::Result<()> {
-    take_registry_name(&mut options)?;
-    if !config::is_valid_name(&options.name) {
-        bail!("server names use lowercase letters, digits and `-` only");
-    }
-    let from_registry = match &options.from {
-        Some(registry_name) => {
-            let remote = search::remote_from_registry(
-                &options.name,
-                registry_name,
-                options.remote.as_deref(),
-                options.force,
-            )
-            .await?;
-            options.url = Some(remote.url.clone());
-            Some(remote)
-        }
-        None if options.remote.is_some() => {
-            bail!("`--remote` picks one of a registry server's remotes; use it with `--from`")
-        }
-        None => None,
-    };
-    check_add_options(&options, &paths.global_config())?;
+    search::take_registry_name(&mut options)?;
     let file = paths.global_config();
     let original = read_or_empty(&file)?;
     let mut document = parse(&original, &file)?;
-    if servers_table(&mut document)?.contains_key(&options.name) {
-        bail!(
-            "{} is already in {}; edit it there, or `plugbay remove {}` first",
-            options.name,
-            file.display(),
-            options.name
-        );
-    }
+    check_new_name(&options, &mut document, &file)?;
+    let source = search::registry_source(&mut options).await?;
+    check_add_options(&options, &file)?;
 
     let definition = definition_table(&options)?;
     servers_table(&mut document)?.insert(&options.name, Item::Table(definition));
@@ -235,38 +209,18 @@ pub async fn add(paths: &Paths, mut options: AddOptions) -> anyhow::Result<()> {
         restore(&file, &original)?;
         bail!("nothing written: {problem}");
     }
-    let source = match &options.from {
-        Some(registry_name) => format!(" from the MCP Registry ({registry_name})"),
+    let origin = match &source {
+        Some(source) => format!(" from the MCP Registry ({})", source.registry_name),
         None => String::new(),
     };
     println!(
-        "Added {name}{source} to the catalog in {file}. Pin it with `plugbay use {name}` (or `{name}:<account>`).",
+        "Added {name}{origin} to the catalog in {file}. Pin it with `plugbay use {name}` (or `{name}:<account>`).",
         name = options.name,
         file = file.display()
     );
-    let token_steps = from_registry
-        .as_ref()
-        .and_then(|remote| search::token_steps(&options.name, remote));
-    if let Some(steps) = token_steps {
+    if let Some(steps) = source.and_then(|source| source.next_steps(&options.name)) {
         println!("{steps}");
     }
-    Ok(())
-}
-
-/// `plugbay add com.acme/tracker` means `plugbay add tracker --from com.acme/tracker`.
-fn take_registry_name(options: &mut AddOptions) -> anyhow::Result<()> {
-    let is_bare_name =
-        options.from.is_none() && options.url.is_none() && options.command.is_empty();
-    if !is_bare_name || !options.name.contains('/') {
-        return Ok(());
-    }
-    let Some(name) = search::name_from_registry_name(&options.name) else {
-        bail!(
-            "pick a name for it: `plugbay add <name> --from {}`",
-            options.name
-        );
-    };
-    options.from = Some(std::mem::replace(&mut options.name, name));
     Ok(())
 }
 
@@ -607,10 +561,17 @@ fn is_known(config: &ResolvedConfig, document: &DocumentMut, name: &str) -> bool
     in_this_file || known_names(config).contains(&name)
 }
 
-/// Refuses catalog entries that would quietly redirect pins, send traffic unencrypted, or
-/// write a secret into the config file.
-fn check_add_options(options: &AddOptions, global_config: &Path) -> anyhow::Result<()> {
+/// Refuses a catalog name that is invalid, already taken, or would quietly redirect the pins of
+/// a built-in server. Local checks only, so they run before any registry lookup.
+fn check_new_name(
+    options: &AddOptions,
+    document: &mut DocumentMut,
+    global_config: &Path,
+) -> anyhow::Result<()> {
     let name = &options.name;
+    if !config::is_valid_name(name) {
+        bail!("server names use lowercase letters, digits and `-` only");
+    }
     if let Some(entry) = registry::lookup(name)
         && !options.force
     {
@@ -621,6 +582,19 @@ fn check_add_options(options: &AddOptions, global_config: &Path) -> anyhow::Resu
             entry.url
         );
     }
+    if servers_table(document)?.contains_key(name) {
+        bail!(
+            "{name} is already in {}; edit it there, or `plugbay remove {name}` first",
+            global_config.display()
+        );
+    }
+    Ok(())
+}
+
+/// Refuses catalog entries that would send traffic unencrypted or write a secret into the
+/// config file.
+fn check_add_options(options: &AddOptions, global_config: &Path) -> anyhow::Result<()> {
+    let name = &options.name;
     if let Some(url) = &options.url {
         check_url(url)?;
     }
@@ -648,15 +622,9 @@ fn check_add_options(options: &AddOptions, global_config: &Path) -> anyhow::Resu
 /// `https`, or plain `http` to this machine only: anything else would send tokens in the clear.
 fn check_url(text: &str) -> anyhow::Result<()> {
     let url = url::Url::parse(text).with_context(|| format!("`{text}` is not a valid url"))?;
-    let is_loopback = match url.host() {
-        Some(url::Host::Domain(domain)) => domain == "localhost",
-        Some(url::Host::Ipv4(address)) => address.is_loopback(),
-        Some(url::Host::Ipv6(address)) => address.is_loopback(),
-        None => false,
-    };
     match url.scheme() {
         "https" => Ok(()),
-        "http" if is_loopback => Ok(()),
+        "http" if config::is_loopback(&url) => Ok(()),
         "http" => bail!(
             "`{text}` is plain http to another machine, so logins and tokens would travel \
              unencrypted; use its https url (plain http is fine for localhost / 127.0.0.1)"
@@ -724,9 +692,7 @@ mod tests {
             } else {
                 Vec::new()
             },
-            force: false,
-            from: None,
-            remote: None,
+            ..Default::default()
         }
     }
 
@@ -754,11 +720,7 @@ mod tests {
         let options = AddOptions {
             name: "wa".to_string(),
             url: Some("http://127.0.0.1:7373/mcp".to_string()),
-            env: Vec::new(),
-            command: Vec::new(),
-            force: false,
-            from: None,
-            remote: None,
+            ..Default::default()
         };
         let result = edited("", |document| {
             let definition = definition_table(&options).unwrap();
@@ -822,11 +784,7 @@ mod tests {
         let remote = AddOptions {
             name: "wa".to_string(),
             url: Some("http://127.0.0.1:7373/mcp".to_string()),
-            env: Vec::new(),
-            command: Vec::new(),
-            force: false,
-            from: None,
-            remote: None,
+            ..Default::default()
         };
         assert_eq!(
             definition_table(&remote).unwrap().to_string(),
@@ -835,16 +793,13 @@ mod tests {
 
         let stdio = AddOptions {
             name: "teams".to_string(),
-            url: None,
             env: vec!["REGION=eu".to_string()],
             command: vec![
                 "npx".to_string(),
                 "-y".to_string(),
                 "msteams-mcp".to_string(),
             ],
-            force: false,
-            from: None,
-            remote: None,
+            ..Default::default()
         };
         assert_eq!(
             definition_table(&stdio).unwrap().to_string(),
@@ -921,12 +876,54 @@ mod tests {
     #[test]
     fn add_refuses_to_shadow_a_built_in_server_without_force() {
         let global = Path::new("/home/me/.config/plugbay/config.toml");
+        let mut document = DocumentMut::new();
         let mut options = add_options("linear", Some("https://evil.example.com/mcp"), &[]);
-        let error = check_add_options(&options, global).unwrap_err().to_string();
+        let error = check_new_name(&options, &mut document, global)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("--force"), "{error}");
 
         options.force = true;
-        assert!(check_add_options(&options, global).is_ok());
+        assert!(check_new_name(&options, &mut document, global).is_ok());
+    }
+
+    #[test]
+    fn add_refuses_a_name_already_in_the_catalog() {
+        let global = Path::new("/home/me/.config/plugbay/config.toml");
+        let mut document: DocumentMut = "[servers.wa]\nurl = \"https://wa.example/mcp\"\n"
+            .parse()
+            .unwrap();
+        let options = add_options("wa", Some("https://wa.example/mcp"), &[]);
+        let error = check_new_name(&options, &mut document, global)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("already in"), "{error}");
+    }
+
+    #[test]
+    fn a_bare_registry_name_becomes_from_with_a_short_name() {
+        let mut options = AddOptions {
+            name: "io.github.acme/tracker-mcp".to_string(),
+            ..Default::default()
+        };
+        search::take_registry_name(&mut options).unwrap();
+        assert_eq!(options.name, "tracker");
+        assert_eq!(options.from.as_deref(), Some("io.github.acme/tracker-mcp"));
+    }
+
+    #[tokio::test]
+    async fn remote_without_from_is_refused_before_any_lookup() {
+        let mut options = AddOptions {
+            name: "tracker".to_string(),
+            remote: Some("https://mcp.acme.example/mcp".to_string()),
+            ..Default::default()
+        };
+        let error = search::registry_source(&mut options)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("use it with `--from`"), "{error}");
     }
 
     #[test]
@@ -935,6 +932,8 @@ mod tests {
         assert!(check_url("http://127.0.0.1:7373/mcp").is_ok());
         assert!(check_url("http://localhost:7373/mcp").is_ok());
         assert!(check_url("http://[::1]:7373/mcp").is_ok());
+        assert!(check_url("http://localhost.:7373/mcp").is_ok());
+        assert!(check_url("http://[::ffff:127.0.0.1]:7373/mcp").is_ok());
         assert!(check_url("http://mcp.example.com/mcp").is_err());
         assert!(check_url("ftp://127.0.0.1/mcp").is_err());
     }

@@ -1,6 +1,5 @@
 //! OAuth login for remote servers (discovery, PKCE, CIMD/DCR via rmcp) with a loopback callback.
 
-use std::net::IpAddr;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
@@ -12,7 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use url::Url;
 
-use crate::config::{ResolvedServer, ServerTransport};
+use crate::config::{self, ResolvedServer, ServerTransport};
 use crate::credentials::{self, KeychainCredentialStore};
 
 const CLIENT_NAME: &str = "plugbay";
@@ -192,25 +191,16 @@ fn validate_metadata(metadata: &AuthorizationMetadata, server_url: &Url) -> anyh
 /// are on loopback (local test servers); a remote server never gets to send tokens to a local port.
 fn validate_endpoint_url(value: &str, server_url: &Url) -> anyhow::Result<Url> {
     let url = Url::parse(value).with_context(|| format!("`{value}` is not a valid URL"))?;
-    let Some(host) = url.host_str() else {
+    if url.host().is_none() {
         bail!("`{value}` has no host");
-    };
-    let server_is_local = server_url.host_str().is_some_and(is_loopback_host);
+    }
+    let is_local = config::is_loopback(server_url) && config::is_loopback(&url);
     match url.scheme() {
         "https" => Ok(url),
-        "http" if server_is_local && is_loopback_host(host) => Ok(url),
+        "http" if is_local => Ok(url),
         "http" => bail!("`{value}` uses plain http on a non-loopback host; only https is allowed"),
         scheme => bail!("`{value}` uses the `{scheme}` scheme; only https is allowed"),
     }
-}
-
-fn is_loopback_host(host: &str) -> bool {
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    host.parse::<IpAddr>()
-        .is_ok_and(|address| address.is_loopback())
 }
 
 /// Serves the loopback listener until the browser hits `/callback`, and returns the
@@ -350,12 +340,17 @@ mod tests {
         assert!(validate_endpoint_url("http://127.0.0.1:8080/authorize", &local_server()).is_ok());
         assert!(validate_endpoint_url("http://localhost/authorize", &local_server()).is_ok());
         assert!(validate_endpoint_url("http://[::1]:9000/token", &local_server()).is_ok());
+        assert!(validate_endpoint_url("http://localhost./token", &local_server()).is_ok());
+        assert!(
+            validate_endpoint_url("http://[::ffff:127.0.0.1]:9000/token", &local_server()).is_ok()
+        );
         assert!(validate_endpoint_url("http://evil.example/authorize", &local_server()).is_err());
     }
 
     #[test]
     fn remote_server_cannot_point_endpoints_at_local_ports() {
         assert!(validate_endpoint_url("http://127.0.0.1:8080/token", &remote_server()).is_err());
+        assert!(validate_endpoint_url("http://localhost./token", &remote_server()).is_err());
     }
 
     #[test]
