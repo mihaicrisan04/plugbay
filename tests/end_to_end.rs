@@ -1530,3 +1530,19 @@ async fn a_failed_enable_does_not_undo_a_newer_one() {
     assert!(whoami.starts_with("account=client-a "), "{whoami}");
     client.cancel().await.unwrap();
 }
+
+#[cfg(unix)]
+#[test]
+fn completions_register_under_the_alias_they_were_run_as() {
+    let links = TempDir::new().unwrap();
+    let alias = links.path().join("pb");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_plugbay"), &alias).unwrap();
+
+    let output = std::process::Command::new(&alias)
+        .args(["completion", "zsh"])
+        .output()
+        .unwrap();
+
+    let script = String::from_utf8(output.stdout).unwrap();
+    assert!(script.starts_with("#compdef pb\n"), "{script}");
+}
