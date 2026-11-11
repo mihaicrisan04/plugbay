@@ -5,11 +5,18 @@ Releases are cut by pushing a `v*` tag. `.github/workflows/release.yml` builds t
 ## One-time setup
 
 1. Create `github.com/mihaicrisan04/plugbay` and push the repo.
-2. Create a fine-grained personal access token with access to `mihaicrisan04/homebrew-tap` only, permission **Contents: read and write**.
-3. Add it to the plugbay repo as the Actions secret `HOMEBREW_TAP_TOKEN` (Settings > Secrets and variables > Actions, or `gh secret set HOMEBREW_TAP_TOKEN -R mihaicrisan04/plugbay`).
-4. Optionally enable private vulnerability reporting (Settings > Security), which `SECURITY.md` points to.
+2. Give the workflow write access to the tap with an SSH deploy key (scoped to that one repo, never expires):
 
-The release itself uses the built-in `GITHUB_TOKEN`; only the tap update needs the extra secret.
+   ```sh
+   ssh-keygen -t ed25519 -N '' -C 'plugbay release -> homebrew-tap' -f tap_key
+   gh repo deploy-key add tap_key.pub -R mihaicrisan04/homebrew-tap --allow-write --title 'plugbay release workflow'
+   gh secret set HOMEBREW_TAP_DEPLOY_KEY -R mihaicrisan04/plugbay < tap_key
+   rm tap_key tap_key.pub
+   ```
+
+3. Optionally enable private vulnerability reporting (Settings > Security), which `SECURITY.md` points to.
+
+The release itself uses the built-in `GITHUB_TOKEN`; only the tap update needs the deploy key.
 
 ## Cutting a release
 
@@ -42,7 +49,7 @@ A tag with a hyphen (`v0.2.0-rc.1`) is published as a GitHub prerelease and does
 3. **release** creates the GitHub Release with the tarballs, the `.sha256` files, a combined `SHA256SUMS` and generated notes.
 4. **homebrew-tap** renders `packaging/homebrew/plugbay.rb` with `packaging/homebrew/render.sh` and pushes it to `Formula/plugbay.rb` in the tap as `plugbay: update to v{version}`.
 
-If the tap step fails (missing or expired token), fix the secret and re-run only that job from the Actions page.
+If the tap step fails (missing secret or deploy key removed), fix it and re-run only that job from the Actions page.
 
 ## Testing the formula locally
 

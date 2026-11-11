@@ -166,7 +166,7 @@ From an audit of the session runtime; Mihai approved each.
 - No byte cap on remote (HTTP) upstream responses: rmcp's HTTP adapter buffers whole JSON bodies. Stdio messages are capped at 16 MiB
 - Upstream stderr is logged with resolved secret env values redacted (lines capped at 4 KiB); other secrets a server prints itself are not caught
 - Server urls are masked for display (userinfo, query values, fragment, token-looking path segments), but the masking of path tokens is a heuristic, and `ServerIdentity` itself (the credential key) still holds the full path and userinfo; it is rendered only through `ServerIdentity::masked()`
-- ~~Version skew: after an upgrade the running daemon keeps the old version until `plugbay stop`.~~ Fixed in v0.3 item 5: the first newer shim (or `tools` / `call` / `restart`) retires it and every session moves. The old objection (a retired daemon still serving old sessions misses `logout` / `trust --revoke`) no longer applies, since a daemon only retires when every session can move. What remains: the released 0.2.1 daemon predates retiring and its shims can't reconnect, so the first upgrade past it still needs `plugbay stop` and a restart of agents started before it (doctor says so)
+- ~~Version skew: after an upgrade the running daemon keeps the old version until `plugbay stop`.~~ Fixed in v0.3 item 5: the first newer shim (or `tools` / `call` / `restart`) retires it and every session moves. The old objection (a retired daemon still serving old sessions misses `logout` / `trust --revoke`) no longer applies, since a daemon only retires when every session can move. What remains: a daemon from before v0.3.0 (0.2.1 and older source builds; none was released) predates retiring and its shims can't reconnect, so the first upgrade past it still needs `plugbay stop` and a restart of agents started before it (doctor says so)
 - Remote MCP requests don't follow redirects and have a 10s connect timeout; a read only times out after 10 minutes of silence (the longest tool call), so idle event streams reconnect at most that often
 - OAuth registration is DCR-only until we host a CIMD document; no manual `client_id` flow yet
 - Untested against live services: a real OAuth login (Linear), `setup`/`import --apply` against real Claude Code and Codex configs, keychain prompts on macOS
@@ -174,7 +174,7 @@ From an audit of the session runtime; Mihai approved each.
 
 ## Next steps
 
-1. Release v0.2.1: `HOMEBREW_TAP_TOKEN` secret, tag, brew formula; Developer ID signing so upgrades don't re-prompt for the keychain
+1. ~~Release: tag, brew formula~~ (v0.3.0 shipped unsigned, 2026-11-11; main had all of v0.3 under 0.2.1, which was never tagged). Still to do: Developer ID signing and notarization so upgrades don't re-prompt for the keychain
 2. Launch: awesome-mcp-servers (Aggregators), Show HN led by the wrong-account story, r/ClaudeAI and r/codex, a note on anthropics/claude-code#27302 (multi-account connectors, 400+ 👍)
 3. Tools on demand (roadmap 6), then registry search/export (roadmap 7)
 4. Real-service checks from the gaps list; ~~one shared "what resolved here" report model~~ (done, v0.3 step 1); Linux Secret Service edge cases
