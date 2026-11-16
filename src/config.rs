@@ -91,7 +91,8 @@ pub struct ResolvedServer {
     pub account_metadata: BTreeMap<String, String>,
     /// Which file last set each field (`url`, `account`, `command`, `headers.Authorization`, ...).
     pub provenance: BTreeMap<String, PathBuf>,
-    /// Non-global files that set an executable field of this server; each must be trusted.
+    /// Non-global files that set an executable field of this server; each must be trusted. Also
+    /// decides where a stdio server runs (see [`ResolvedServer::is_defined_by_project`]).
     pub requires_trust_from: Vec<PathBuf>,
 }
 
@@ -247,6 +248,11 @@ impl ResolvedServer {
 
     pub fn is_stdio(&self) -> bool {
         matches!(self.transport, ServerTransport::Stdio { .. })
+    }
+
+    /// True when a project file set what runs or where requests go, rather than the global config.
+    pub fn is_defined_by_project(&self) -> bool {
+        !self.requires_trust_from.is_empty()
     }
 
     /// Remote servers authenticate with what `plugbay login` stored (a token or an OAuth login)

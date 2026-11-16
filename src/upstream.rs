@@ -38,7 +38,9 @@ const TOOLS_CHANGED_DEBOUNCE: Duration = Duration::from_millis(250);
 pub struct UpstreamKey {
     pub identity: ServerIdentity,
     pub account: String,
-    /// Stdio servers run per working dir (each worktree gets its own process); remote ones don't care.
+    /// Where a stdio server runs (`None` for remote servers): its configured `cwd`, else the
+    /// session's worktree for a server a project defines, else `$HOME`. So a server only the global
+    /// config defines runs once per machine, and a second copy can't fight it over ports or state.
     pub working_dir: Option<PathBuf>,
     /// Hash of the unresolved transport config (full URL, header and env templates, args), so two
     /// projects that send different credentials or query parameters never share a connection.
@@ -46,10 +48,13 @@ pub struct UpstreamKey {
 }
 
 impl UpstreamKey {
-    pub fn for_server(server: &ResolvedServer, working_dir: Option<&PathBuf>) -> Self {
+    pub fn for_server(server: &ResolvedServer, project_dir: Option<&PathBuf>, home: &Path) -> Self {
         let working_dir = match &server.transport {
             ServerTransport::Stdio { cwd: Some(cwd), .. } => Some(cwd.clone()),
-            ServerTransport::Stdio { cwd: None, .. } => working_dir.cloned(),
+            ServerTransport::Stdio { cwd: None, .. } => match project_dir {
+                Some(project_dir) if server.is_defined_by_project() => Some(project_dir.clone()),
+                _ => Some(home.to_path_buf()),
+            },
             ServerTransport::Http { .. } => None,
         };
         Self {
@@ -263,10 +268,10 @@ impl UpstreamPool {
     pub async fn acquire(
         self: &Arc<Self>,
         server: &ResolvedServer,
-        working_dir: Option<&PathBuf>,
+        project_dir: Option<&PathBuf>,
         may_connect: MayConnect<'_>,
     ) -> Result<Lease, ConnectError> {
-        let key = UpstreamKey::for_server(server, working_dir);
+        let key = UpstreamKey::for_server(server, project_dir, &self.paths.home);
         let (slot, claim) = self.claim(&key);
 
         let mut connection = slot.lock().await;
@@ -277,6 +282,11 @@ impl UpstreamPool {
             });
         }
 
+        // A closed connection can leave its process running (e.g. after an oversized message);
+        // stop it first so the new one never runs beside it.
+        if let Some(stale) = connection.take() {
+            stale.stop_process();
+        }
         let upstream = Arc::new(connect(server, &key, self.changes.clone(), may_connect).await?);
         *connection = Some(upstream.clone());
         self.verify_account(&upstream);
@@ -450,8 +460,14 @@ async fn connect(
             None,
         ),
         ServerTransport::Stdio { env, .. } => {
+            let Some(working_dir) = key.working_dir.as_deref() else {
+                return Err(ConnectError::Failed(anyhow::anyhow!(
+                    "no working directory for {}",
+                    server.display_name()
+                )));
+            };
             let (service, process) =
-                connect_stdio(server, env, key.working_dir.as_deref(), client, may_connect).await?;
+                connect_stdio(server, env, working_dir, client, may_connect).await?;
             (service, Some(parking_lot::Mutex::new(process)))
         }
     };
@@ -574,7 +590,7 @@ fn mask_url_in_error(error: ConnectError, url: &Url) -> ConnectError {
 async fn connect_stdio(
     server: &ResolvedServer,
     env: &BTreeMap<String, String>,
-    working_dir: Option<&Path>,
+    working_dir: &Path,
     client: UpstreamClient,
     may_connect: MayConnect<'_>,
 ) -> Result<(RunningService<RoleClient, UpstreamClient>, StdioProcess), ConnectError> {
@@ -720,6 +736,27 @@ mod tests {
             transport_fingerprint: String::new(),
         };
         UpstreamClient::new(key, changes)
+    }
+
+    #[test]
+    fn a_global_stdio_server_gets_one_key_whatever_the_project() {
+        let server = ResolvedServer::test_stdio("tool", "personal", "tool-mcp", &[]);
+        let home = Path::new("/home/me");
+        let first = UpstreamKey::for_server(&server, Some(&PathBuf::from("/work/first")), home);
+        let second = UpstreamKey::for_server(&server, Some(&PathBuf::from("/work/second")), home);
+        assert_eq!(first, second);
+        assert_eq!(first.working_dir.as_deref(), Some(home));
+    }
+
+    #[test]
+    fn a_stdio_server_a_project_defines_gets_one_key_per_worktree() {
+        let mut server = ResolvedServer::test_stdio("tool", "personal", "tool-mcp", &[]);
+        server.requires_trust_from = vec![PathBuf::from("/work/plugbay.toml")];
+        let home = Path::new("/home/me");
+        let first = UpstreamKey::for_server(&server, Some(&PathBuf::from("/work/first")), home);
+        let second = UpstreamKey::for_server(&server, Some(&PathBuf::from("/work/second")), home);
+        assert_ne!(first, second);
+        assert_eq!(first.working_dir, Some(PathBuf::from("/work/first")));
     }
 
     #[tokio::test]

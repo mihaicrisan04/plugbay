@@ -370,7 +370,7 @@ impl Session {
                 });
                 continue;
             }
-            let key = UpstreamKey::for_server(&server, working_dir);
+            let key = UpstreamKey::for_server(&server, working_dir, &self.shared.paths.home);
             if let Some(index) = reusable
                 .iter()
                 .position(|active| active.can_be_reused_for(&key))
@@ -975,7 +975,7 @@ mod tests {
         let active = ActiveServer {
             status: ServerStatus::Connecting {
                 attempt,
-                key: UpstreamKey::for_server(&server, None),
+                key: UpstreamKey::for_server(&server, None, std::path::Path::new("/home/me")),
                 task: task.abort_handle(),
             },
             server,

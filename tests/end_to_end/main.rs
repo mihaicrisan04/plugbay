@@ -391,20 +391,64 @@ async fn each_project_gets_its_own_account_and_tools() {
 #[tokio::test]
 async fn sessions_with_the_same_account_share_one_upstream_process() {
     let sandbox = Sandbox::new();
+    write_project(
+        &sandbox.projects.join("client-a-twin"),
+        "[servers]\necho = \"client-a\"\n",
+    );
 
-    let first = sandbox.connect("client-a").await;
-    let nested = sandbox.connect("client-a/app").await;
-    let first_pid = call_text(&first, "echo__whoami").await;
-    let nested_pid = call_text(&nested, "echo__whoami").await;
+    let mut whoamis = Vec::new();
+    let mut clients = Vec::new();
+    for project in ["client-a", "client-a/app", "client-a-twin", "client-a"] {
+        let client = sandbox.connect(project).await;
+        whoamis.push(call_text(&client, "echo__whoami").await);
+        clients.push(client);
+    }
 
-    // The nested dir inherits client-a but runs with its own working dir, so it gets its own process;
-    // two sessions in the same dir share one.
-    let second = sandbox.connect("client-a").await;
-    let second_pid = call_text(&second, "echo__whoami").await;
-    assert_eq!(first_pid, second_pid);
-    assert!(nested_pid.starts_with("account=client-a "), "{nested_pid}");
+    // A server the global config defines runs once per machine, in $HOME, whichever project
+    // or worktree an agent starts in: two copies could fight over ports or state.
+    let home = std::path::Path::new(&std::env::var("HOME").unwrap())
+        .canonicalize()
+        .unwrap();
+    let expected = format!("account=client-a cwd={} pid=", home.display());
+    assert!(whoamis[0].starts_with(&expected), "{}", whoamis[0]);
+    assert!(
+        whoamis.iter().all(|whoami| whoami == &whoamis[0]),
+        "{whoamis:#?}"
+    );
 
-    for client in [first, nested, second] {
+    for client in clients {
+        client.cancel().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_server_a_project_defines_runs_in_each_worktree() {
+    let sandbox = Sandbox::new();
+    sandbox.prepend_to_global_config(&format!(
+        "trusted_paths = [\"{}/**\"]\n",
+        sandbox.projects.display()
+    ));
+    write_project(&sandbox.projects.join("local"), &local_echo_config(""));
+    write_project(&sandbox.projects.join("local/first"), "");
+    write_project(&sandbox.projects.join("local/second"), "");
+
+    let first = sandbox.connect("local/first").await;
+    let second = sandbox.connect("local/second").await;
+    let first_whoami = call_text(&first, "local__whoami").await;
+    let second_whoami = call_text(&second, "local__whoami").await;
+
+    let first_dir = sandbox.projects.join("local/first");
+    let second_dir = sandbox.projects.join("local/second");
+    assert!(
+        first_whoami.contains(&format!("cwd={} pid=", first_dir.display())),
+        "{first_whoami}"
+    );
+    assert!(
+        second_whoami.contains(&format!("cwd={} pid=", second_dir.display())),
+        "{second_whoami}"
+    );
+
+    for client in [first, second] {
         client.cancel().await.unwrap();
     }
 }
