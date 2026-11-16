@@ -38,7 +38,7 @@ pub struct SpawnRequest<'a> {
     pub env: &'a BTreeMap<String, String>,
     /// Values whose env template held a secret ref; scrubbed from stderr before it is logged.
     pub secret_values: Vec<String>,
-    pub working_dir: Option<&'a Path>,
+    pub working_dir: &'a Path,
 }
 
 pub fn spawn(request: SpawnRequest<'_>) -> anyhow::Result<(StdioProcess, StdioPipes)> {
@@ -50,10 +50,8 @@ pub fn spawn(request: SpawnRequest<'_>) -> anyhow::Result<(StdioProcess, StdioPi
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .process_group(0);
-    if let Some(working_dir) = request.working_dir {
-        command.current_dir(working_dir);
-    }
+        .process_group(0)
+        .current_dir(request.working_dir);
 
     let mut child = command
         .spawn()

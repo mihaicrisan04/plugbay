@@ -70,7 +70,12 @@ impl ServerHandler for EchoServer {
         let text = match request.name.as_ref() {
             "whoami" => {
                 let account = std::env::var("ECHO_ACCOUNT").unwrap_or_else(|_| "unset".to_string());
-                format!("account={account} pid={}", std::process::id())
+                let cwd = std::env::current_dir().unwrap_or_default();
+                format!(
+                    "account={account} cwd={} pid={}",
+                    cwd.display(),
+                    std::process::id()
+                )
             }
             "echo" => request
                 .arguments

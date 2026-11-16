@@ -56,7 +56,7 @@ Exact syntax is open (see [config-schema.md](config-schema.md)); these semantics
 - Sessions outlive their daemon: when it exits (upgrade, `plugbay stop`, crash) the shim moves the session to a new one, replays the handshake and carries the session's pins over; a shim newer than the running daemon retires it (v0.3 item 5)
 - Project detection: `--project` / `CLAUDE_PROJECT_DIR` > MCP roots (deprecated in spec 2026-07-28, hint only) > shim cwd (ignore `/` and `$HOME`) > global
 - Speak protocol 2025-11-25 to clients for now
-- Worktrees: resolve config by git common dir, run upstream servers with the worktree as cwd
+- Worktrees: resolve config by git common dir, run stdio servers a project defines with the worktree as cwd
 - Upstream servers shared across sessions per (server identity, account), ref-counted
 - Tools passed through as `server__tool` (short server keys, no underscores, names ≤ 64 chars). Rely on native tool search (Claude Code, Codex); meta-tool search mode later for clients without it
 - Server instructions state the active account ("PostHog → client-a, EU") so agent and human see which client they touch
@@ -91,7 +91,7 @@ Made while building v0.1 on `feat/v0.1`; revisit any of them freely.
 - Wire protocol: the shim writes one JSON hello line (`session` with project hints, or `control`), then the socket carries plain MCP. The shim is a byte pipe; the daemon runs the rmcp server per connection
 - Daemon single-instance via a lock file in the state dir; socket `~/.local/state/plugbay/daemon.sock` (0600, dir 0700); idle exit after 10 min; upstreams kept 60 s after their last session. `PLUGBAY_HOME` relocates config + state (tests)
 - If the daemon can't start, the shim serves the session in-process
-- Stdio upstreams are shared per (identity, account, working dir), so each worktree gets its own process; remote ones per (identity, account)
+- Stdio upstreams that only the global config defines run once per machine per (identity, account), in their `cwd` or `$HOME`; ones a project file defines or changes (the ones that need trust) run once per worktree, in it; remote ones per (identity, account) (since 2026-11-16; was per working dir for every stdio server, and two copies of google:personal fought over a fixed port, so OAuth callbacks saved tokens into google:wolfpack's folder)
 - A remote server without a static `Authorization` header uses stored OAuth tokens if any, else connects anonymously and turns a 401 challenge into the `<server>__login` stub
 - Trust prompt: shown at most once per version of the untrusted config per daemon run (since 2026-10-17; was once per folder); `allow_once` lasts for the daemon's lifetime. Codex doesn't re-list tools, so tools unlocked mid-session appear in its next session
 - Built-in `plugbay__status` tool: what resolved, from which files, and why a server is missing. Server name `plugbay` is reserved
